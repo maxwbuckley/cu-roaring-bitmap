@@ -32,7 +32,12 @@ add_library(cu_roaring_filter
     src/upload.cpp
     src/set_ops.cu
     src/decompress.cu
+    src/bloom.cu
 )
+
+# Header-only interface target for device-side API (roaring_view, warp_query)
+add_library(cu_roaring_device INTERFACE)
+target_include_directories(cu_roaring_device INTERFACE include/)
 target_include_directories(cu_roaring_filter PUBLIC include/)
 target_link_libraries(cu_roaring_filter PUBLIC roaring CUDA::cudart)
 set_target_properties(cu_roaring_filter PROPERTIES

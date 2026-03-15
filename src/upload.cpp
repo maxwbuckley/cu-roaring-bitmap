@@ -236,6 +236,7 @@ void gpu_roaring_free(GpuRoaring& bitmap) {
     if (bitmap.bitmap_data)   cudaFree(bitmap.bitmap_data);
     if (bitmap.array_data)    cudaFree(bitmap.array_data);
     if (bitmap.run_data)      cudaFree(bitmap.run_data);
+    if (bitmap.key_bloom)     cudaFree(bitmap.key_bloom);
     bitmap = GpuRoaring{};
 }
 

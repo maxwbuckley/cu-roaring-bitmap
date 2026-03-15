@@ -29,6 +29,10 @@ struct GpuRoaring {
 
     uint16_t* run_data           = nullptr; // [total_run_pairs * 2] packed (start, length)
     uint32_t  n_run_containers    = 0;
+
+    // Optional Bloom filter over container keys for fast rejection
+    uint32_t* key_bloom          = nullptr; // [BLOOM_SIZE_WORDS] or nullptr
+    static constexpr uint32_t BLOOM_SIZE_WORDS = 2048;  // 8 KB = 65536 bits
 };
 
 struct GpuRoaringMeta {
