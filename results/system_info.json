@@ -1,0 +1,16 @@
+{
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "gpu_sm": "12.0 (Blackwell)",
+  "gpu_sms": 170,
+  "gpu_memory_mb": 32607,
+  "gpu_memory_bw_tb_s": 1.8,
+  "gpu_boost_clock_mhz": 3090,
+  "gpu_driver": "581.95",
+  "cuda_version": "12.4",
+  "cuda_architectures": "sm_89 (PTX JIT to sm_120)",
+  "cpu": "Intel Core Ultra 9 285K",
+  "ram_gb": 32,
+  "os": "WSL2 (Linux 6.6.87.2-microsoft-standard-WSL2)",
+  "pcie": "PCIe 5.0 x16",
+  "date": "2026-03-15"
+}

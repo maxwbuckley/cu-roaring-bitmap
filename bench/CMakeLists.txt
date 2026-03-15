@@ -18,3 +18,8 @@ endfunction()
 add_cu_roaring_bench(bench_set_ops)
 add_cu_roaring_bench(bench_decompress)
 add_cu_roaring_bench(bench_transfer)
+
+# Comprehensive benchmark (no google benchmark dependency, standalone)
+add_executable(bench_comprehensive bench_comprehensive.cu)
+target_link_libraries(bench_comprehensive PRIVATE cu_roaring_filter)
+set_target_properties(bench_comprehensive PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

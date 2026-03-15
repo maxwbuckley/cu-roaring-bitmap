@@ -1,0 +1,10 @@
+{
+  "benchmark": "memory_footprint",
+  "results": [
+    {"universe": 1000000000, "n_tags": 10, "flat_bytes": 1250000000, "roaring_bytes": 439994400, "ratio": 2.84, "flat_fits_32gb": true, "roaring_fits_32gb": true},
+    {"universe": 1000000000, "n_tags": 100, "flat_bytes": 12500000000, "roaring_bytes": 6902585600, "ratio": 1.81, "flat_fits_32gb": true, "roaring_fits_32gb": true},
+    {"universe": 1000000000, "n_tags": 500, "flat_bytes": 62500000000, "roaring_bytes": 34512928000, "ratio": 1.81, "flat_fits_32gb": false, "roaring_fits_32gb": false},
+    {"universe": 1000000000, "n_tags": 1000, "flat_bytes": 125000000000, "roaring_bytes": 69025856000, "ratio": 1.81, "flat_fits_32gb": false, "roaring_fits_32gb": false},
+    {"universe": 1000000000, "n_tags": 5000, "flat_bytes": 625000000000, "roaring_bytes": 345129280000, "ratio": 1.81, "flat_fits_32gb": false, "roaring_fits_32gb": false}
+  ]
+}

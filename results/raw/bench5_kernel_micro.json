@@ -1,0 +1,14 @@
+{
+  "benchmark": "kernel_micro",
+  "results": [
+    {"universe": 10000000, "density": 0.0100, "n_containers": 153, "n_bmp": 0, "n_arr": 153, "decomp_median_ms": 0.0307, "decomp_bw_gbs": 40.8, "and_median_ms": 0.5106},
+    {"universe": 10000000, "density": 0.1000, "n_containers": 153, "n_bmp": 152, "n_arr": 1, "decomp_median_ms": 0.0121, "decomp_bw_gbs": 103.6, "and_median_ms": 1.3088},
+    {"universe": 10000000, "density": 0.5000, "n_containers": 153, "n_bmp": 153, "n_arr": 0, "decomp_median_ms": 0.0302, "decomp_bw_gbs": 41.3, "and_median_ms": 0.8562},
+    {"universe": 100000000, "density": 0.0100, "n_containers": 1526, "n_bmp": 0, "n_arr": 1526, "decomp_median_ms": 0.0181, "decomp_bw_gbs": 688.9, "and_median_ms": 0.9102},
+    {"universe": 100000000, "density": 0.1000, "n_containers": 1526, "n_bmp": 1526, "n_arr": 0, "decomp_median_ms": 0.0175, "decomp_bw_gbs": 712.8, "and_median_ms": 0.8782},
+    {"universe": 100000000, "density": 0.5000, "n_containers": 1526, "n_bmp": 1526, "n_arr": 0, "decomp_median_ms": 0.0168, "decomp_bw_gbs": 742.6, "and_median_ms": 0.8357},
+    {"universe": 1000000000, "density": 0.0100, "n_containers": 15259, "n_bmp": 0, "n_arr": 15259, "decomp_median_ms": 0.2323, "decomp_bw_gbs": 538.1, "and_median_ms": 1.5711},
+    {"universe": 1000000000, "density": 0.1000, "n_containers": 15259, "n_bmp": 15259, "n_arr": 0, "decomp_median_ms": 0.2331, "decomp_bw_gbs": 536.4, "and_median_ms": 2.9475},
+    {"universe": 1000000000, "density": 0.5000, "n_containers": 15259, "n_bmp": 15259, "n_arr": 0, "decomp_median_ms": 0.2262, "decomp_bw_gbs": 552.7, "and_median_ms": 2.9036}
+  ]
+}

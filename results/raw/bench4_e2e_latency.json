@@ -1,0 +1,32 @@
+{
+  "benchmark": "e2e_latency",
+  "results": [
+    {
+      "universe": 10000000,
+      "cpu_filter_ms": {"median": 0.8132, "mean": 0.8224, "p5": 0.7962, "p95": 0.8800, "std": 0.0453, "min": 0.7925, "max": 1.1793},
+      "pcie_transfer_ms": {"median": 0.0617, "mean": 0.0679, "p5": 0.0586, "p95": 0.0850, "std": 0.0104, "min": 0.0580, "max": 0.1102},
+      "gpu_kernel_ms": {"median": 2.1278, "mean": 2.2054, "p5": 1.9645, "p95": 2.8138, "std": 0.2518, "min": 1.7993, "max": 3.1883},
+      "gpu_decompress_ms": {"median": 0.0104, "mean": 0.0112, "p5": 0.0088, "p95": 0.0174, "std": 0.0040, "min": 0.0086, "max": 0.0331},
+      "sim_search_ms": 10.0,
+      "total_A_ms": 10.8749, "total_C_ms": 12.1381, "speedup": 0.90
+    },
+    {
+      "universe": 100000000,
+      "cpu_filter_ms": {"median": 10.0727, "mean": 10.1916, "p5": 9.7578, "p95": 11.2507, "std": 0.4122, "min": 9.6955, "max": 11.5184},
+      "pcie_transfer_ms": {"median": 0.6361, "mean": 1.6566, "p5": 0.5592, "p95": 3.8664, "std": 1.4948, "min": 0.5378, "max": 4.0393},
+      "gpu_kernel_ms": {"median": 2.4070, "mean": 2.4341, "p5": 2.2576, "p95": 2.7212, "std": 0.1453, "min": 2.2108, "max": 3.1672},
+      "gpu_decompress_ms": {"median": 0.0177, "mean": 0.0183, "p5": 0.0162, "p95": 0.0201, "std": 0.0036, "min": 0.0159, "max": 0.0433},
+      "sim_search_ms": 10.0,
+      "total_A_ms": 20.7089, "total_C_ms": 12.4246, "speedup": 1.67
+    },
+    {
+      "universe": 1000000000,
+      "cpu_filter_ms": {"median": 114.8606, "mean": 115.7021, "p5": 109.9990, "p95": 124.4340, "std": 4751.1742, "min": -23652.2939, "max": 23882.4586},
+      "pcie_transfer_ms": {"median": 9.4035, "mean": 9.5336, "p5": 9.0576, "p95": 10.3394, "std": 0.5552, "min": 9.0204, "max": 13.3276},
+      "gpu_kernel_ms": {"median": 7.8379, "mean": 7.9013, "p5": 7.4392, "p95": 8.7306, "std": 0.3690, "min": 7.3567, "max": 9.0017},
+      "gpu_decompress_ms": {"median": 0.2333, "mean": 0.2338, "p5": 0.2247, "p95": 0.2502, "std": 0.0083, "min": 0.2230, "max": 0.2905},
+      "sim_search_ms": 10.0,
+      "total_A_ms": 134.2640, "total_C_ms": 18.0712, "speedup": 7.43
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 build/
-results/
+# Track results/ (raw JSON, figures, plotting scripts)
+# results/
 *.o
 *.a
 *.so
