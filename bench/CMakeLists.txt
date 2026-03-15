@@ -1,0 +1,20 @@
+include(FetchContent)
+FetchContent_Declare(
+    googlebenchmark
+    GIT_REPOSITORY https://github.com/google/benchmark.git
+    GIT_TAG v1.9.1
+    GIT_SHALLOW ON
+)
+set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googlebenchmark)
+
+function(add_cu_roaring_bench name)
+    add_executable(${name} ${name}.cu)
+    target_link_libraries(${name} PRIVATE cu_roaring_filter benchmark::benchmark benchmark::benchmark_main)
+    set_target_properties(${name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endfunction()
+
+add_cu_roaring_bench(bench_set_ops)
+add_cu_roaring_bench(bench_decompress)
+add_cu_roaring_bench(bench_transfer)

@@ -1,0 +1,5 @@
+build/
+results/
+*.o
+*.a
+*.so
