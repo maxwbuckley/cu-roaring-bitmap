@@ -6,3 +6,4 @@
 #include "cu_roaring/detail/upload.cuh"
 #include "cu_roaring/detail/decompress.cuh"
 #include "cu_roaring/detail/set_ops.cuh"
+#include "cu_roaring/detail/upload_ids.cuh"

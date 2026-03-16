@@ -10,13 +10,16 @@ __device__ __forceinline__ bool warp_contains(const GpuRoaringView& r, uint32_t 
   const uint16_t key = static_cast<uint16_t>(id >> 16);
   const uint16_t low = static_cast<uint16_t>(id & 0xFFFF);
   const unsigned lane = threadIdx.x & 31;
-  constexpr unsigned FULL_MASK = 0xFFFFFFFF;
+
+  // Use the active mask instead of FULL_MASK to avoid deadlocks when
+  // not all warp lanes participate (e.g. inside CAGRA search kernels).
+  const unsigned active_mask = __activemask();
 
   // Find the leader: for each thread, find the lowest lane with the same key.
   // Use __match_any_sync to get a mask of all lanes with the same key,
   // then find the lowest set bit as the leader.
 #if __CUDA_ARCH__ >= 700
-  unsigned match_mask = __match_any_sync(FULL_MASK, static_cast<unsigned>(key));
+  unsigned match_mask = __match_any_sync(active_mask, static_cast<unsigned>(key));
   unsigned leader_lane = __ffs(match_mask) - 1;  // lowest set bit (0-indexed)
 #else
   // Fallback for older architectures: every thread is its own leader
@@ -36,7 +39,7 @@ __device__ __forceinline__ bool warp_contains(const GpuRoaringView& r, uint32_t 
   }
 
   // Broadcast result from leader to all threads with the same key
-  container_idx = __shfl_sync(FULL_MASK, container_idx, leader_lane);
+  container_idx = __shfl_sync(active_mask, container_idx, leader_lane);
 
   if (container_idx < 0) return false;
 
