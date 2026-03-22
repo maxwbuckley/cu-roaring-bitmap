@@ -272,14 +272,14 @@ For "color=red AND price<50 AND in_stock" at 1B scale:
 | Sort + dedup in `upload_from_ids` | Accepts unsorted/duplicate IDs, uses CUB on GPU | `upload_ids.cu` |
 | Direct-map key index | O(1) key lookup replaces O(log n) binary search. 30 KB at 1B | `roaring_view.cuh`, all upload paths |
 | 2-read all-bitmap fast path | Skips type/offset/card reads when all containers are bitmap. 2 reads vs bitset's 1 | `roaring_view.cuh`, `roaring_warp_query.cuh` |
+| Fused multi-AND kernel | 3-6x faster than pairwise chain for N-way AND on all-bitmap inputs | `set_ops.cu` |
 | Strict `-Werror` (14 flags) | Zero warnings on all 11 targets | `CMakeLists.txt` |
 
 ### Planned (not started)
 
 | Optimization | Expected Impact | Effort | Notes |
 |---|---|---|---|
-| **Fused multi-predicate kernel** | 20-40% for 4+ predicates | High | Current `multi_and` does N pairwise ops with ~20 cudaMallocs each. Fuse into single D2H + multi-way merge + batched kernels |
-| **cudaMallocAsync / memory pool** | Reduce allocation stalls | Medium | Replace synchronous cudaMalloc in upload and set_ops with stream-ordered allocation |
+| **cudaMallocAsync / memory pool** | Reduce allocation stalls | Medium | Replace synchronous cudaMalloc in pairwise set_ops with stream-ordered allocation |
 | **IVF-PQ/Flat support** | Expand beyond CAGRA | Medium | Add `FilterType::Roaring` to cuVS IVF runtime dispatch union |
 | **Python bindings** | Developer reach | Medium | Expose `roaring_filter` through `pylibcuvs` for Python RAG pipelines |
 | **Shared memory key cache** | Better locality in CAGRA kernel | Low | Preload key index into SMEM once per block. Only measurable inside CAGRA, not standalone |
