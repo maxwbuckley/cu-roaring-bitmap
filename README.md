@@ -21,7 +21,7 @@ cd cu-roaring-filter
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="89"
 make -j$(nproc)
-ctest --output-on-failure   # 34 tests
+ctest --output-on-failure   # 4 test suites
 ```
 
 Requires: CUDA 12.4+, CMake 3.25+, GCC 13+ (or any C++17 compiler).
@@ -40,7 +40,6 @@ roaring_bitmap_add_range(cpu_bm, 0, 500000);
 
 // Transfer to GPU in compressed SoA format
 cu_roaring::GpuRoaring gpu_bm = cu_roaring::upload(cpu_bm, stream);
-cu_roaring::build_key_bloom(gpu_bm, stream);  // optional Bloom filter
 
 roaring_bitmap_free(cpu_bm);  // CPU copy no longer needed
 ```
@@ -126,7 +125,6 @@ cu-roaring-filter integrates natively with CAGRA's filtered search. The Roaring 
 auto color_bm   = cu_roaring::upload(color_red_bitmap, stream);
 auto price_bm   = cu_roaring::upload(price_lt_50_bitmap, stream);
 auto filter_bm   = cu_roaring::set_operation(color_bm, price_bm, cu_roaring::SetOp::AND, stream);
-cu_roaring::build_key_bloom(filter_bm, stream);
 
 auto view = cu_roaring::make_view(filter_bm);
 auto filter = cuvs::neighbors::filtering::roaring_filter_warp(
@@ -138,7 +136,7 @@ cuvs::neighbors::cagra::search(res, params, index, queries, neighbors, distances
 
 ## Benchmark Results
 
-All benchmarks on NVIDIA RTX 5090 (170 SMs, 32 GB). Median of 30 iterations with 10 warmup.
+All benchmarks on NVIDIA RTX 5090 (170 SMs, 32 GB). Median of 50 iterations with 10 warmup.
 
 ### Filter Construction (1B universe, Zipfian tag distribution)
 
@@ -148,21 +146,23 @@ All benchmarks on NVIDIA RTX 5090 (170 SMs, 32 GB). Median of 30 iterations with
 | 4 | 180.6 ms | 10.4 ms | **17x** |
 | 8 | 180.1 ms | 15.5 ms | **12x** |
 
-### CAGRA Filtered Search (1M vectors, 128-dim, k=10, batch=100)
+### Point Query Throughput (10M random queries)
 
-| Pass Rate | cuVS bitset | roaring_warp | Speedup | Recall |
-|-----------|------------|-------------|---------|--------|
-| 50% | 0.981 ms | 0.751 ms | **1.31x** | 98.2% |
-| 10% | 1.602 ms | 1.327 ms | **1.21x** | 96.2% |
-| 1% | 3.596 ms | 3.584 ms | 1.00x | 97.2% |
+Standalone point query benchmark comparing `contains()`, `warp_contains()`, and flat bitset across universe sizes and set densities.
 
-### Throughput (1M vectors, batch=10K)
+| Universe | Density | Containers | Bitset | `contains()` | `warp_contains()` | Roaring vs Bitset |
+|----------|---------|------------|--------|-------------|-------------------|-------------------|
+| 1M | 0.1% | 16 (all array) | 137 Gq/s | 167 Gq/s | 151 Gq/s | **1.2x faster** |
+| 10M | 0.1% | 153 (all array) | 100 Gq/s | 136 Gq/s | 115 Gq/s | **1.4x faster** |
+| 100M | 10% | 1526 (all bitmap) | 101 Gq/s | 95 Gq/s | 94 Gq/s | 0.9x |
+| 100M | 1% | 1526 (all array) | 101 Gq/s | 13 Gq/s | 13 Gq/s | 0.1x |
+| 1B | 10% | 15259 (all bitmap) | 15 Gq/s | 15 Gq/s | **24 Gq/s** | **1.6x faster** |
+| 1B | 50% | 15259 (all bitmap) | 27 Gq/s | 26 Gq/s | 24 Gq/s | 1.0x |
 
-| Filter | QPS |
-|--------|-----|
-| No filter | 2.6M |
-| Bitset | 922K |
-| Roaring warp | **960K** |
+Key findings:
+- **Bitmap containers match or beat bitset speed** — at 1B/10%, `warp_contains()` is 1.6x faster than flat bitset because the 125 MB bitset thrashes L2 cache while Roaring accesses less data per query via the `__ldg` read-only cache path.
+- **Array containers are slow** — the double binary search (key lookup + in-container search) causes 3-8x slowdown at 100M+ scale. See [Optimization Analysis](#optimization-analysis) for solutions.
+- **Small universes favor Roaring** — at 1M (16 containers), the entire structure fits in L2 cache and `contains()` is faster than bitset.
 
 ### Memory Compression
 
@@ -178,6 +178,48 @@ All benchmarks on NVIDIA RTX 5090 (170 SMs, 32 GB). Median of 30 iterations with
 |--------------|---------|-----------|
 | 1B | 0.23 ms | 538 GB/s |
 | 100M | 0.018 ms | 713 GB/s |
+
+### CAGRA Filtered Search (1M vectors, 128-dim, k=10, batch=100)
+
+| Pass Rate | cuVS bitset | roaring_warp | Speedup | Recall |
+|-----------|------------|-------------|---------|--------|
+| 50% | 0.981 ms | 0.751 ms | **1.31x** | 98.2% |
+| 10% | 1.602 ms | 1.327 ms | **1.21x** | 96.2% |
+| 1% | 3.596 ms | 3.584 ms | 1.00x | 97.2% |
+
+## Optimization Analysis
+
+Detailed benchmarks in `bench/bench_optimized_query.cu` (B7) measured three optimization strategies against the baseline. Results on 10M random queries, RTX 5090.
+
+### The Array Container Problem
+
+Array containers (used when a container has fewer than 4096 elements) require a binary search inside the container *on top of* the key binary search. This compounds to 18-28 global memory reads per query vs 1 for a flat bitset:
+
+```
+Flat bitset:   id → bitset[id/32]                    = 1 global read
+Roaring array: id → key search (11 reads) →
+                     type/offset/card (3 reads) →
+                     array search (10 reads)          = 24 global reads
+Roaring bitmap: id → key search (11 reads) →
+                      type/offset (2 reads) →
+                      bitmap word (1 read)            = 14 global reads
+```
+
+### Optimization Results
+
+| Strategy | What it does | Best speedup | When to use |
+|----------|-------------|-------------|-------------|
+| **All-bitmap promotion** | Convert array containers to bitmap at upload time | **7.4x** (100M/1%) | Hot filters queried millions of times |
+| **Direct-map key index** | Replace O(log n) key binary search with O(1) table lookup | **1.75x** (1B/10%) | Large universe (1B+) with bitmap containers |
+| **`__ldg()` + warp broadcast** | Read-only cache for global loads; leader broadcasts metadata | **1.6x** (1B/10%) | Already applied in library |
+
+### Recommendations for cuVS Integration
+
+1. **Hot filters** (queried during CAGRA graph traversal): Promote all array containers to bitmap at upload time. The 3-8x query speedup justifies the extra memory. At 0.1% density this means using 125 MB instead of 2.1 MB — but you're querying this filter millions of times per search batch.
+
+2. **Cold filters** (stored in GPU memory, used for set operations): Keep compressed Roaring. The 59x memory savings lets you store far more concurrent filters in GPU memory.
+
+3. **Memory is the real value proposition** at scale. With 100 filter attributes at 1B scale: flat bitsets require 12.5 GB, Roaring requires ~0.7 GB for sparse attributes.
 
 ## Architecture
 
@@ -208,17 +250,18 @@ Following the CRoaring format, each 16-bit key range uses the most compact repre
 ### Query Strategies
 
 **`contains(id)`** — Per-thread point query:
-1. Extract high-16 key, check Bloom filter (if present)
-2. Binary search over sorted keys array
-3. Container-type-specific membership test
+1. Extract high-16 key
+2. Binary search over sorted keys array (via `__ldg` read-only cache)
+3. Load container metadata (type, offset, cardinality) via `__ldg`
+4. Container-type-specific membership test
 
 **`warp_contains(id)`** — Warp-cooperative query:
 1. `__match_any_sync` groups threads with the same high-16 key
-2. Leader thread performs one binary search
-3. `__shfl_sync` broadcasts container index to group
+2. Leader thread performs one binary search + reads metadata
+3. `__shfl_sync` broadcasts container index, type, offset, and cardinality to group
 4. Each thread does its own low-16-bit membership test
 
-The warp variant reduces binary searches by up to 32x when neighboring threads query IDs in the same container (common in graph traversal).
+The warp variant reduces binary searches by up to 32x when neighboring threads query IDs in the same container (common in graph traversal). At 1B scale with bitmap containers, this makes `warp_contains()` 1.6x faster than a flat bitset.
 
 ## Project Structure
 
@@ -234,12 +277,18 @@ cu-roaring-filter/
 │   │   ├── set_ops.cuh             AND/OR/ANDNOT/XOR
 │   │   └── utils.cuh               CUDA_CHECK, helpers
 │   └── device/
-│       ├── roaring_view.cuh        device-side contains()
-│       ├── roaring_warp_query.cuh  warp-cooperative contains()
+│       ├── roaring_view.cuh        device-side contains() with __ldg
+│       ├── roaring_warp_query.cuh  warp-cooperative contains() with broadcast
 │       └── make_view.cuh           GpuRoaring → GpuRoaringView
 ├── src/                            implementation (.cpp, .cu)
-├── test/                           34 Google Tests
-├── bench/                          benchmarks (Google Benchmark + standalone)
+├── test/                           4 test suites (Google Test)
+├── bench/                          benchmarks (B1-B7)
+│   ├── bench_comprehensive.cu      B1/B3/B4/B5: construction, memory, E2E
+│   ├── bench_point_query.cu        B6: point query throughput
+│   ├── bench_optimized_query.cu    B7: optimization analysis
+│   ├── bench_set_ops.cu            set operation microbenchmarks
+│   ├── bench_decompress.cu         decompression microbenchmarks
+│   └── bench_transfer.cu           PCIe transfer comparison
 ├── third_party/CRoaring/           git submodule
 └── results/                        benchmark outputs + figures
 ```
@@ -253,7 +302,7 @@ cu-roaring-filter/
 | **Set ops on GPU** | AND/OR/ANDNOT/XOR | Bitwise only | N/A (built into index) |
 | **Kernel integration** | `contains()` / `warp_contains()` | Bit test | N/A (custom kernels) |
 | **Ad-hoc queries** | Yes | Yes | No (requires re-indexing) |
-| **Peak filtered QPS** | 960K (CAGRA, 1M, batch=10K) | 922K | 5M (custom index, 10M) |
+| **Point query (1B/10%)** | **24 Gq/s** (warp) | 15 Gq/s | N/A |
 | **Construction** | Upload + set ops (~10ms for 4 preds @ 1B) | Trivial | Index build (minutes) |
 
 ## License

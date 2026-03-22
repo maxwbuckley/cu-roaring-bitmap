@@ -37,16 +37,39 @@ struct GpuRoaringView {
     int idx = binary_search_keys(key);
     if (idx < 0) return false;
 
-    switch (types[idx]) {
+    auto type = load_type(idx);
+    uint32_t off = load_offset(idx);
+
+    switch (type) {
       case ContainerTypeD::BITMAP:
-        return bitmap_contains(offsets[idx], low);
+        return bitmap_contains(off, low);
       case ContainerTypeD::ARRAY:
-        return array_contains(offsets[idx], cardinalities[idx], low);
+        return array_contains(off, load_cardinality(idx), low);
       case ContainerTypeD::RUN:
-        return run_contains(offsets[idx], cardinalities[idx], low);
+        return run_contains(off, load_cardinality(idx), low);
       default: return false;
     }
   }
+
+  // ---- Metadata loads via __ldg (read-only texture cache) ----
+
+  __device__ __forceinline__ ContainerTypeD load_type(int idx) const
+  {
+    return static_cast<ContainerTypeD>(
+        __ldg(reinterpret_cast<const uint8_t*>(types) + idx));
+  }
+
+  __device__ __forceinline__ uint32_t load_offset(int idx) const
+  {
+    return __ldg(offsets + idx);
+  }
+
+  __device__ __forceinline__ uint16_t load_cardinality(int idx) const
+  {
+    return __ldg(cardinalities + idx);
+  }
+
+  // ---- Bloom filter ----
 
   __device__ __forceinline__ bool bloom_may_contain(uint16_t key) const
   {
@@ -55,18 +78,20 @@ struct GpuRoaringView {
     constexpr uint32_t BLOOM_BITS = BLOOM_SIZE_WORDS * 32;
     for (uint32_t i = 0; i < bloom_n_hashes; ++i) {
       uint32_t bit = (h1 + i * h2) % BLOOM_BITS;
-      if (!(key_bloom[bit >> 5] & (1u << (bit & 31)))) return false;
+      if (!(__ldg(key_bloom + (bit >> 5)) & (1u << (bit & 31)))) return false;
     }
     return true;
   }
+
+  // ---- Key binary search (uses __ldg for each probe) ----
 
   __device__ __forceinline__ int binary_search_keys(uint16_t key) const
   {
     int lo = 0;
     int hi = static_cast<int>(n_containers) - 1;
     while (lo <= hi) {
-      int mid         = (lo + hi) >> 1;
-      uint16_t mid_key = keys[mid];
+      int mid          = (lo + hi) >> 1;
+      uint16_t mid_key = __ldg(keys + mid);
       if (mid_key == key) return mid;
       if (mid_key < key)
         lo = mid + 1;
@@ -80,7 +105,7 @@ struct GpuRoaringView {
 
   __device__ __forceinline__ bool bitmap_contains(uint32_t byte_offset, uint16_t low) const
   {
-    uint64_t word = bitmap_data[byte_offset / sizeof(uint64_t) + (low >> 6)];
+    uint64_t word = __ldg(bitmap_data + byte_offset / sizeof(uint64_t) + (low >> 6));
     return (word >> (low & 63)) & 1;
   }
 
@@ -93,7 +118,7 @@ struct GpuRoaringView {
     int hi = static_cast<int>(card) - 1;
     while (lo <= hi) {
       int mid      = (lo + hi) >> 1;
-      uint16_t val = arr[mid];
+      uint16_t val = __ldg(arr + mid);
       if (val == low) return true;
       if (val < low)
         lo = mid + 1;
@@ -112,8 +137,8 @@ struct GpuRoaringView {
     int hi = static_cast<int>(n_runs) - 1;
     while (lo <= hi) {
       int mid        = (lo + hi) >> 1;
-      uint16_t start = runs[mid * 2];
-      uint16_t len   = runs[mid * 2 + 1];
+      uint16_t start = __ldg(runs + mid * 2);
+      uint16_t len   = __ldg(runs + mid * 2 + 1);
       if (low < start)
         hi = mid - 1;
       else if (low > start + len)

@@ -5,6 +5,9 @@ namespace cu_roaring {
 
 // Warp-cooperative contains: threads sharing the same high-16 key
 // amortise the binary search over the container key array.
+// The leader also reads container metadata and broadcasts it via
+// __shfl_sync, so follower lanes never touch global memory for
+// type/offset/cardinality lookups.
 __device__ __forceinline__ bool warp_contains(const GpuRoaringView& r, uint32_t id)
 {
   const uint16_t key = static_cast<uint16_t>(id >> 16);
@@ -28,32 +31,43 @@ __device__ __forceinline__ bool warp_contains(const GpuRoaringView& r, uint32_t 
 
   bool is_leader = (lane == leader_lane);
 
-  // Leaders do the binary search
+  // Leaders do the binary search + metadata read.
+  // Followers get results via __shfl_sync (no global memory access).
   int container_idx = -1;
+  uint32_t meta_type   = 0;
+  uint32_t meta_offset = 0;
+  uint32_t meta_card   = 0;
+
   if (is_leader) {
     if (r.bloom_n_hashes > 0 && !r.bloom_may_contain(key)) {
       container_idx = -2;
     } else {
       container_idx = r.binary_search_keys(key);
     }
+
+    if (container_idx >= 0) {
+      meta_type   = static_cast<uint32_t>(r.load_type(container_idx));
+      meta_offset = r.load_offset(container_idx);
+      meta_card   = r.load_cardinality(container_idx);
+    }
   }
 
-  // Broadcast result from leader to all threads with the same key
+  // Broadcast everything from leader — followers do zero global reads
   container_idx = __shfl_sync(active_mask, container_idx, leader_lane);
-
   if (container_idx < 0) return false;
 
-  // Each thread does its own low-bits check
-  ContainerTypeD type = r.types[container_idx];
-  uint32_t offset     = r.offsets[container_idx];
+  meta_type   = __shfl_sync(active_mask, meta_type, leader_lane);
+  meta_offset = __shfl_sync(active_mask, meta_offset, leader_lane);
+  meta_card   = __shfl_sync(active_mask, meta_card, leader_lane);
 
-  switch (type) {
+  // Each thread does its own low-bits check using the broadcast metadata
+  switch (static_cast<ContainerTypeD>(meta_type)) {
     case ContainerTypeD::BITMAP:
-      return r.bitmap_contains(offset, low);
+      return r.bitmap_contains(meta_offset, low);
     case ContainerTypeD::ARRAY:
-      return r.array_contains(offset, r.cardinalities[container_idx], low);
+      return r.array_contains(meta_offset, static_cast<uint16_t>(meta_card), low);
     case ContainerTypeD::RUN:
-      return r.run_contains(offset, r.cardinalities[container_idx], low);
+      return r.run_contains(meta_offset, static_cast<uint16_t>(meta_card), low);
     default: return false;
   }
 }
