@@ -43,6 +43,14 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
         CUDA_CHECK(cudaMemcpyAsync(result.bitmap_data, bm.bitmap_data,
                                    n * 1024 * sizeof(uint64_t),
                                    cudaMemcpyDeviceToDevice, stream));
+        // Copy key_index
+        if (bm.key_index) {
+            result.max_key = bm.max_key;
+            size_t idx_bytes = (static_cast<size_t>(bm.max_key) + 1) * sizeof(uint16_t);
+            CUDA_CHECK(cudaMalloc(&result.key_index, idx_bytes));
+            CUDA_CHECK(cudaMemcpyAsync(result.key_index, bm.key_index,
+                                       idx_bytes, cudaMemcpyDeviceToDevice, stream));
+        }
         CUDA_CHECK(cudaStreamSynchronize(stream));
         return result;
     }
@@ -172,6 +180,20 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
     CUDA_CHECK(cudaMemcpyAsync(result.bitmap_data, all_bitmap.data(),
                                static_cast<size_t>(n) * 1024 * sizeof(uint64_t),
                                cudaMemcpyHostToDevice, stream));
+
+    // Build key_index (we have h_keys on host already)
+    if (n > 0) {
+        result.max_key = h_keys[n - 1];
+        std::vector<uint16_t> h_key_index(result.max_key + 1, 0xFFFF);
+        for (uint32_t i = 0; i < n; ++i) {
+            h_key_index[h_keys[i]] = static_cast<uint16_t>(i);
+        }
+        CUDA_CHECK(cudaMalloc(&result.key_index,
+                              (result.max_key + 1) * sizeof(uint16_t)));
+        CUDA_CHECK(cudaMemcpyAsync(result.key_index, h_key_index.data(),
+                                   (result.max_key + 1) * sizeof(uint16_t),
+                                   cudaMemcpyHostToDevice, stream));
+    }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
     return result;

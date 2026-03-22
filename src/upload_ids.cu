@@ -63,6 +63,30 @@ __global__ void scatter_to_bitmaps_kernel(const uint32_t* sorted_ids,
     }
 }
 
+// Build direct-map key index: key_index[key] = container index, 0xFFFF = absent
+__global__ void build_key_index_kernel(const uint16_t* unique_keys,
+                                        uint16_t* key_index,
+                                        uint32_t n_containers,
+                                        uint32_t max_key_plus_one)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    // First: zero-fill with 0xFFFF (absent sentinel)
+    if (i < max_key_plus_one) {
+        key_index[i] = 0xFFFF;
+    }
+    // Barrier not needed — separate kernel launch for the write pass
+}
+
+__global__ void populate_key_index_kernel(const uint16_t* unique_keys,
+                                           uint16_t* key_index,
+                                           uint32_t n_containers)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_containers) {
+        key_index[unique_keys[i]] = static_cast<uint16_t>(i);
+    }
+}
+
 // Build metadata arrays: keys, types (all BITMAP), offsets, cardinalities
 __global__ void build_metadata_kernel(const uint16_t* unique_keys,
                                        const uint32_t* counts,
@@ -223,6 +247,28 @@ static GpuRoaring gpu_upload(const uint32_t* host_ids,
             h_n_containers);
     }
 
+    // 9. Build direct-map key index on GPU
+    // Get max_key (last element of d_container_keys)
+    uint16_t h_max_key = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&h_max_key,
+                               d_container_keys + h_n_containers - 1,
+                               sizeof(uint16_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    result.max_key = h_max_key;
+
+    uint32_t index_size = static_cast<uint32_t>(h_max_key) + 1;
+    CUDA_CHECK(cudaMalloc(&result.key_index, index_size * sizeof(uint16_t)));
+    // Fill with 0xFFFF
+    CUDA_CHECK(cudaMemsetAsync(result.key_index, 0xFF,
+                               index_size * sizeof(uint16_t), stream));
+    // Write container indices
+    {
+        uint32_t blocks = (h_n_containers + 255) / 256;
+        populate_key_index_kernel<<<blocks, 256, 0, stream>>>(
+            d_container_keys, result.key_index, h_n_containers);
+    }
+
     cudaFree(d_container_keys);
     cudaFree(d_counts);
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -331,6 +377,20 @@ static GpuRoaring cpu_upload(const uint32_t* raw_ids,
                               h_array_pool.size() * sizeof(uint16_t)));
         CUDA_CHECK(cudaMemcpyAsync(result.array_data, h_array_pool.data(),
                                    h_array_pool.size() * sizeof(uint16_t),
+                                   cudaMemcpyHostToDevice, stream));
+    }
+
+    // Build direct-map key index
+    if (n > 0) {
+        result.max_key = h_keys[n - 1];
+        std::vector<uint16_t> h_key_index(result.max_key + 1, 0xFFFF);
+        for (uint32_t i = 0; i < n; ++i) {
+            h_key_index[h_keys[i]] = static_cast<uint16_t>(i);
+        }
+        CUDA_CHECK(cudaMalloc(&result.key_index,
+                              (result.max_key + 1) * sizeof(uint16_t)));
+        CUDA_CHECK(cudaMemcpyAsync(result.key_index, h_key_index.data(),
+                                   (result.max_key + 1) * sizeof(uint16_t),
                                    cudaMemcpyHostToDevice, stream));
     }
 

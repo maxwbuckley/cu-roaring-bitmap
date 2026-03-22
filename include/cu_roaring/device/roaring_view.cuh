@@ -22,12 +22,16 @@ struct GpuRoaringView {
   const uint16_t* array_data;
   const uint16_t* run_data;
 
+  // Direct-map key index: O(1) lookup replaces O(log n) binary search
+  const uint16_t* key_index;    // key_index[high16] = container idx, 0xFFFF = absent
+  uint32_t        max_key;      // highest valid key value
+
   __device__ __forceinline__ bool contains(uint32_t id) const
   {
     const uint16_t key = static_cast<uint16_t>(id >> 16);
     const uint16_t low = static_cast<uint16_t>(id & 0xFFFF);
 
-    int idx = binary_search_keys(key);
+    int idx = lookup_key(key);
     if (idx < 0) return false;
 
     auto type = load_type(idx);
@@ -42,6 +46,20 @@ struct GpuRoaringView {
         return run_contains(off, load_cardinality(idx), low);
       default: return false;
     }
+  }
+
+  // ---- Key lookup: O(1) direct-map or O(log n) binary search fallback ----
+
+  __device__ __forceinline__ int lookup_key(uint16_t key) const
+  {
+    if (key_index) {
+      // O(1) direct-map lookup
+      if (key > max_key) return -1;
+      uint16_t idx = __ldg(key_index + key);
+      return (idx == 0xFFFF) ? -1 : static_cast<int>(idx);
+    }
+    // Fallback: binary search (for views created without key_index)
+    return binary_search_keys(key);
   }
 
   // ---- Metadata loads via __ldg (read-only texture cache) ----
@@ -62,7 +80,7 @@ struct GpuRoaringView {
     return __ldg(cardinalities + idx);
   }
 
-  // ---- Key binary search (uses __ldg for each probe) ----
+  // ---- Binary search fallback ----
 
   __device__ __forceinline__ int binary_search_keys(uint16_t key) const
   {

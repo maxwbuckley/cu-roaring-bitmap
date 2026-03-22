@@ -227,6 +227,21 @@ GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap, cudaStream_t stream,
     if (h_array_pool)  cudaFreeHost(h_array_pool);
     if (h_run_pool)    cudaFreeHost(h_run_pool);
 
+    // Build direct-map key index
+    if (n > 0) {
+        result.max_key = h_keys[n - 1];
+        std::vector<uint16_t> h_key_index(result.max_key + 1, 0xFFFF);
+        for (uint32_t i = 0; i < n; ++i) {
+            h_key_index[h_keys[i]] = static_cast<uint16_t>(i);
+        }
+        CUDA_CHECK(cudaMalloc(&result.key_index,
+                              (result.max_key + 1) * sizeof(uint16_t)));
+        CUDA_CHECK(cudaMemcpyAsync(result.key_index, h_key_index.data(),
+                                   (result.max_key + 1) * sizeof(uint16_t),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
     // Resolve auto threshold based on GPU L2 cache size
     uint32_t effective_threshold = bitmap_threshold;
     if (bitmap_threshold == PROMOTE_AUTO) {
@@ -252,6 +267,7 @@ void gpu_roaring_free(GpuRoaring& bitmap) {
     if (bitmap.bitmap_data)   cudaFree(bitmap.bitmap_data);
     if (bitmap.array_data)    cudaFree(bitmap.array_data);
     if (bitmap.run_data)      cudaFree(bitmap.run_data);
+    if (bitmap.key_index)     cudaFree(bitmap.key_index);
     bitmap = GpuRoaring{};
 }
 

@@ -30,6 +30,12 @@ struct GpuRoaring {
 
     uint16_t* run_data           = nullptr; // [total_run_pairs * 2] packed (start, length)
     uint32_t  n_run_containers    = 0;
+
+    // Direct-map key index: key_index[high16] = container index, or 0xFFFF.
+    // Replaces O(log n) binary search with O(1) table lookup.
+    // Built automatically during upload. Memory: (max_key + 1) * 2 bytes.
+    uint16_t* key_index          = nullptr; // [max_key + 1] or nullptr
+    uint32_t  max_key            = 0;       // highest container key value
 };
 
 struct GpuRoaringMeta {
