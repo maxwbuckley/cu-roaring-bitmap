@@ -270,13 +270,9 @@ For "color=red AND price<50 AND in_stock" at 1B scale:
 | One-line cuVS filter constructor | `roaring_filter(bitmap)` | `roaring_filter.cuh` |
 | GPU-native upload pipeline | 66x faster at 100M IDs (99ms vs 7.5s CPU) | `upload_ids.cu` |
 | Sort + dedup in `upload_from_ids` | Accepts unsorted/duplicate IDs, uses CUB on GPU | `upload_ids.cu` |
+| Direct-map key index | O(1) key lookup replaces O(log n) binary search. 30 KB at 1B | `roaring_view.cuh`, all upload paths |
+| 2-read all-bitmap fast path | Skips type/offset/card reads when all containers are bitmap. 2 reads vs bitset's 1 | `roaring_view.cuh`, `roaring_warp_query.cuh` |
 | Strict `-Werror` (14 flags) | Zero warnings on all 11 targets | `CMakeLists.txt` |
-
-### Prototyped (benchmarked, not yet in library)
-
-| Optimization | Impact | Effort | Notes |
-|---|---|---|---|
-| Direct-map key index | 1.75x at 1B for `contains()` | Medium | O(1) table lookup replaces O(log n) binary search. 30 KB at 1B. Prototyped in `bench_optimized_query.cu` |
 
 ### Planned (not started)
 
