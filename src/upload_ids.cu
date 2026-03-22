@@ -13,8 +13,10 @@
 
 namespace cu_roaring {
 
-// Below this threshold, use CPU sort (faster due to kernel launch overhead)
-static constexpr uint32_t GPU_SORT_THRESHOLD = 65536;
+// Below this threshold, use CPU sort. The GPU-native pipeline wins at all
+// scales above ~1K IDs on RTX 5090 (CUB launch overhead ~0.3ms vs CPU
+// sort + upload). Conservative at 1024 to account for smaller GPUs.
+static constexpr uint32_t GPU_SORT_THRESHOLD = 1024;
 
 // ============================================================================
 // GPU kernels for fully device-resident upload pipeline
