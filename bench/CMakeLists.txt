@@ -49,3 +49,9 @@ add_executable(bench_multi_and bench_multi_and.cu)
 target_link_libraries(bench_multi_and PRIVATE cu_roaring_filter)
 set_target_properties(bench_multi_and PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 cu_roaring_target_strict_warnings(bench_multi_and)
+
+# YFCC-10M filtered track benchmark
+add_executable(bench_yfcc bench_yfcc.cu)
+target_link_libraries(bench_yfcc PRIVATE cu_roaring_filter)
+set_target_properties(bench_yfcc PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+cu_roaring_target_strict_warnings(bench_yfcc)

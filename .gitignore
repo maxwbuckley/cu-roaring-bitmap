@@ -4,3 +4,4 @@ build/
 *.o
 *.a
 *.so
+bench/yfcc_data/
