@@ -16,6 +16,6 @@ GpuRoaring upload_from_sorted_ids(const uint32_t* sorted_ids,
                                   uint32_t n_ids,
                                   uint32_t universe_size,
                                   cudaStream_t stream = 0,
-                                  uint32_t bitmap_threshold = PROMOTE_NONE);
+                                  uint32_t bitmap_threshold = PROMOTE_AUTO);
 
 }  // namespace cu_roaring

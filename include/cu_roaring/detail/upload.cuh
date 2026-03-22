@@ -18,7 +18,7 @@ namespace cu_roaring {
 //   Any value N         — promote containers with cardinality > N to bitmap
 GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap,
                   cudaStream_t stream = 0,
-                  uint32_t bitmap_threshold = PROMOTE_NONE);
+                  uint32_t bitmap_threshold = PROMOTE_AUTO);
 
 void gpu_roaring_free(GpuRoaring& bitmap);
 

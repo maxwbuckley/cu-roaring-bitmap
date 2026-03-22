@@ -207,11 +207,20 @@ The compression advantage is most impactful when many attributes are sparse (0.1
 
 ### Recommended Strategy
 
+The default `PROMOTE_AUTO` policy handles this automatically by querying the GPU's L2 cache size at upload time:
+
+| Condition | Auto Decision | Why |
+|-----------|--------------|-----|
+| Flat bitset fits in L2 (small universe) | `PROMOTE_NONE` — keep arrays | Bitset reads would be L2 hits; save memory |
+| Flat bitset exceeds L2 (large universe) | `PROMOTE_ALL` — all bitmap | Bitset would thrash cache; roaring's `__ldg` reads win |
+
+Developers just call `upload()` with no arguments and get the right behavior. Manual overrides are available:
+
 | Use Case | Strategy | Memory | Query Speed |
 |----------|----------|--------|-------------|
-| **Hot filter** (queried per search) | `upload(bm, stream, PROMOTE_ALL)` | Same as bitset | Matches or beats bitset |
-| **Cold filter** (stored, used in set ops) | Default Roaring | 6-59x smaller | Slower per-query, but rarely queried directly |
-| **Multi-predicate** | Set ops on compressed, then promote result | Only final result uses full memory | Best of both worlds |
+| **Default** | `upload(bm, stream)` — auto | Optimal | Optimal |
+| **Cold filter** (stored, used in set ops) | `upload(bm, stream, PROMOTE_NONE)` | 6-59x smaller | Slower per-query |
+| **Multi-predicate** | Set ops on compressed, then `promote_auto()` result | Only final result uses full memory | Best of both worlds |
 
 ---
 
@@ -254,7 +263,8 @@ Total: ~17 ms → 12x faster
 | `__ldg()` on all device reads | `roaring_view.cuh` | 1.6x at 1B/10% (texture cache for scattered reads) |
 | Warp metadata broadcast | `roaring_warp_query.cuh` | Eliminates 96 redundant global reads per warp |
 | All-bitmap promotion | `promote.cuh`, `upload.cuh`, `upload_ids.cuh` | 3.9-7.4x for array container elimination |
-| Configurable threshold | `upload()`, `upload_from_sorted_ids()` | `PROMOTE_ALL` or custom threshold |
+| Cache-aware auto policy | `promote.cuh` — `PROMOTE_AUTO` default | Queries L2 cache size, selects optimal strategy per GPU |
+| Configurable threshold | `upload()`, `upload_from_sorted_ids()` | `PROMOTE_AUTO` (default), `PROMOTE_ALL`, `PROMOTE_NONE`, or custom |
 | Strict `-Werror` warnings | `CMakeLists.txt` | `-Wshadow`, `-Wnon-virtual-dtor`, etc. on all targets |
 
 ### Prototyped (not yet in library)

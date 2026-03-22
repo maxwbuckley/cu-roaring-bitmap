@@ -175,4 +175,50 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
     return result;
 }
 
+// ============================================================================
+// Cache-aware automatic promotion
+// ============================================================================
+
+uint32_t resolve_auto_threshold(uint32_t universe_size, int device_id)
+{
+    if (device_id < 0) {
+        CUDA_CHECK(cudaGetDevice(&device_id));
+    }
+
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
+
+    size_t l2_bytes          = static_cast<size_t>(prop.l2CacheSize);
+    size_t flat_bitset_bytes = (static_cast<size_t>(universe_size) + 7) / 8;
+
+    // If the flat bitset exceeds L2 cache, scattered bitset reads will
+    // thrash the cache. Roaring with all-bitmap containers wins here
+    // because __ldg routes through the read-only texture cache and the
+    // key-indexed access pattern has better spatial locality than random
+    // bitset lookups across a 100+ MB array.
+    //
+    // If the flat bitset fits in L2, bitset point queries are essentially
+    // free (single L2-cached read), so there's no query speed reason to
+    // promote. The user chose roaring for memory savings or set operations,
+    // not for query speed at this scale.
+    if (flat_bitset_bytes > l2_bytes) {
+        return PROMOTE_ALL;
+    }
+    return PROMOTE_NONE;
+}
+
+GpuRoaring promote_auto(const GpuRoaring& bm, cudaStream_t stream, int device_id)
+{
+    uint32_t threshold = resolve_auto_threshold(bm.universe_size, device_id);
+
+    if (threshold == PROMOTE_ALL &&
+        (bm.n_array_containers > 0 || bm.n_run_containers > 0)) {
+        return promote_to_bitmap(bm, stream);
+    }
+
+    // No promotion needed — return a deep copy so the caller has
+    // consistent ownership semantics (always gets a new GpuRoaring).
+    return promote_to_bitmap(bm, stream);  // handles the all-bitmap copy path
+}
+
 }  // namespace cu_roaring

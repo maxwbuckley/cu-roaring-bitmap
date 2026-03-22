@@ -1,4 +1,5 @@
 #include "cu_roaring/detail/upload_ids.cuh"
+#include "cu_roaring/detail/promote.cuh"
 #include "cu_roaring/detail/utils.cuh"
 
 #include <algorithm>
@@ -13,6 +14,12 @@ GpuRoaring upload_from_sorted_ids(const uint32_t* sorted_ids,
                                   cudaStream_t stream,
                                   uint32_t bitmap_threshold)
 {
+  // Resolve PROMOTE_AUTO to a concrete threshold
+  uint32_t effective_threshold = bitmap_threshold;
+  if (bitmap_threshold == PROMOTE_AUTO) {
+    effective_threshold = resolve_auto_threshold(universe_size);
+  }
+
   GpuRoaring result{};
   result.universe_size = universe_size;
   if (n_ids == 0) return result;
@@ -52,7 +59,7 @@ GpuRoaring upload_from_sorted_ids(const uint32_t* sorted_ids,
     uint32_t card = static_cast<uint32_t>(containers[i].values.size());
     h_cards[i] = static_cast<uint16_t>(card > 65535 ? 0 : card);
 
-    if (card > bitmap_threshold) {
+    if (card > effective_threshold) {
       h_types[i]  = ContainerType::BITMAP;
       h_offsets[i] = static_cast<uint32_t>(h_bitmap_pool.size() * sizeof(uint64_t));
       size_t base  = h_bitmap_pool.size();

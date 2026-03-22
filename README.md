@@ -38,12 +38,15 @@ Requires: CUDA 12.4+, CMake 3.25+, GCC 13+ (or any C++17 compiler).
 roaring_bitmap_t* cpu_bm = roaring_bitmap_create();
 roaring_bitmap_add_range(cpu_bm, 0, 500000);
 
-// Transfer to GPU in compressed SoA format
+// Transfer to GPU — PROMOTE_AUTO (default) queries the GPU's L2 cache size
+// and automatically selects the optimal container format:
+//   - Small universe (bitset fits in L2): keeps compressed arrays (saves memory)
+//   - Large universe (bitset exceeds L2): promotes all to bitmap (faster queries)
 cu_roaring::GpuRoaring gpu_bm = cu_roaring::upload(cpu_bm, stream);
 
-// For hot filters queried millions of times (e.g., CAGRA graph traversal),
-// promote all containers to bitmap for 3-8x faster point queries:
-auto fast_bm = cu_roaring::upload(cpu_bm, stream, cu_roaring::PROMOTE_ALL);
+// Manual overrides if you know your workload:
+auto compressed = cu_roaring::upload(cpu_bm, stream, cu_roaring::PROMOTE_NONE);  // min memory
+auto fast       = cu_roaring::upload(cpu_bm, stream, cu_roaring::PROMOTE_ALL);   // max query speed
 
 roaring_bitmap_free(cpu_bm);  // CPU copy no longer needed
 ```
@@ -57,10 +60,11 @@ std::vector<uint32_t> pass_ids = {0, 5, 12, 99, 1042, ...};
 auto gpu_bm = cu_roaring::upload_from_sorted_ids(
     pass_ids.data(), pass_ids.size(), universe_size, stream);
 
-// Or with all-bitmap promotion for fastest queries:
+// Default (PROMOTE_AUTO) picks the optimal format for your GPU.
+// Override manually if needed:
 auto fast_bm = cu_roaring::upload_from_sorted_ids(
     pass_ids.data(), pass_ids.size(), universe_size, stream,
-    cu_roaring::PROMOTE_ALL);
+    cu_roaring::PROMOTE_ALL);  // force all-bitmap for max query speed
 ```
 
 ### Set operations on GPU
@@ -108,19 +112,27 @@ __global__ void my_kernel_warp(cu_roaring::GpuRoaringView view, ...) {
 }
 ```
 
-### Promote containers to bitmap (faster queries)
+### Container promotion (automatic and manual)
 
-Array containers require a binary search inside the container, which is 3-8x slower than bitmap containers at scale. For filters that will be queried many times (e.g., during CAGRA graph traversal), promote all containers to bitmap:
+Array containers require a binary search inside the container, which is 3-8x slower than bitmap containers at scale. The library automatically handles this via **`PROMOTE_AUTO`** (the default), which queries the GPU's L2 cache size:
+
+- **Bitset fits in L2** (small universe): keeps compressed arrays — memory savings are the priority
+- **Bitset exceeds L2** (large universe): promotes all containers to bitmap — roaring's `__ldg`-cached reads beat the cache-thrashing bitset
 
 ```cpp
 #include <cu_roaring/detail/promote.cuh>
 
-// Post-upload promotion (returns a new GpuRoaring; original is not modified)
-auto promoted = cu_roaring::promote_to_bitmap(gpu_bm, stream);
-cu_roaring::gpu_roaring_free(gpu_bm);  // free the original
-gpu_bm = promoted;
+// Check what the auto policy chose for your data:
+uint32_t threshold = cu_roaring::resolve_auto_threshold(universe_size);
+// Returns PROMOTE_ALL (0) at 1B scale, PROMOTE_NONE (4096) at 1M scale
 
-// Or use a custom threshold: containers with >256 elements become bitmap
+// Post-upload cache-aware promotion:
+auto optimized = cu_roaring::promote_auto(gpu_bm, stream);
+
+// Or force all-bitmap manually:
+auto promoted = cu_roaring::promote_to_bitmap(gpu_bm, stream);
+
+// Or set a custom threshold: containers with >256 elements become bitmap
 auto custom = cu_roaring::upload(cpu_bm, stream, 256);
 ```
 
@@ -246,15 +258,15 @@ Roaring bitmap: id → key search (11 reads) →
 
 | Strategy | What it does | Best speedup | Status |
 |----------|-------------|-------------|--------|
-| **All-bitmap promotion** | Convert array containers to bitmap at upload time | **7.4x** (100M/1%) | `upload(bm, stream, PROMOTE_ALL)` or `promote_to_bitmap()` |
+| **Cache-aware auto promotion** | Query GPU L2 cache size, promote when bitset would thrash cache | **7.4x** (100M/1%) | `PROMOTE_AUTO` (default), `promote_auto()`, or manual `PROMOTE_ALL` |
 | **`__ldg()` + warp broadcast** | Read-only cache for global loads; leader broadcasts metadata | **1.6x** (1B/10%) | Applied in library (`roaring_view.cuh`, `roaring_warp_query.cuh`) |
 | **Direct-map key index** | Replace O(log n) key binary search with O(1) table lookup | **1.75x** (1B/10%) | Prototyped in `bench_optimized_query.cu` |
 
 ### Recommendations for cuVS Integration
 
-1. **Hot filters** (queried during CAGRA graph traversal): Promote all array containers to bitmap at upload time. The 3-8x query speedup justifies the extra memory. At 0.1% density this means using 125 MB instead of 2.1 MB — but you're querying this filter millions of times per search batch.
+1. **Default (PROMOTE_AUTO)**: Just call `upload()` — the library queries your GPU's L2 cache size and picks the optimal strategy. At 1B scale it promotes to all-bitmap (faster queries); at 1M it keeps compressed arrays (saves memory). No tuning required.
 
-2. **Cold filters** (stored in GPU memory, used for set operations): Keep compressed Roaring. The 59x memory savings lets you store far more concurrent filters in GPU memory.
+2. **Cold filters** (stored in GPU memory, used for set operations): Use `PROMOTE_NONE` explicitly. The 59x memory savings lets you store far more concurrent filters in GPU memory. Promote only the final combined result before search.
 
 3. **Memory is the real value proposition** at scale. With 100 filter attributes at 1B scale: flat bitsets require 12.5 GB, Roaring requires ~0.7 GB for sparse attributes.
 

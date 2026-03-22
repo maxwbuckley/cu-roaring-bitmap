@@ -192,9 +192,10 @@ TEST_F(PromoteTest, UploadFromIdsWithThreshold) {
 
     uint32_t universe = 5 * 65536;
 
-    // Default: array containers
+    // Explicit PROMOTE_NONE: array containers
     auto arr = cu_roaring::upload_from_sorted_ids(
-        ids.data(), static_cast<uint32_t>(ids.size()), universe);
+        ids.data(), static_cast<uint32_t>(ids.size()), universe, 0,
+        cu_roaring::PROMOTE_NONE);
     EXPECT_EQ(arr.n_containers, 5u);
     EXPECT_EQ(arr.n_array_containers, 5u);
     EXPECT_EQ(arr.n_bitmap_containers, 0u);
@@ -233,9 +234,10 @@ TEST_F(PromoteTest, UploadFromIdsCustomThreshold) {
     EXPECT_EQ(bmp.n_bitmap_containers, 3u);
     EXPECT_EQ(bmp.n_array_containers, 0u);
 
-    // Threshold 4096 (default): card=200 <= 4096, so all stay array
+    // Threshold 4096 (PROMOTE_NONE): card=200 <= 4096, so all stay array
     auto arr = cu_roaring::upload_from_sorted_ids(
-        ids.data(), static_cast<uint32_t>(ids.size()), universe);
+        ids.data(), static_cast<uint32_t>(ids.size()), universe, 0,
+        cu_roaring::PROMOTE_NONE);
     EXPECT_EQ(arr.n_array_containers, 3u);
     EXPECT_EQ(arr.n_bitmap_containers, 0u);
 
@@ -246,4 +248,89 @@ TEST_F(PromoteTest, UploadFromIdsCustomThreshold) {
 
     cu_roaring::gpu_roaring_free(bmp);
     cu_roaring::gpu_roaring_free(arr);
+}
+
+// ============================================================================
+// PROMOTE_AUTO (cache-aware policy)
+// ============================================================================
+
+TEST_F(PromoteTest, ResolveAutoThresholdSmallUniverse) {
+    // Small universe: flat bitset easily fits in L2 → PROMOTE_NONE
+    uint32_t threshold = cu_roaring::resolve_auto_threshold(1000000);  // 125 KB
+    EXPECT_EQ(threshold, cu_roaring::PROMOTE_NONE);
+}
+
+TEST_F(PromoteTest, ResolveAutoThresholdLargeUniverse) {
+    // 1B universe: flat bitset = 125 MB, exceeds any GPU's L2 → PROMOTE_ALL
+    uint32_t threshold = cu_roaring::resolve_auto_threshold(1000000000);
+    EXPECT_EQ(threshold, cu_roaring::PROMOTE_ALL);
+}
+
+TEST_F(PromoteTest, PromoteAutoSmallUniverse) {
+    // Small universe: auto should keep arrays (bitset fits in L2)
+    std::vector<uint32_t> ids;
+    for (uint32_t i = 0; i < 500; ++i)
+        ids.push_back(i * 100);
+
+    auto bm = cu_roaring::upload_from_sorted_ids(
+        ids.data(), static_cast<uint32_t>(ids.size()), 100000);
+    // At 100K universe (12.5 KB bitset), auto keeps PROMOTE_NONE
+    // Containers have 500 elements each → array containers
+    EXPECT_GT(bm.n_array_containers, 0u);
+
+    auto promoted = cu_roaring::promote_auto(bm);
+    // Auto should NOT promote (small universe fits in L2)
+    // But promote_auto always returns a valid copy, verify correctness
+    auto bs1 = to_host_bitset(bm);
+    auto bs2 = to_host_bitset(promoted);
+    EXPECT_EQ(bs1, bs2);
+
+    cu_roaring::gpu_roaring_free(promoted);
+    cu_roaring::gpu_roaring_free(bm);
+}
+
+TEST_F(PromoteTest, PromoteAutoLargeUniverse) {
+    // Large universe: auto should promote (bitset exceeds L2)
+    // We can't create a real 1B bitmap in a test, but we can set
+    // universe_size large and verify resolve_auto_threshold behavior
+    uint32_t threshold = cu_roaring::resolve_auto_threshold(1000000000);
+    EXPECT_EQ(threshold, cu_roaring::PROMOTE_ALL);
+
+    // Small dataset but large universe_size → auto promotes
+    std::vector<uint32_t> ids = {0, 65536, 131072};  // 3 containers, 1 element each
+    auto bm = cu_roaring::upload_from_sorted_ids(
+        ids.data(), 3, 1000000000);  // universe=1B
+    // Auto default: should have promoted to bitmap
+    EXPECT_EQ(bm.n_bitmap_containers, 3u);
+    EXPECT_EQ(bm.n_array_containers, 0u);
+
+    cu_roaring::gpu_roaring_free(bm);
+}
+
+TEST_F(PromoteTest, UploadDefaultIsAuto) {
+    // Verify that the default parameter is PROMOTE_AUTO by checking
+    // that small universes produce arrays and large universes produce bitmaps.
+    std::vector<uint32_t> ids = {0, 100, 200};
+
+    // Small universe: default auto → PROMOTE_NONE → arrays
+    auto small = cu_roaring::upload_from_sorted_ids(ids.data(), 3, 10000);
+    EXPECT_EQ(small.n_array_containers, 1u);
+    EXPECT_EQ(small.n_bitmap_containers, 0u);
+
+    // Large universe: default auto → PROMOTE_ALL → bitmaps
+    auto large = cu_roaring::upload_from_sorted_ids(ids.data(), 3, 1000000000);
+    EXPECT_EQ(large.n_bitmap_containers, 1u);
+    EXPECT_EQ(large.n_array_containers, 0u);
+
+    // Both must decompress to the same content
+    // (different universe_size but same IDs present)
+    auto bs_s = to_host_bitset(small);
+    auto bs_l = to_host_bitset(large);
+    // Check the first few words match (IDs 0, 100, 200 are all in word range 0-6)
+    for (int w = 0; w < 7 && w < static_cast<int>(bs_s.size()) && w < static_cast<int>(bs_l.size()); ++w) {
+        EXPECT_EQ(bs_s[w], bs_l[w]) << "Mismatch at word " << w;
+    }
+
+    cu_roaring::gpu_roaring_free(small);
+    cu_roaring::gpu_roaring_free(large);
 }

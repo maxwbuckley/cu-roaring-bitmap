@@ -226,8 +226,14 @@ GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap, cudaStream_t stream,
     if (h_array_pool)  cudaFreeHost(h_array_pool);
     if (h_run_pool)    cudaFreeHost(h_run_pool);
 
-    // Promote containers to bitmap if requested
-    if (bitmap_threshold < PROMOTE_NONE &&
+    // Resolve auto threshold based on GPU L2 cache size
+    uint32_t effective_threshold = bitmap_threshold;
+    if (bitmap_threshold == PROMOTE_AUTO) {
+        effective_threshold = resolve_auto_threshold(result.universe_size);
+    }
+
+    // Promote containers to bitmap if requested or auto-selected
+    if (effective_threshold < PROMOTE_NONE &&
         (result.n_array_containers > 0 || result.n_run_containers > 0)) {
         GpuRoaring promoted = promote_to_bitmap(result, stream);
         gpu_roaring_free(result);
