@@ -9,6 +9,7 @@ Filtered vector search at scale requires checking billions of candidate IDs agai
 cu-roaring-filter brings Roaring bitmaps to the GPU:
 
 - **6-59x memory compression** vs flat bitsets (depending on set density)
+- **66x faster filter upload** at 100M IDs via GPU-native sort/partition pipeline
 - **17x faster filter construction** than CPU CRoaring for multi-predicate queries at 1B scale
 - **Direct kernel integration** — `contains()` and `warp_contains()` callable from any CUDA kernel
 - **Sub-millisecond set operations** (AND/OR/ANDNOT/XOR) on GPU-resident bitmaps
@@ -182,6 +183,19 @@ All benchmarks on NVIDIA RTX 5090 (170 SMs, 32 GB). Median of 50 iterations with
 | 4 | 180.6 ms | 10.4 ms | **17x** |
 | 8 | 180.1 ms | 15.5 ms | **12x** |
 
+### Upload Latency at Scale (B8)
+
+`upload_from_ids()` uses a fully GPU-native pipeline for large inputs: CUB RadixSort + Unique + on-device container construction. Data never returns to the host after the initial upload.
+
+| IDs | CPU-only | GPU-native | Speedup |
+|-----|---------|-----------|---------|
+| 100K | 5.3 ms | 0.9 ms | **6x** |
+| 1M | 57 ms | 4.7 ms | **11x** |
+| 10M | 629 ms | 11 ms | **52x** |
+| 100M | 7,464 ms | 99 ms | **66x** |
+
+At search engine scale (100M IDs), filter construction takes **99 ms** — fast enough to rebuild on every query.
+
 ### Point Query Throughput (10M random queries)
 
 Standalone point query benchmark comparing `contains()`, `warp_contains()`, and flat bitset across universe sizes and set densities.
@@ -326,7 +340,7 @@ cu-roaring-filter/
 │   ├── types.cuh                   GpuRoaring, enums
 │   ├── detail/
 │   │   ├── upload.cuh              CPU CRoaring → GPU
-│   │   ├── upload_ids.cuh          sorted IDs → GPU (no CRoaring dep)
+│   │   ├── upload_ids.cuh          IDs → GPU (GPU-native sort/partition)
 │   │   ├── decompress.cuh          GPU → flat bitset
 │   │   ├── set_ops.cuh             AND/OR/ANDNOT/XOR
 │   │   ├── promote.cuh             array/run → bitmap promotion
@@ -337,10 +351,11 @@ cu-roaring-filter/
 │       └── make_view.cuh           GpuRoaring → GpuRoaringView
 ├── src/                            implementation (.cpp, .cu)
 ├── test/                           5 test suites (Google Test)
-├── bench/                          benchmarks (B1-B7)
+├── bench/                          benchmarks (B1-B8)
 │   ├── bench_comprehensive.cu      B1/B3/B4/B5: construction, memory, E2E
 │   ├── bench_point_query.cu        B6: point query throughput
 │   ├── bench_optimized_query.cu    B7: optimization analysis
+│   ├── bench_upload_scale.cu       B8: upload latency at XL scale
 │   ├── bench_set_ops.cu            set operation microbenchmarks
 │   ├── bench_decompress.cu         decompression microbenchmarks
 │   └── bench_transfer.cu           PCIe transfer comparison
@@ -358,6 +373,7 @@ cu-roaring-filter/
 | **Kernel integration** | `contains()` / `warp_contains()` | Bit test | N/A (custom kernels) |
 | **Ad-hoc queries** | Yes | Yes | No (requires re-indexing) |
 | **Point query (1B/10%)** | **24 Gq/s** (warp) | 15 Gq/s | N/A |
+| **Upload (100M IDs)** | **99 ms** (GPU-native) | N/A (pre-allocated) | Minutes (index build) |
 | **Construction** | Upload + set ops (~10ms for 4 preds @ 1B) | Trivial | Index build (minutes) |
 
 ## Development
@@ -378,6 +394,7 @@ Warnings are applied per-target via `cu_roaring_target_strict_warnings()` define
 cd build
 ./bench/bench_point_query           # B6: point query throughput
 ./bench/bench_optimized_query       # B7: optimization analysis
+./bench/bench_upload_scale          # B8: upload latency at XL scale
 ./bench/bench_comprehensive         # B1/B3/B4/B5: construction, memory, E2E
 ./bench/bench_set_ops               # set operation microbenchmarks
 ./bench/bench_decompress            # decompression microbenchmarks
