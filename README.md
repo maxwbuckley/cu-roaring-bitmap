@@ -200,24 +200,22 @@ At search engine scale (100M IDs), filter construction takes **99 ms** — fast 
 
 Standalone point query benchmark comparing `contains()`, `warp_contains()`, and flat bitset across universe sizes and set densities.
 
-Default `PROMOTE_AUTO` policy: arrays at 1M (<=64 containers), all-bitmap at 10M+ (>64 containers).
+All results with `PROMOTE_AUTO` + O(1) direct-map key index. Random access pattern (realistic for search).
 
-| Universe | Density | Containers (auto) | Bitset | `contains()` | `warp_contains()` | vs Bitset | Compression |
-|----------|---------|-------------------|--------|-------------|-------------------|-----------|-------------|
-| 1M | 0.1% | 16 arr | 145 Gq/s | **169 Gq/s** | 154 Gq/s | **1.2x faster** | 59.7x |
-| 10M | 0.1% | 153 bmp (auto) | 101 Gq/s | 99 Gq/s | 97 Gq/s | 1.0x | 58.6x |
-| 10M | 1% | 153 bmp (auto) | 100 Gq/s | 97 Gq/s | 98 Gq/s | **1.0x** | **6.2x** |
-| 100M | 1% | 1526 bmp (auto) | 101 Gq/s | 93 Gq/s | 93 Gq/s | **0.9x** | **6.2x** |
-| 100M | 10% | 1526 bmp (auto) | 101 Gq/s | 95 Gq/s | 94 Gq/s | 0.9x | 1.0x |
-| 1B | 0.1% | 15259 bmp (auto) | 27 Gq/s | 26 Gq/s | 22 Gq/s | 1.0x | **58.4x** |
-| 1B | 1% | 15259 bmp (auto) | 15 Gq/s | 15 Gq/s | **23 Gq/s** | **1.5x faster** | **6.2x** |
-| 1B | 10% | 15259 bmp (auto) | 15 Gq/s | 15 Gq/s | **23 Gq/s** | **1.6x faster** | 1.0x |
+| Universe | Density | Bitset | `contains()` | `warp_contains()` | vs Bitset | Compression |
+|----------|---------|--------|-------------|-------------------|-----------|-------------|
+| 1M | 0.1% | 156 Gq/s | **214 Gq/s** | 190 Gq/s | **1.4x faster** | 59.7x |
+| 10M | 1% | 101 Gq/s | 99 Gq/s | 99 Gq/s | **1.0x** | **6.2x** |
+| 100M | 1% | 102 Gq/s | 95 Gq/s | 96 Gq/s | 0.9x | **6.2x** |
+| 1B | 0.1% | 15 Gq/s | 15 Gq/s | 15 Gq/s | **1.0x** | **58.4x** |
+| 1B | 1% | 15 Gq/s | 15 Gq/s | **25 Gq/s** | **1.6x faster** | **6.2x** |
+| 1B | 10% | 15 Gq/s | 15 Gq/s | 15 Gq/s | 1.0x | 1.0x |
 
 Key findings:
-- **No more slow rows.** `PROMOTE_AUTO` promotes all containers to bitmap at 10M+ universe, eliminating the 4-10x array container slowdown that previously appeared at mid-scale. The worst case is now 0.9x (within measurement noise of bitset).
-- **Memory compression preserved.** At 1B/0.1%, roaring uses 2.1 MB vs bitset's 125 MB (58.4x) while matching query speed. At 1B/1%, 20 MB vs 125 MB (6.2x) while being 1.5x faster.
-- **Small universes keep arrays.** At 1M (16 containers), the entire structure fits in L1 and `contains()` is 1.2x faster than bitset.
-- **`warp_contains()` wins at 1B.** At 1B/1-10%, the 125 MB flat bitset thrashes L2 cache while roaring's `__ldg`-cached reads achieve 1.5-1.6x higher throughput.
+- **Query speed at parity or better for random access.** Across random/strided patterns, roaring matches bitset within 10% at all scales. At 1M/0.1% it's 1.4x faster; at 1B/1% it's 1.6x faster.
+- **Memory compression is the value proposition.** At 1B/0.1%, roaring uses 2.1 MB vs bitset's 125 MB (58.4x) — same query speed, 59x less memory.
+- **Clustered access patterns favor bitset** (1.2-2.3x faster) due to cache-line prefetching. CAGRA's graph traversal pattern is closer to random/strided than clustered.
+- **`warp_contains()` wins at 1B/1%.** The 125 MB flat bitset thrashes L2 cache while roaring's `__ldg`-cached reads achieve 1.6x higher throughput.
 
 ### Memory Compression
 

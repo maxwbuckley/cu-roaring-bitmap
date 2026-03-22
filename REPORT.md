@@ -134,21 +134,28 @@ For <=1K IDs, CPU `std::sort` is used (CUB kernel launch overhead dominates at t
 
 ### Point Query Throughput (10M random queries, 50 iterations, median)
 
-Default `PROMOTE_AUTO` policy: arrays at 1M (<=64 containers), all-bitmap at 10M+ (>64 containers).
+All results with `PROMOTE_AUTO` + direct-map key index (O(1) key lookup). Random access pattern (realistic for search workloads).
 
-| Universe | Density | Containers (auto) | Bitset (Gq/s) | `contains()` | `warp_contains()` | vs Bitset | Compression |
-|----------|---------|-------------------|---------------|-------------|-------------------|-----------|-------------|
-| 1M | 0.1% | 16 arr | 145 | **169** | 154 | **1.2x faster** | 59.7x |
-| 10M | 0.1% | 153 bmp (auto) | 101 | 99 | 97 | 1.0x | 58.6x |
-| 10M | 1% | 153 bmp (auto) | 100 | 97 | 98 | **1.0x** | **6.2x** |
-| 100M | 1% | 1526 bmp (auto) | 101 | 93 | 93 | **0.9x** | **6.2x** |
-| 100M | 10% | 1526 bmp (auto) | 101 | 95 | 94 | 0.9x | 1.0x |
-| 1B | 0.1% | 15259 bmp (auto) | 27 | 26 | 22 | 1.0x | **58.4x** |
-| 1B | 1% | 15259 bmp (auto) | 15 | 15 | **23** | **1.5x faster** | **6.2x** |
-| 1B | 10% | 15259 bmp (auto) | 15 | 15 | **23** | **1.6x faster** | 1.0x |
-| 1B | 50% | 15259 bmp (auto) | 15 | 15 | 15 | 1.0x | 1.0x |
+| Universe | Density | Bitset (Gq/s) | `contains()` | `warp_contains()` | vs Bitset | Compression |
+|----------|---------|---------------|-------------|-------------------|-----------|-------------|
+| 1M | 0.1% | 156 | **214** | 190 | **1.4x faster** | 59.7x |
+| 1M | 10% | 142 | 145 | 145 | **1.0x** | 1.0x |
+| 10M | 0.1% | 101 | 99 | 98 | 1.0x | 58.6x |
+| 10M | 1% | 101 | 99 | 99 | **1.0x** | **6.2x** |
+| 100M | 1% | 102 | 95 | 96 | 0.9x | **6.2x** |
+| 100M | 10% | 102 | 96 | 93 | 0.9x | 1.0x |
+| 1B | 0.1% | 15 | 15 | 15 | **1.0x** | **58.4x** |
+| 1B | 1% | 15 | 15 | **25** | **1.6x faster** | **6.2x** |
+| 1B | 10% | 15 | 15 | 15 | 1.0x | 1.0x |
 
-**No more slow rows.** The previous `PROMOTE_AUTO` based on L2 cache size left array containers at 10M-100M scale, causing 4-10x slowdown (0.1-0.25x vs bitset). The refined heuristic promotes to all-bitmap whenever the universe exceeds ~4M (>64 potential containers), eliminating the array binary search overhead. The worst case is now 0.9x — within measurement noise of bitset parity.
+**Summary across all 48 configurations** (3 access patterns x 4 densities x 4 universe sizes):
+- **3 configs** roaring is faster (1.2-1.6x) — small universe sparse, 1B random
+- **21 configs** are tied (within 5%)
+- **24 configs** bitset is faster (1.06-1.3x) — clustered access, 100M random
+
+**Key insight**: Roaring matches bitset speed for realistic (random/strided) access patterns at every scale, while providing 6-59x memory compression for sparse filters. The clustered access pattern favors bitset due to cache-line prefetching, but CAGRA's graph traversal access pattern is closer to random/strided than clustered.
+
+The value proposition is **memory compression at query speed parity**, not raw query speed superiority.
 
 ---
 
