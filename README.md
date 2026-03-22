@@ -172,6 +172,18 @@ Key findings:
 | 1% (uncommon) | 125 MB | 20 MB | **6.2x** |
 | 50% (common) | 125 MB | ~125 MB | 1x |
 
+### End-to-End Latency (4 predicates, Zipfian density)
+
+Compares two filter pipelines: (A) CPU filter + PCIe transfer vs (C) GPU-resident Roaring set ops.
+
+| Universe | Pipeline A (CPU + PCIe + search) | Pipeline C (GPU set ops + search) | Speedup |
+|----------|--------------------------------|-----------------------------------|---------|
+| 10M | 10.9 ms | 12.1 ms | 0.9x |
+| 100M | 20.7 ms | 12.4 ms | **1.7x** |
+| 1B | 134.3 ms | 18.1 ms | **7.4x** |
+
+GPU-resident filtering breaks even at ~50M and dominates at 100M+ where CPU filter construction and PCIe transfer become the bottleneck.
+
 ### Decompress Kernel Throughput
 
 | Universe Size | Latency | Bandwidth |
@@ -304,6 +316,38 @@ cu-roaring-filter/
 | **Ad-hoc queries** | Yes | Yes | No (requires re-indexing) |
 | **Point query (1B/10%)** | **24 Gq/s** (warp) | 15 Gq/s | N/A |
 | **Construction** | Upload + set ops (~10ms for 4 preds @ 1B) | Trivial | Index build (minutes) |
+
+## Development
+
+### Compiler Warnings
+
+All targets (library, tests, benchmarks) compile with `-Werror` and a strict warning set. No warning suppressions are allowed — if it warns, it doesn't merge.
+
+**CXX flags**: `-Wall -Wextra -Werror -Wshadow -Wnon-virtual-dtor -Woverloaded-virtual -Wcast-align -Wformat=2 -Wimplicit-fallthrough -Wmisleading-indentation -Wnull-dereference -Wdouble-promotion -Wunused -Wpedantic`
+
+**CUDA flags**: `--Werror all-warnings` with the same flags forwarded to the host compiler via `-Xcompiler`. A few flags (`-Wold-style-cast`, `-Wconversion`, `-Wpedantic`, `-Wdouble-promotion`) are excluded from the CUDA forwarding set because they fire in CUDA toolkit headers.
+
+Warnings are applied per-target via `cu_roaring_target_strict_warnings()` defined in the root `CMakeLists.txt`. Third-party code (CRoaring, Google Test, Google Benchmark) is excluded.
+
+### Running Benchmarks
+
+```bash
+cd build
+./bench/bench_point_query           # B6: point query throughput
+./bench/bench_optimized_query       # B7: optimization analysis
+./bench/bench_comprehensive         # B1/B3/B4/B5: construction, memory, E2E
+./bench/bench_set_ops               # set operation microbenchmarks
+./bench/bench_decompress            # decompression microbenchmarks
+./bench/bench_transfer              # PCIe transfer comparison
+```
+
+Results are written to `results/raw/*.json`. Generate figures with:
+
+```bash
+cd results
+python3 plot_figures.py             # B1/B3/B4/B5 figures
+python3 plot_point_query.py         # B6 figures + summary table
+```
 
 ## License
 
