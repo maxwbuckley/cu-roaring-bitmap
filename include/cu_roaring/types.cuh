@@ -17,8 +17,9 @@ struct GpuRoaring {
     ContainerType* types        = nullptr;  // [n_containers] container type tag
     uint32_t*      offsets      = nullptr;  // [n_containers] byte offset into per-type data pool
     uint16_t*      cardinalities = nullptr; // [n_containers] element count
-    uint32_t       n_containers  = 0;
-    uint32_t       universe_size = 0;       // max representable ID + 1
+    uint32_t       n_containers      = 0;
+    uint32_t       universe_size     = 0;   // max representable ID + 1
+    uint64_t       total_cardinality = 0;   // total number of set bits
 
     // Per-type data pools (contiguous, type-homogeneous)
     uint64_t* bitmap_data        = nullptr; // [n_bitmap_containers * 1024]

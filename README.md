@@ -159,17 +159,16 @@ cu-roaring-filter integrates natively with CAGRA's filtered search. The Roaring 
 #include <cuvs/neighbors/roaring_filter.cuh>
 
 // Build filter from arbitrary predicates
-auto color_bm   = cu_roaring::upload(color_red_bitmap, stream);
-auto price_bm   = cu_roaring::upload(price_lt_50_bitmap, stream);
-auto filter_bm   = cu_roaring::set_operation(color_bm, price_bm, cu_roaring::SetOp::AND, stream);
+auto color_bm  = cu_roaring::upload(color_red_bitmap, stream);
+auto price_bm  = cu_roaring::upload(price_lt_50_bitmap, stream);
+auto filter_bm = cu_roaring::set_operation(color_bm, price_bm, cu_roaring::SetOp::AND, stream);
 
-auto view = cu_roaring::make_view(filter_bm);
-auto filter = cuvs::neighbors::filtering::roaring_filter_warp(
-    view, cardinality, n_rows);
-
-// Search — roaring membership checks happen inside CAGRA's graph traversal kernel
+// One line: GpuRoaring → ready-to-search filter
+auto filter = cuvs::neighbors::filtering::roaring_filter(filter_bm);
 cuvs::neighbors::cagra::search(res, params, index, queries, neighbors, distances, filter);
 ```
+
+The `roaring_filter` constructor takes a `GpuRoaring` directly — no `make_view()`, no cardinality tracking, no choosing between filter variants. It uses warp-cooperative queries internally (always faster for CAGRA's graph traversal pattern).
 
 ## Benchmark Results
 

@@ -21,7 +21,8 @@ GpuRoaring upload_from_sorted_ids(const uint32_t* sorted_ids,
   }
 
   GpuRoaring result{};
-  result.universe_size = universe_size;
+  result.universe_size     = universe_size;
+  result.total_cardinality = n_ids;
   if (n_ids == 0) return result;
 
   // Partition IDs into containers by high 16 bits

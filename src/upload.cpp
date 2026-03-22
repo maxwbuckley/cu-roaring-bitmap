@@ -172,6 +172,7 @@ GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap, cudaStream_t stream,
         uint16_t max_key = ra.keys[ra.size - 1];
         result.universe_size = (static_cast<uint32_t>(max_key) + 1) << 16;
     }
+    result.total_cardinality = roaring_bitmap_get_cardinality(cpu_bitmap);
 
     CUDA_CHECK(cudaMalloc(&result.keys, n * sizeof(uint16_t)));
     CUDA_CHECK(cudaMalloc(&result.types, n * sizeof(ContainerType)));

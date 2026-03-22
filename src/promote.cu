@@ -20,6 +20,7 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
         result.n_array_containers  = 0;
         result.n_run_containers    = 0;
         result.universe_size       = bm.universe_size;
+        result.total_cardinality   = bm.total_cardinality;
 
         CUDA_CHECK(cudaMalloc(&result.keys, n * sizeof(uint16_t)));
         CUDA_CHECK(cudaMalloc(&result.types, n * sizeof(ContainerType)));
@@ -147,6 +148,7 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
     result.n_array_containers  = 0;
     result.n_run_containers    = 0;
     result.universe_size       = bm.universe_size;
+    result.total_cardinality   = bm.total_cardinality;
 
     CUDA_CHECK(cudaMalloc(&result.keys, n * sizeof(uint16_t)));
     CUDA_CHECK(cudaMalloc(&result.types, n * sizeof(ContainerType)));
