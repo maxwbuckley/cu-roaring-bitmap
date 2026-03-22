@@ -2,13 +2,87 @@
 #include "cu_roaring/detail/promote.cuh"
 #include "cu_roaring/detail/utils.cuh"
 
+#include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_select.cuh>
+
 #include <algorithm>
 #include <cstring>
 #include <vector>
 
 namespace cu_roaring {
 
-GpuRoaring upload_from_ids(const uint32_t* sorted_ids,
+// Below this threshold, CPU std::sort is faster than GPU sort due to
+// kernel launch overhead and H2D/D2H transfer cost.
+static constexpr uint32_t GPU_SORT_THRESHOLD = 65536;
+
+// GPU sort + unique via CUB. Returns sorted, deduplicated IDs on host.
+static std::vector<uint32_t> gpu_sort_unique(const uint32_t* ids,
+                                              uint32_t n_ids,
+                                              cudaStream_t stream)
+{
+    // Upload unsorted IDs to GPU
+    uint32_t* d_in = nullptr;
+    uint32_t* d_sorted = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_in, n_ids * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_sorted, n_ids * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpyAsync(d_in, ids, n_ids * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    // CUB DeviceRadixSort
+    size_t sort_temp_bytes = 0;
+    cub::DeviceRadixSort::SortKeys(nullptr, sort_temp_bytes,
+                                   d_in, d_sorted, n_ids, 0, 32, stream);
+    void* d_sort_temp = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_sort_temp, sort_temp_bytes));
+    cub::DeviceRadixSort::SortKeys(d_sort_temp, sort_temp_bytes,
+                                   d_in, d_sorted, n_ids, 0, 32, stream);
+    cudaFree(d_sort_temp);
+    cudaFree(d_in);
+
+    // CUB DeviceSelect::Unique (in-place output)
+    uint32_t* d_unique = nullptr;
+    uint32_t* d_num_unique = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_unique, n_ids * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_num_unique, sizeof(uint32_t)));
+
+    size_t unique_temp_bytes = 0;
+    cub::DeviceSelect::Unique(nullptr, unique_temp_bytes,
+                              d_sorted, d_unique, d_num_unique, n_ids, stream);
+    void* d_unique_temp = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_unique_temp, unique_temp_bytes));
+    cub::DeviceSelect::Unique(d_unique_temp, unique_temp_bytes,
+                              d_sorted, d_unique, d_num_unique, n_ids, stream);
+    cudaFree(d_unique_temp);
+    cudaFree(d_sorted);
+
+    // Download unique count
+    uint32_t h_num_unique = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&h_num_unique, d_num_unique, sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    cudaFree(d_num_unique);
+
+    // Download sorted unique IDs
+    std::vector<uint32_t> result(h_num_unique);
+    CUDA_CHECK(cudaMemcpy(result.data(), d_unique,
+                          h_num_unique * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+    cudaFree(d_unique);
+
+    return result;
+}
+
+// CPU sort + unique (faster for small inputs)
+static std::vector<uint32_t> cpu_sort_unique(const uint32_t* raw_ids,
+                                              uint32_t n_ids)
+{
+    std::vector<uint32_t> ids(raw_ids, raw_ids + n_ids);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
+GpuRoaring upload_from_ids(const uint32_t* raw_ids,
                            uint32_t n_ids,
                            uint32_t universe_size,
                            cudaStream_t stream,
@@ -24,10 +98,10 @@ GpuRoaring upload_from_ids(const uint32_t* sorted_ids,
   result.universe_size = universe_size;
   if (n_ids == 0) return result;
 
-  // Sort and deduplicate — callers don't need to pre-sort
-  std::vector<uint32_t> ids(sorted_ids, sorted_ids + n_ids);
-  std::sort(ids.begin(), ids.end());
-  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  // Sort and deduplicate — GPU for large inputs, CPU for small
+  std::vector<uint32_t> ids = (n_ids > GPU_SORT_THRESHOLD)
+      ? gpu_sort_unique(raw_ids, n_ids, stream)
+      : cpu_sort_unique(raw_ids, n_ids);
   result.total_cardinality = ids.size();
 
   // Partition IDs into containers by high 16 bits

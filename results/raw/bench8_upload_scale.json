@@ -1,0 +1,26 @@
+{
+  "benchmark": "upload_scale",
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "results": [
+    {"n_ids": 10000, "universe": 100000,
+     "gpu_path_median_ms": 0.65, "gpu_path_std_ms": 0.12,
+     "cpu_path_median_ms": 0.71, "cpu_path_std_ms": 0.13,
+     "speedup": 1.1},
+    {"n_ids": 100000, "universe": 1000000,
+     "gpu_path_median_ms": 1.30, "gpu_path_std_ms": 5.76,
+     "cpu_path_median_ms": 5.29, "cpu_path_std_ms": 0.21,
+     "speedup": 4.1},
+    {"n_ids": 1000000, "universe": 10000000,
+     "gpu_path_median_ms": 9.52, "gpu_path_std_ms": 0.70,
+     "cpu_path_median_ms": 57.32, "cpu_path_std_ms": 4.61,
+     "speedup": 6.0},
+    {"n_ids": 10000000, "universe": 100000000,
+     "gpu_path_median_ms": 54.41, "gpu_path_std_ms": 10.74,
+     "cpu_path_median_ms": 628.59, "cpu_path_std_ms": 16.98,
+     "speedup": 11.6},
+    {"n_ids": 100000000, "universe": 1000000000,
+     "gpu_path_median_ms": 626.61, "gpu_path_std_ms": 85.27,
+     "cpu_path_median_ms": 7463.71, "cpu_path_std_ms": 247.41,
+     "speedup": 11.9}
+  ]
+}
