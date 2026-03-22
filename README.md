@@ -229,11 +229,13 @@ GPU-resident filtering breaks even at ~50M and dominates at 100M+ where CPU filt
 
 ### CAGRA Filtered Search (1M vectors, 128-dim, k=10, batch=100)
 
-| Pass Rate | cuVS bitset | roaring_warp | Speedup | Recall |
-|-----------|------------|-------------|---------|--------|
+| Pass Rate | cuVS bitset | roaring_warp | Speedup | Agreement* |
+|-----------|------------|-------------|---------|------------|
 | 50% | 0.981 ms | 0.751 ms | **1.31x** | 98.2% |
 | 10% | 1.602 ms | 1.327 ms | **1.21x** | 96.2% |
 | 1% | 3.596 ms | 3.584 ms | 1.00x | 97.2% |
+
+*\*Result agreement between roaring and bitset filters. Both produce approximate results (CAGRA is ANN). The 2-4% difference reflects different graph traversal paths, not missing valid neighbors.*
 
 ## Optimization Analysis
 

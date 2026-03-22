@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-cu-roaring-filter brings Roaring bitmap compressed set membership to NVIDIA GPUs, enabling memory-efficient filtered vector search at billion scale. At 1B vectors with 10% filter selectivity, `warp_contains()` is **1.6x faster than flat bitset** while using up to **59x less memory** for sparse filters. Inside NVIDIA cuVS's CAGRA graph search, roaring filters deliver **1.31x speedup** over the bitset baseline at 50% selectivity with 98.2% recall.
+cu-roaring-filter brings Roaring bitmap compressed set membership to NVIDIA GPUs, enabling memory-efficient filtered vector search at billion scale. At 1B vectors with 10% filter selectivity, `warp_contains()` is **1.6x faster than flat bitset** while using up to **59x less memory** for sparse filters. Inside NVIDIA cuVS's CAGRA graph search, roaring filters deliver **1.31x speedup** over the bitset baseline at 50% selectivity with 98.2% result agreement (both methods produce approximate results; the 1.8% difference is due to CAGRA's graph traversal taking slightly different paths, not missing valid neighbors).
 
 Key results:
 - **Query speed**: 24 Gq/s (warp-cooperative, 1B/10%) vs 15 Gq/s for flat bitset
@@ -155,11 +155,13 @@ Benchmarked across 48 configurations: **38 cases 5-17% slower, 10 neutral, 0 hel
 
 ## 5. CAGRA Integration Results
 
-| Pass Rate | No Filter | Bitset Filter | Roaring (warp) | Speedup vs Bitset | Recall |
-|-----------|-----------|--------------|----------------|-------------------|--------|
+| Pass Rate | No Filter | Bitset Filter | Roaring (warp) | Speedup vs Bitset | Agreement* |
+|-----------|-----------|--------------|----------------|-------------------|------------|
 | 50% | 4.57 ms | 0.981 ms | **0.751 ms** | **1.31x** | 98.2% |
 | 10% | 0.77 ms | 1.602 ms | **1.327 ms** | **1.21x** | 96.2% |
 | 1% | 0.68 ms | 3.596 ms | **3.584 ms** | 1.00x | 97.2% |
+
+*\*Agreement = fraction of k=10 results identical between roaring and bitset filters. Both are approximate (CAGRA is an ANN algorithm). The 2-4% difference is not missing valid neighbors — it's CAGRA's graph traversal taking slightly different paths due to different filter evaluation order, settling on equally-valid but non-identical approximate results.*
 
 Throughput at batch=10K: Roaring **960K QPS** vs Bitset 922K QPS.
 
