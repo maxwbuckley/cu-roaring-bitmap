@@ -89,6 +89,25 @@ GpuRoaring (Structure-of-Arrays)
 └── run_data[]       uint16_t   run containers (start, length pairs)
 ```
 
+### Upload Pipeline (upload_from_ids)
+
+For >1K IDs, the entire pipeline runs on GPU — data never returns to host after the initial transfer:
+
+```
+1. H→D: copy unsorted IDs to GPU                    (one-time PCIe transfer)
+2. CUB DeviceRadixSort                               (GPU sort)
+3. CUB DeviceSelect::Unique                           (GPU dedup)
+4. extract_keys_kernel: id >> 16 for each ID          (GPU)
+5. CUB DeviceRunLengthEncode: find container boundaries (GPU)
+6. CUB DeviceScan::ExclusiveSum: prefix sum for offsets (GPU)
+7. scatter_to_bitmaps_kernel: build 8KB bitmap per container (GPU)
+8. build_metadata_kernel: write keys/types/offsets/cards    (GPU)
+```
+
+At 100M IDs this takes **99 ms** (66x faster than CPU sort + upload). The key insight: since the roaring bitmap lives on GPU, paying the H→D transfer once to sort and build on-device eliminates the D→H round-trip that a CPU-sort approach would require.
+
+For <=1K IDs, CPU `std::sort` is used (CUB kernel launch overhead dominates at tiny scale).
+
 ### Query Path (contains)
 
 ```
@@ -173,7 +192,23 @@ Throughput at batch=10K: Roaring **960K QPS** vs Bitset 922K QPS.
 
 ---
 
-## 6. Memory Analysis
+## 6. Upload Latency at Scale (B8)
+
+`upload_from_ids()` uses a fully GPU-native pipeline: one H→D transfer of unsorted IDs, then sort, dedup, partition, and bitmap construction all run on GPU. Data never returns to host.
+
+| IDs | CPU-only | GPU-native | Speedup |
+|-----|---------|-----------|---------|
+| 10K | 0.7 ms | 0.7 ms | 1x |
+| 100K | 5.3 ms | 0.9 ms | **6x** |
+| 1M | 57 ms | 4.7 ms | **11x** |
+| 10M | 629 ms | 11 ms | **52x** |
+| 100M | 7,464 ms | 99 ms | **66x** |
+
+At search engine scale (100M IDs), filter construction takes **99 ms** — fast enough to rebuild filters per query. The GPU sort threshold is 1K IDs (measured crossover point on RTX 5090; below 1K, CUB launch overhead exceeds CPU sort time).
+
+---
+
+## 7. Memory Analysis
 
 ### Per-Bitmap Memory at 1B Scale
 
@@ -201,7 +236,7 @@ Throughput at batch=10K: Roaring **960K QPS** vs Bitset 922K QPS.
 
 ---
 
-## 7. End-to-End Pipeline Comparison
+## 8. End-to-End Pipeline Comparison
 
 For "color=red AND price<50 AND in_stock" at 1B scale:
 
@@ -213,7 +248,7 @@ For "color=red AND price<50 AND in_stock" at 1B scale:
 
 ---
 
-## 8. Optimizations — Shipped vs Future
+## 9. Optimizations — Shipped vs Future
 
 ### Shipped
 
@@ -226,7 +261,8 @@ For "color=red AND price<50 AND in_stock" at 1B scale:
 | Bloom filter removal | +5-10% query speed (removed overhead) | All device headers |
 | `total_cardinality` tracking | Eliminates manual cardinality plumbing | `types.cuh` |
 | One-line cuVS filter constructor | `roaring_filter(bitmap)` | `roaring_filter.cuh` |
-| Sort + dedup in `upload_from_ids` | Fixes silent corruption on unsorted input | `upload_ids.cu` |
+| GPU-native upload pipeline | 66x faster at 100M IDs (99ms vs 7.5s CPU) | `upload_ids.cu` |
+| Sort + dedup in `upload_from_ids` | Accepts unsorted/duplicate IDs, uses CUB on GPU | `upload_ids.cu` |
 | Strict `-Werror` (14 flags) | Zero warnings on all 11 targets | `CMakeLists.txt` |
 
 ### Prototyped (benchmarked, not yet in library)
@@ -241,7 +277,6 @@ For "color=red AND price<50 AND in_stock" at 1B scale:
 |---|---|---|---|
 | **Fused multi-predicate kernel** | 20-40% for 4+ predicates | High | Current `multi_and` does N pairwise ops with ~20 cudaMallocs each. Fuse into single D2H + multi-way merge + batched kernels |
 | **cudaMallocAsync / memory pool** | Reduce allocation stalls | Medium | Replace synchronous cudaMalloc in upload and set_ops with stream-ordered allocation |
-| **GPU-side sort for upload** | 30x faster upload at 100M+ IDs | Medium | CUB `DeviceRadixSort` + GPU partitioning. Only matters at 100M+ IDs where CPU sort takes >1s. At 1M (typical CAGRA) the CPU sort is 10 ms — not a bottleneck |
 | **IVF-PQ/Flat support** | Expand beyond CAGRA | Medium | Add `FilterType::Roaring` to cuVS IVF runtime dispatch union |
 | **Python bindings** | Developer reach | Medium | Expose `roaring_filter` through `pylibcuvs` for Python RAG pipelines |
 | **Shared memory key cache** | Better locality in CAGRA kernel | Low | Preload key index into SMEM once per block. Only measurable inside CAGRA, not standalone |
@@ -250,7 +285,7 @@ For "color=red AND price<50 AND in_stock" at 1B scale:
 
 ---
 
-## 9. Comparison with Alternatives
+## 10. Comparison with Alternatives
 
 | | cu-roaring-filter | Flat Bitset (cuVS default) | VecFlow (label-centric IVF) |
 |---|---|---|---|
@@ -260,12 +295,13 @@ For "color=red AND price<50 AND in_stock" at 1B scale:
 | **CAGRA speedup** | **1.31x** (50% pass) | Baseline | N/A |
 | **Set ops on GPU** | AND/OR/ANDNOT/XOR | Bitwise only | N/A |
 | **Ad-hoc queries** | Yes | Yes | No (requires re-indexing) |
-| **Construction (4 pred, 1B)** | **10 ms** (GPU) | Trivial | Minutes (index build) |
+| **Upload (100M IDs)** | **99 ms** (GPU-native) | N/A (pre-allocated) | Minutes (index build) |
+| **Construction (4 pred, 1B)** | **10 ms** (GPU set ops) | Trivial | Minutes (index build) |
 | **User-facing API** | 3 calls, zero config | 2 calls | Custom index build |
 
 ---
 
-## 10. Integration Path
+## 11. Integration Path
 
 ### cuVS Upstream (rapidsai/cuvs)
 
@@ -276,7 +312,7 @@ Already prototyped in the cuVS fork:
 3. **CAGRA kernel instantiations** — float, half, int8, uint8
 
 Remaining for upstream PR:
-- Port `PROMOTE_AUTO`, `upload_from_ids` (sort+dedup), `total_cardinality` into cuVS `gpu_roaring`
+- Port GPU-native upload pipeline, `PROMOTE_AUTO`, `total_cardinality` into cuVS `gpu_roaring`
 - Add `FilterType::Roaring` to IVF runtime dispatch
 - Python bindings via `pylibcuvs`
 - Integration tests in cuVS CI
