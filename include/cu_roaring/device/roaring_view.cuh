@@ -22,17 +22,10 @@ struct GpuRoaringView {
   const uint16_t* array_data;
   const uint16_t* run_data;
 
-  const uint32_t* key_bloom;
-  uint32_t        bloom_n_hashes;
-
-  static constexpr uint32_t BLOOM_SIZE_WORDS = 2048;  // 8 KB = 65536 bits
-
   __device__ __forceinline__ bool contains(uint32_t id) const
   {
     const uint16_t key = static_cast<uint16_t>(id >> 16);
     const uint16_t low = static_cast<uint16_t>(id & 0xFFFF);
-
-    if (bloom_n_hashes > 0 && !bloom_may_contain(key)) return false;
 
     int idx = binary_search_keys(key);
     if (idx < 0) return false;
@@ -67,20 +60,6 @@ struct GpuRoaringView {
   __device__ __forceinline__ uint16_t load_cardinality(int idx) const
   {
     return __ldg(cardinalities + idx);
-  }
-
-  // ---- Bloom filter ----
-
-  __device__ __forceinline__ bool bloom_may_contain(uint16_t key) const
-  {
-    uint32_t h1 = static_cast<uint32_t>(key) * 0x9E3779B9u;
-    uint32_t h2 = static_cast<uint32_t>(key) * 0x517CC1B7u;
-    constexpr uint32_t BLOOM_BITS = BLOOM_SIZE_WORDS * 32;
-    for (uint32_t i = 0; i < bloom_n_hashes; ++i) {
-      uint32_t bit = (h1 + i * h2) % BLOOM_BITS;
-      if (!(__ldg(key_bloom + (bit >> 5)) & (1u << (bit & 31)))) return false;
-    }
-    return true;
   }
 
   // ---- Key binary search (uses __ldg for each probe) ----

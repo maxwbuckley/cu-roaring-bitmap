@@ -9,7 +9,7 @@
  *   Universe:  {1M, 10M, 100M, 1B}
  *   Density:   {0.1%, 1%, 10%, 50%}
  *   Pattern:   {random, clustered, strided}
- *   Method:    {flat_bitset, contains, warp_contains, warp_contains+bloom}
+ *   Method:    {flat_bitset, contains, warp_contains}
  *
  * Outputs JSON to results/raw/bench6_point_query.json
  */
@@ -31,10 +31,6 @@
 #include <random>
 #include <vector>
 
-// Forward-declare bloom builder (defined in bloom.cu, no public header)
-namespace cu_roaring {
-void build_key_bloom(GpuRoaring& bitmap, cudaStream_t stream = 0);
-}
 
 // ============================================================================
 // Query generation
@@ -355,11 +351,8 @@ int main()
              gpu_bm.n_containers, gpu_bm.n_bitmap_containers,
              gpu_bm.n_array_containers, gpu_bm.n_run_containers);
 
-      // Create views: without bloom and with bloom
-      auto view_no_bloom = cu_roaring::make_view(gpu_bm);
-
-      cu_roaring::build_key_bloom(gpu_bm);
-      auto view_bloom = cu_roaring::make_view(gpu_bm);
+      // Create view
+      auto view = cu_roaring::make_view(gpu_bm);
 
       // Create flat bitset
       uint32_t* d_bitset = make_gpu_bitset(cpu_bm, U);
@@ -368,7 +361,6 @@ int main()
       // Estimate roaring GPU bytes
       auto meta = cu_roaring::get_meta(cpu_bm);
       size_t roaring_bytes = meta.total_bytes;
-      size_t bloom_bytes = gpu_bm.key_bloom ? cu_roaring::GpuRoaring::BLOOM_SIZE_WORDS * sizeof(uint32_t) : 0;
 
       printf("  Memory: bitset=%.2fMB roaring=%.2fMB (%.1fx compression)\n",
              bitset_bytes / 1e6, roaring_bytes / 1e6,
@@ -379,12 +371,10 @@ int main()
       uint32_t* d_results_bitset;
       uint32_t* d_results_contains;
       uint32_t* d_results_warp;
-      uint32_t* d_results_warp_bloom;
       cudaMalloc(&d_queries, N_QUERIES * sizeof(uint32_t));
       cudaMalloc(&d_results_bitset, N_QUERIES * sizeof(uint32_t));
       cudaMalloc(&d_results_contains, N_QUERIES * sizeof(uint32_t));
       cudaMalloc(&d_results_warp, N_QUERIES * sizeof(uint32_t));
-      cudaMalloc(&d_results_warp_bloom, N_QUERIES * sizeof(uint32_t));
 
       dim3 block(256);
       dim3 grid((N_QUERIES + 255) / 256);
@@ -405,33 +395,25 @@ int main()
         });
 
         // --- Roaring contains() ---
-        // Use view without bloom for fair comparison
         auto ct_stats = bench_gpu_kernel(WARMUP, ITERS, [&]() {
           roaring_contains_kernel<<<grid, block>>>(
-            view_no_bloom, d_queries, d_results_contains, N_QUERIES);
+            view, d_queries, d_results_contains, N_QUERIES);
         });
 
         // --- Roaring warp_contains() ---
         auto wc_stats = bench_gpu_kernel(WARMUP, ITERS, [&]() {
           roaring_warp_contains_kernel<<<grid, block>>>(
-            view_no_bloom, d_queries, d_results_warp, N_QUERIES);
-        });
-
-        // --- Roaring warp_contains() + Bloom ---
-        auto wb_stats = bench_gpu_kernel(WARMUP, ITERS, [&]() {
-          roaring_warp_contains_kernel<<<grid, block>>>(
-            view_bloom, d_queries, d_results_warp_bloom, N_QUERIES);
+            view, d_queries, d_results_warp, N_QUERIES);
         });
 
         // Correctness: all methods must match bitset
         uint32_t mm_ct = verify_results(d_results_bitset, d_results_contains, N_QUERIES);
         uint32_t mm_wc = verify_results(d_results_bitset, d_results_warp, N_QUERIES);
-        uint32_t mm_wb = verify_results(d_results_bitset, d_results_warp_bloom, N_QUERIES);
         uint32_t hits  = count_hits(d_results_bitset, N_QUERIES);
 
-        if (mm_ct > 0 || mm_wc > 0 || mm_wb > 0) {
-          printf("  *** CORRECTNESS FAILURE: contains=%u warp=%u bloom=%u ***\n",
-                 mm_ct, mm_wc, mm_wb);
+        if (mm_ct > 0 || mm_wc > 0) {
+          printf("  *** CORRECTNESS FAILURE: contains=%u warp=%u ***\n",
+                 mm_ct, mm_wc);
         }
 
         double hit_rate = (double)hits / N_QUERIES;
@@ -440,15 +422,12 @@ int main()
         double bs_gqps = N_QUERIES / (bs_stats.median * 1e-3) / 1e9;
         double ct_gqps = N_QUERIES / (ct_stats.median * 1e-3) / 1e9;
         double wc_gqps = N_QUERIES / (wc_stats.median * 1e-3) / 1e9;
-        double wb_gqps = N_QUERIES / (wb_stats.median * 1e-3) / 1e9;
 
         printf("    bitset:         %.3f ms (%.2f Gq/s)\n", bs_stats.median, bs_gqps);
         printf("    contains:       %.3f ms (%.2f Gq/s) %.1fx vs bitset\n",
                ct_stats.median, ct_gqps, bs_stats.median / ct_stats.median);
         printf("    warp_contains:  %.3f ms (%.2f Gq/s) %.1fx vs bitset\n",
                wc_stats.median, wc_gqps, bs_stats.median / wc_stats.median);
-        printf("    warp+bloom:     %.3f ms (%.2f Gq/s) %.1fx vs bitset\n",
-               wb_stats.median, wb_gqps, bs_stats.median / wb_stats.median);
         printf("    hit_rate=%.3f\n", hit_rate);
 
         // Write JSON
@@ -464,8 +443,8 @@ int main()
         fprintf(f, "      \"n_containers\": %u, \"n_bitmap\": %u, \"n_array\": %u, \"n_run\": %u,\n",
                 gpu_bm.n_containers, gpu_bm.n_bitmap_containers,
                 gpu_bm.n_array_containers, gpu_bm.n_run_containers);
-        fprintf(f, "      \"bitset_bytes\": %zu, \"roaring_bytes\": %zu, \"bloom_bytes\": %zu,\n",
-                bitset_bytes, roaring_bytes, bloom_bytes);
+        fprintf(f, "      \"bitset_bytes\": %zu, \"roaring_bytes\": %zu,\n",
+                bitset_bytes, roaring_bytes);
         fprintf(f, "      \"compression_ratio\": %.2f,\n",
                 (double)bitset_bytes / roaring_bytes);
         fprintf(f, "      ");
@@ -474,23 +453,19 @@ int main()
         write_stats(f, "contains_ms", ct_stats);
         fprintf(f, ",\n      ");
         write_stats(f, "warp_contains_ms", wc_stats);
-        fprintf(f, ",\n      ");
-        write_stats(f, "warp_bloom_ms", wb_stats);
         fprintf(f, ",\n");
 
         // Derived metrics
         fprintf(f, "      \"bitset_gqps\": %.4f, \"contains_gqps\": %.4f, "
-                "\"warp_gqps\": %.4f, \"warp_bloom_gqps\": %.4f,\n",
-                bs_gqps, ct_gqps, wc_gqps, wb_gqps);
-        fprintf(f, "      \"contains_vs_bitset\": %.4f, \"warp_vs_bitset\": %.4f, "
-                "\"warp_bloom_vs_bitset\": %.4f,\n",
+                "\"warp_gqps\": %.4f,\n",
+                bs_gqps, ct_gqps, wc_gqps);
+        fprintf(f, "      \"contains_vs_bitset\": %.4f, \"warp_vs_bitset\": %.4f,\n",
                 ct_stats.median / bs_stats.median,
-                wc_stats.median / bs_stats.median,
-                wb_stats.median / bs_stats.median);
+                wc_stats.median / bs_stats.median);
         fprintf(f, "      \"warp_vs_contains\": %.4f,\n",
                 ct_stats.median / wc_stats.median);
         fprintf(f, "      \"correctness\": %s\n",
-                (mm_ct == 0 && mm_wc == 0 && mm_wb == 0) ? "true" : "false");
+                (mm_ct == 0 && mm_wc == 0) ? "true" : "false");
         fprintf(f, "    }");
       }
 
@@ -499,7 +474,6 @@ int main()
       cudaFree(d_results_bitset);
       cudaFree(d_results_contains);
       cudaFree(d_results_warp);
-      cudaFree(d_results_warp_bloom);
       cudaFree(d_bitset);
       cu_roaring::gpu_roaring_free(gpu_bm);
       roaring_bitmap_free(cpu_bm);

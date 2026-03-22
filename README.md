@@ -284,8 +284,7 @@ GpuRoaring
 ├── cardinalities[]  uint16_t   elements per container
 ├── bitmap_data[]    uint64_t   bitmap containers (1024 words each)
 ├── array_data[]     uint16_t   sorted array containers
-├── run_data[]       uint16_t   run containers (start, length pairs)
-└── key_bloom[]      uint32_t   optional Bloom filter (8 KB)
+└── run_data[]       uint16_t   run containers (start, length pairs)
 ```
 
 ### Container Types

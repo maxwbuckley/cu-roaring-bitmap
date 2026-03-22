@@ -39,11 +39,7 @@ __device__ __forceinline__ bool warp_contains(const GpuRoaringView& r, uint32_t 
   uint32_t meta_card   = 0;
 
   if (is_leader) {
-    if (r.bloom_n_hashes > 0 && !r.bloom_may_contain(key)) {
-      container_idx = -2;
-    } else {
-      container_idx = r.binary_search_keys(key);
-    }
+    container_idx = r.binary_search_keys(key);
 
     if (container_idx >= 0) {
       meta_type   = static_cast<uint32_t>(r.load_type(container_idx));

@@ -17,8 +17,6 @@ inline GpuRoaringView make_view(const GpuRoaring& bitmap)
   v.bitmap_data    = bitmap.bitmap_data;
   v.array_data     = bitmap.array_data;
   v.run_data       = bitmap.run_data;
-  v.key_bloom      = bitmap.key_bloom;
-  v.bloom_n_hashes = bitmap.key_bloom ? 2 : 0;
   return v;
 }
 

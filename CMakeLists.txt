@@ -69,7 +69,6 @@ add_library(cu_roaring_filter
     src/upload.cpp
     src/set_ops.cu
     src/decompress.cu
-    src/bloom.cu
     src/upload_ids.cu
     src/promote.cu
 )

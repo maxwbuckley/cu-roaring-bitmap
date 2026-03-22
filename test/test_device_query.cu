@@ -10,9 +10,9 @@
 #include <random>
 #include <vector>
 
-// Forward declare bloom builder
+// Forward declare gpu_roaring_free
 namespace cu_roaring {
-void build_key_bloom(GpuRoaring& bitmap, cudaStream_t stream);
+void gpu_roaring_free(GpuRoaring& bitmap);
 }
 
 // Kernel: test contains() for each query ID
@@ -62,8 +62,6 @@ class DeviceQueryTest : public ::testing::Test {
     cudaDeviceSynchronize();
 
     // Download results
-    std::vector<bool> h_results(n);
-    // bool is tricky with cudaMemcpy, use char
     std::vector<char> h_results_raw(n);
     cudaMemcpy(h_results_raw.data(), d_results, n * sizeof(bool), cudaMemcpyDeviceToHost);
 
@@ -91,10 +89,9 @@ TEST_F(DeviceQueryTest, ScalarContains_Dense) {
 
   auto gpu = cu_roaring::upload(r);
 
-  // Query: mix of present and absent IDs
   std::vector<uint32_t> queries;
   for (uint32_t i = 0; i < 10000; ++i)
-    queries.push_back(i * 20);  // some present, some not
+    queries.push_back(i * 20);
 
   verify_contains(gpu, r, queries, false);
   cu_roaring::gpu_roaring_free(gpu);
@@ -113,25 +110,6 @@ TEST_F(DeviceQueryTest, ScalarContains_Sparse) {
   std::vector<uint32_t> queries;
   for (uint32_t i = 0; i < 10000; ++i)
     queries.push_back(dist(gen));
-
-  verify_contains(gpu, r, queries, false);
-  cu_roaring::gpu_roaring_free(gpu);
-  roaring_bitmap_free(r);
-}
-
-TEST_F(DeviceQueryTest, ScalarContains_WithBloom) {
-  roaring_bitmap_t* r = roaring_bitmap_create();
-  std::mt19937 gen(42);
-  std::uniform_real_distribution<double> dist(0.0, 1.0);
-  for (uint32_t i = 0; i < 500000; ++i)
-    if (dist(gen) < 0.3) roaring_bitmap_add(r, i);
-
-  auto gpu = cu_roaring::upload(r);
-  cu_roaring::build_key_bloom(gpu, 0);
-
-  std::vector<uint32_t> queries;
-  for (uint32_t i = 0; i < 20000; ++i)
-    queries.push_back(i * 25);
 
   verify_contains(gpu, r, queries, false);
   cu_roaring::gpu_roaring_free(gpu);
@@ -157,14 +135,12 @@ TEST_F(DeviceQueryTest, WarpContains_Dense) {
 }
 
 TEST_F(DeviceQueryTest, WarpContains_ClusteredIDs) {
-  // Test where warp threads query IDs in the same container (same key)
   roaring_bitmap_t* r = roaring_bitmap_create();
   for (uint32_t i = 0; i < 100000; ++i)
     roaring_bitmap_add(r, i);
 
   auto gpu = cu_roaring::upload(r);
 
-  // All queries in same container (key=0): should share binary search
   std::vector<uint32_t> queries;
   for (uint32_t i = 0; i < 1024; ++i)
     queries.push_back(i);
@@ -174,28 +150,8 @@ TEST_F(DeviceQueryTest, WarpContains_ClusteredIDs) {
   roaring_bitmap_free(r);
 }
 
-TEST_F(DeviceQueryTest, WarpContains_WithBloom) {
-  roaring_bitmap_t* r = roaring_bitmap_create();
-  std::mt19937 gen(42);
-  std::uniform_real_distribution<double> dist(0.0, 1.0);
-  for (uint32_t i = 0; i < 500000; ++i)
-    if (dist(gen) < 0.3) roaring_bitmap_add(r, i);
-
-  auto gpu = cu_roaring::upload(r);
-  cu_roaring::build_key_bloom(gpu, 0);
-
-  std::vector<uint32_t> queries;
-  for (uint32_t i = 0; i < 20000; ++i)
-    queries.push_back(i * 25);
-
-  verify_contains(gpu, r, queries, true);
-  cu_roaring::gpu_roaring_free(gpu);
-  roaring_bitmap_free(r);
-}
-
 TEST_F(DeviceQueryTest, Contains_RunContainers) {
   roaring_bitmap_t* r = roaring_bitmap_create();
-  // Create runs
   for (uint32_t i = 1000; i < 5000; ++i) roaring_bitmap_add(r, i);
   for (uint32_t i = 70000; i < 80000; ++i) roaring_bitmap_add(r, i);
   roaring_bitmap_run_optimize(r);
@@ -216,21 +172,8 @@ TEST_F(DeviceQueryTest, Contains_EmptyBitmap) {
   roaring_bitmap_t* r = roaring_bitmap_create();
   auto gpu = cu_roaring::upload(r);
 
-  // All queries should return false
-  std::vector<uint32_t> queries = {0, 1, 100, 65535, 65536, 1000000};
-
-  uint32_t n = static_cast<uint32_t>(queries.size());
-  uint32_t* d_queries;
-  bool* d_results;
-  cudaMalloc(&d_queries, n * sizeof(uint32_t));
-  cudaMalloc(&d_results, n * sizeof(bool));
-  cudaMemcpy(d_queries, queries.data(), n * sizeof(uint32_t), cudaMemcpyHostToDevice);
-
-  // Can't use make_view on empty bitmap (null pointers) — just verify n_containers == 0
   EXPECT_EQ(gpu.n_containers, 0u);
 
-  cudaFree(d_queries);
-  cudaFree(d_results);
   cu_roaring::gpu_roaring_free(gpu);
   roaring_bitmap_free(r);
 }
