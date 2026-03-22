@@ -21,7 +21,7 @@ cd cu-roaring-filter
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="89"
 make -j$(nproc)
-ctest --output-on-failure   # 4 test suites
+ctest --output-on-failure   # 5 test suites
 ```
 
 Requires: CUDA 12.4+, CMake 3.25+, GCC 13+ (or any C++17 compiler).
@@ -312,6 +312,7 @@ cu-roaring-filter/
 │   │   ├── upload_ids.cuh          sorted IDs → GPU (no CRoaring dep)
 │   │   ├── decompress.cuh          GPU → flat bitset
 │   │   ├── set_ops.cuh             AND/OR/ANDNOT/XOR
+│   │   ├── promote.cuh             array/run → bitmap promotion
 │   │   └── utils.cuh               CUDA_CHECK, helpers
 │   └── device/
 │       ├── roaring_view.cuh        device-side contains() with __ldg
