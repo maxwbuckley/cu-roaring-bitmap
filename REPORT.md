@@ -18,6 +18,45 @@ Key results:
 
 ---
 
+## Current Status
+
+### What's Shipped
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| GPU Roaring bitmap (SoA layout) | Done | Upload from CRoaring or raw IDs |
+| `contains()` per-thread query | Done | With `__ldg` read-only cache |
+| `warp_contains()` cooperative query | Done | With `__shfl_sync` metadata broadcast |
+| Set operations (AND/OR/ANDNOT/XOR) | Done | Pairwise and multi-way |
+| Decompress to flat bitset | Done | 538 GB/s at 1B |
+| Cache-aware `PROMOTE_AUTO` | Done | Default policy — queries GPU L2 cache size |
+| All-bitmap promotion | Done | `PROMOTE_ALL`, `promote_to_bitmap()`, `promote_auto()` |
+| Unsorted/duplicate ID handling | Done | `upload_from_ids()` sorts and deduplicates internally |
+| One-line cuVS filter | Done | `roaring_filter(gpu_bitmap)` — no make_view, no cardinality |
+| Strict `-Werror` on all targets | Done | 14 warning flags, zero suppressions |
+| Bloom filter | **Removed** | Benchmarked at 5-17% overhead across 48 configs, zero benefit |
+| 7 benchmark suites (B1-B7) | Done | 150+ configurations, JSON output, figure generation |
+| CAGRA integration (cuVS fork) | Done | Kernel instantiations for float/half/int8/uint8 |
+| REPORT.md + README.md | Done | Full documentation |
+
+### API Surface (what a developer sees)
+
+```cpp
+// Upload — accepts unsorted IDs with duplicates, auto-selects optimal container format
+auto bitmap = cu_roaring::upload_from_ids(ids, n, universe, stream);
+
+// Combine predicates on GPU
+auto combined = cu_roaring::set_operation(a, b, cu_roaring::SetOp::AND, stream);
+
+// Search — one line
+auto filter = cuvs::neighbors::filtering::roaring_filter(combined);
+cuvs::neighbors::cagra::search(res, params, index, queries, neighbors, distances, filter);
+```
+
+Three function calls. No configuration required. The library handles sorting, deduplication, container format selection, L2 cache-aware promotion, view creation, and warp-cooperative query strategy internally.
+
+---
+
 ## 1. Problem Statement
 
 Filtered vector search at scale requires checking candidate IDs against a validity set during graph traversal. CAGRA's search kernel calls the filter function **millions of times per query batch** — every candidate neighbor encountered during the search is checked.
@@ -52,12 +91,10 @@ GpuRoaring (Structure-of-Arrays)
 
 ### Query Path (contains)
 
-Each membership check follows this path:
-
 ```
 1. key = id >> 16                            // register, free
-2. binary_search(keys[], key)                // log2(N) reads via __ldg (read-only cache)
-3. load type, offset, cardinality            // 1 read (via __ldg)
+2. binary_search(keys[], key)                // log2(N) reads via __ldg
+3. load type, offset, cardinality            // 1 read via __ldg
 4. container-specific test:
    - BITMAP: bitmap_data[word] via __ldg     // 1 read
    - ARRAY:  binary_search(array_data[])     // log2(card) reads
@@ -65,27 +102,18 @@ Each membership check follows this path:
 
 ### Warp-Cooperative Query (warp_contains)
 
-The warp variant amortizes the key lookup across 32 threads:
-
 ```
-1. __match_any_sync groups threads with the same high-16 key
-2. Leader performs binary search + reads metadata (type, offset, cardinality)
-3. __shfl_sync broadcasts all metadata to followers (zero global reads for followers)
-4. Each thread does its own container-level test
+1. __match_any_sync groups threads with same high-16 key
+2. Leader performs binary search + reads metadata
+3. __shfl_sync broadcasts type, offset, cardinality to all followers
+4. Each thread does its own container-level membership test
 ```
 
 ---
 
 ## 3. Standalone Benchmark Results (B6)
 
-### Methodology
-
-- 10M random queries per configuration
-- 50 iterations with 10 warmup, median reported
-- GPU timing via `cudaEvent` (no host overhead)
-- Correctness verified against flat bitset for every configuration
-
-### Point Query Throughput
+### Point Query Throughput (10M random queries, 50 iterations, median)
 
 | Universe | Density | Containers | Bitset (Gq/s) | `contains()` | `warp_contains()` | vs Bitset |
 |----------|---------|------------|---------------|-------------|-------------------|-----------|
@@ -96,18 +124,6 @@ The warp variant amortizes the key lookup across 32 threads:
 | 100M | 1% | 1526 arr | 101 | 13 | 13 | 0.1x |
 | 1B | 10% | 15259 bmp | 15 | 15 | **24** | **1.6x faster** |
 | 1B | 50% | 15259 bmp | 27 | 26 | 24 | 1.0x |
-
-### Key Findings
-
-**Roaring beats bitset in three scenarios:**
-
-1. **Small universe, sparse data** (1M-10M, 0.1%): The entire roaring structure fits in L2 cache. `contains()` is 1.2-1.4x faster than bitset because the compressed data has better cache efficiency.
-
-2. **Large universe, bitmap containers** (1B, 10%): The flat bitset (125 MB) thrashes L2 cache on random access. Roaring's `__ldg`-cached reads through the 125 MB bitmap data achieve better texture cache utilization because the access pattern (key lookup → one bitmap word) has higher spatial locality than scattered bitset reads.
-
-3. **Warp-cooperative at scale** (1B, 10%): `warp_contains()` at 24 Gq/s vs bitset at 15 Gq/s. The `__shfl_sync` metadata broadcast eliminates redundant global reads when warp lanes share the same container key.
-
-**Roaring is slower with array containers** (100M, 1%): The double binary search (key + in-container) costs 24 global reads per query vs 1 for bitset. This led to the all-bitmap promotion optimization.
 
 ---
 
@@ -121,17 +137,7 @@ The warp variant amortizes the key lookup across 32 threads:
 | Roaring bitmap container | ~14 (key search + 1 word read) | 14x |
 | Roaring array container | ~24 (key search + array search) | 24x |
 
-### Optimization Results
-
-Three optimizations were prototyped and benchmarked:
-
-| Optimization | What | Best Speedup | Status |
-|---|---|---|---|
-| **All-bitmap promotion** | Convert array containers to bitmap at upload | **7.4x** (100M/1%) | Implemented: `upload(bm, stream, PROMOTE_ALL)` |
-| **`__ldg()` read-only cache** | Route all global reads through texture cache | **1.6x** (1B/10%) | Applied in library |
-| **Warp metadata broadcast** | Leader reads type/offset/card, broadcasts via `__shfl_sync` | Eliminates 96 redundant reads/warp | Applied in library |
-
-### All-Bitmap Promotion Impact (B7 data)
+### All-Bitmap Promotion Impact
 
 | Condition | base_contains | allbmp_contains | Speedup | allbmp vs Bitset |
 |-----------|--------------|-----------------|---------|------------------|
@@ -141,19 +147,13 @@ Three optimizations were prototyped and benchmarked:
 | 1B/0.1% random | 0.767 ms | 0.379 ms | **2.0x** | 1.73x faster |
 | 1B/1% random | 1.056 ms | 0.378 ms | **2.8x** | 1.73x faster |
 
-With all-bitmap promotion, roaring matches flat bitset speed across all conditions and **beats it at 1B scale** (1.73x) due to cache effects.
+### Bloom Filter (removed)
+
+Benchmarked across 48 configurations: **38 cases 5-17% slower, 10 neutral, 0 helped.** The 2-hash + 2-global-read bloom check is pure overhead when the binary search confirms or rejects the key anyway. Removed entirely.
 
 ---
 
 ## 5. CAGRA Integration Results
-
-### Setup
-
-- CAGRA index: 1M vectors, 128 dimensions, graph_degree=32, itopk=256
-- 100 queries per batch, k=10 nearest neighbors
-- Recall measured against bitset_filter ground truth
-
-### Search Latency
 
 | Pass Rate | No Filter | Bitset Filter | Roaring (warp) | Speedup vs Bitset | Recall |
 |-----------|-----------|--------------|----------------|-------------------|--------|
@@ -161,23 +161,7 @@ With all-bitmap promotion, roaring matches flat bitset speed across all conditio
 | 10% | 0.77 ms | 1.602 ms | **1.327 ms** | **1.21x** | 96.2% |
 | 1% | 0.68 ms | 3.596 ms | **3.584 ms** | 1.00x | 97.2% |
 
-### Analysis
-
-At **50% pass rate**, roaring is 1.31x faster than bitset. This is because:
-- The CAGRA kernel checks every candidate neighbor against the filter
-- With 50% selectivity, each warp of 32 threads checks 32 candidates
-- Many candidates share the same high-16 key → `warp_contains()` amortizes the key binary search
-- The roaring structure (1M vectors → 16 containers) fits entirely in L2 cache
-
-At **1% pass rate**, roaring and bitset are equal. The search is dominated by graph traversal (finding valid neighbors in a sparse filter), not filter evaluation cost.
-
-### Throughput (1M vectors, batch=10K)
-
-| Filter | QPS |
-|--------|-----|
-| No filter | 2.6M |
-| Bitset | 922K |
-| Roaring warp | **960K** |
+Throughput at batch=10K: Roaring **960K QPS** vs Bitset 922K QPS.
 
 ---
 
@@ -192,88 +176,69 @@ At **1% pass rate**, roaring and bitset are equal. The search is dominated by gr
 | 10% | 125 MB | 125 MB | 125 MB | 1x |
 | 50% | 125 MB | 125 MB | 125 MB | 1x |
 
-### Multi-Attribute Scaling
-
-For a 1B-vector dataset with N filter attributes (Zipfian density distribution):
+### Multi-Attribute Scaling (1B vectors, Zipfian distribution)
 
 | Attributes | Flat Bitset | Roaring (compressed) | Fits in 32 GB? |
 |-----------|------------|---------------------|----------------|
 | 10 | 1.25 GB | 0.44 GB | Both fit |
 | 100 | 12.5 GB | 6.9 GB | Bitset: barely. Roaring: yes |
-| 500 | 62.5 GB | 34.5 GB | Neither. But roaring is 1.8x smaller |
-| 1000 | 125 GB | 69 GB | Neither. Roaring: 1.8x smaller |
+| 500 | 62.5 GB | 34.5 GB | Neither. Roaring 1.8x smaller |
 
-The compression advantage is most impactful when many attributes are sparse (0.1-1% density). A real-world e-commerce catalog might have: 3 popular categories (50% density, no savings), 20 medium categories (10%, no savings), 100 rare attributes (1%, 6x savings), 500 tag bitmaps (0.1%, 59x savings). The rare/tag bitmaps dominate memory and are where roaring helps most.
-
-### Recommended Strategy
-
-The default `PROMOTE_AUTO` policy handles this automatically by querying the GPU's L2 cache size at upload time:
+### Cache-Aware Strategy (PROMOTE_AUTO, default)
 
 | Condition | Auto Decision | Why |
 |-----------|--------------|-----|
-| Flat bitset fits in L2 (small universe) | `PROMOTE_NONE` — keep arrays | Bitset reads would be L2 hits; save memory |
-| Flat bitset exceeds L2 (large universe) | `PROMOTE_ALL` — all bitmap | Bitset would thrash cache; roaring's `__ldg` reads win |
-
-Developers just call `upload()` with no arguments and get the right behavior. Manual overrides are available:
-
-| Use Case | Strategy | Memory | Query Speed |
-|----------|----------|--------|-------------|
-| **Default** | `upload(bm, stream)` — auto | Optimal | Optimal |
-| **Cold filter** (stored, used in set ops) | `upload(bm, stream, PROMOTE_NONE)` | 6-59x smaller | Slower per-query |
-| **Multi-predicate** | Set ops on compressed, then `promote_auto()` result | Only final result uses full memory | Best of both worlds |
+| Flat bitset fits in L2 (small universe) | `PROMOTE_NONE` — keep arrays | Bitset reads = L2 hits; save memory |
+| Flat bitset exceeds L2 (large universe) | `PROMOTE_ALL` — all bitmap | Bitset thrashes cache; roaring's `__ldg` wins |
 
 ---
 
 ## 7. End-to-End Pipeline Comparison
 
-For a multi-predicate filtered search (e.g., "color=red AND price<50 AND in_stock"):
+For "color=red AND price<50 AND in_stock" at 1B scale:
 
-### Pipeline A: CPU Filter + PCIe Transfer
-```
-1. CPU CRoaring AND (3 bitmaps)        → 180 ms at 1B
-2. PCIe transfer (flat bitset to GPU)   →   9 ms at 1B
-3. CAGRA search with bitset_filter      →  10 ms (simulated)
-Total: 199 ms
-```
-
-### Pipeline B: GPU-Resident Roaring
-```
-1. GPU set_operation AND (3 bitmaps)    →   8 ms at 1B
-2. (No transfer — already on GPU)      →   0 ms
-3. CAGRA search with roaring_filter     →  10 ms (simulated)
-Total: 18 ms → 11x faster
-```
-
-### Pipeline C: GPU Roaring + Promotion
-```
-1. GPU set_operation AND (3 bitmaps)    →   8 ms at 1B
-2. promote_to_bitmap (result only)      →  <1 ms
-3. CAGRA search with promoted filter    →  ~8 ms (estimated from 1.3x speedup)
-Total: ~17 ms → 12x faster
-```
+| Pipeline | Filter | Transfer | Search | Total | vs Baseline |
+|----------|--------|----------|--------|-------|-------------|
+| **A: CPU + PCIe** | 180 ms (CPU CRoaring) | 9 ms (H→D) | 10 ms | **199 ms** | baseline |
+| **B: GPU Roaring** | 8 ms (GPU set ops) | 0 ms | 10 ms | **18 ms** | **11x faster** |
+| **C: GPU + Promote** | 8 ms + <1 ms promote | 0 ms | ~8 ms | **~17 ms** | **12x faster** |
 
 ---
 
-## 8. Optimizations Applied
+## 8. Optimizations — Shipped vs Future
 
-### In the Library (shipped)
+### Shipped
 
-| Optimization | File | Impact |
+| Optimization | Impact | Files |
 |---|---|---|
-| `__ldg()` on all device reads | `roaring_view.cuh` | 1.6x at 1B/10% (texture cache for scattered reads) |
-| Warp metadata broadcast | `roaring_warp_query.cuh` | Eliminates 96 redundant global reads per warp |
-| All-bitmap promotion | `promote.cuh`, `upload.cuh`, `upload_ids.cuh` | 3.9-7.4x for array container elimination |
-| Cache-aware auto policy | `promote.cuh` — `PROMOTE_AUTO` default | Queries L2 cache size, selects optimal strategy per GPU |
-| Configurable threshold | `upload()`, `upload_from_sorted_ids()` | `PROMOTE_AUTO` (default), `PROMOTE_ALL`, `PROMOTE_NONE`, or custom |
-| Strict `-Werror` warnings | `CMakeLists.txt` | `-Wshadow`, `-Wnon-virtual-dtor`, etc. on all targets |
+| `__ldg()` read-only cache | 1.6x at 1B/10% | `roaring_view.cuh` |
+| Warp `__shfl_sync` metadata broadcast | Eliminates 96 redundant reads/warp | `roaring_warp_query.cuh` |
+| All-bitmap promotion (`PROMOTE_ALL`) | 3.9-7.4x for array containers | `promote.cuh` |
+| Cache-aware `PROMOTE_AUTO` (default) | Auto-selects per GPU L2 size | `promote.cuh` |
+| Bloom filter removal | +5-10% query speed (removed overhead) | All device headers |
+| `total_cardinality` tracking | Eliminates manual cardinality plumbing | `types.cuh` |
+| One-line cuVS filter constructor | `roaring_filter(bitmap)` | `roaring_filter.cuh` |
+| Sort + dedup in `upload_from_ids` | Fixes silent corruption on unsorted input | `upload_ids.cu` |
+| Strict `-Werror` (14 flags) | Zero warnings on all 11 targets | `CMakeLists.txt` |
 
-### Prototyped (not yet in library)
+### Prototyped (benchmarked, not yet in library)
 
-| Optimization | Location | Impact | Effort |
+| Optimization | Impact | Effort | Notes |
 |---|---|---|---|
-| Direct-map key index | `bench_optimized_query.cu` | 1.75x at 1B for `contains()` | Medium |
-| Fused multi-predicate kernel | Not started | 20-40% for 4+ predicates | High |
-| cudaMallocAsync / memory pool | Not started | Reduce allocation stalls | Medium |
+| Direct-map key index | 1.75x at 1B for `contains()` | Medium | O(1) table lookup replaces O(log n) binary search. 30 KB at 1B. Prototyped in `bench_optimized_query.cu` |
+
+### Planned (not started)
+
+| Optimization | Expected Impact | Effort | Notes |
+|---|---|---|---|
+| **Fused multi-predicate kernel** | 20-40% for 4+ predicates | High | Current `multi_and` does N pairwise ops with ~20 cudaMallocs each. Fuse into single D2H + multi-way merge + batched kernels |
+| **cudaMallocAsync / memory pool** | Reduce allocation stalls | Medium | Replace synchronous cudaMalloc in upload and set_ops with stream-ordered allocation |
+| **GPU-side sort for upload** | 30x faster upload at 100M+ IDs | Medium | CUB `DeviceRadixSort` + GPU partitioning. Only matters at 100M+ IDs where CPU sort takes >1s. At 1M (typical CAGRA) the CPU sort is 10 ms — not a bottleneck |
+| **IVF-PQ/Flat support** | Expand beyond CAGRA | Medium | Add `FilterType::Roaring` to cuVS IVF runtime dispatch union |
+| **Python bindings** | Developer reach | Medium | Expose `roaring_filter` through `pylibcuvs` for Python RAG pipelines |
+| **Shared memory key cache** | Better locality in CAGRA kernel | Low | Preload key index into SMEM once per block. Only measurable inside CAGRA, not standalone |
+| **Per-query filter** | Enable different filters per query in a batch | Medium | Current API applies one filter to all queries. Per-query would need a `bitmap_filter`-like 2D interface |
+| **Streaming filter updates** | Incremental add/remove without full rebuild | High | Currently filters are immutable after upload. Streaming updates would need atomic set-bit operations on GPU-resident containers |
 
 ---
 
@@ -288,33 +253,34 @@ Total: ~17 ms → 12x faster
 | **Set ops on GPU** | AND/OR/ANDNOT/XOR | Bitwise only | N/A |
 | **Ad-hoc queries** | Yes | Yes | No (requires re-indexing) |
 | **Construction (4 pred, 1B)** | **10 ms** (GPU) | Trivial | Minutes (index build) |
+| **User-facing API** | 3 calls, zero config | 2 calls | Custom index build |
 
 ---
 
 ## 10. Integration Path
 
-### For cuVS upstream (rapidsai/cuvs)
+### cuVS Upstream (rapidsai/cuvs)
 
-The integration is already prototyped in the cuVS fork:
+Already prototyped in the cuVS fork:
 
-1. **`cuvs/core/roaring.hpp`** — `gpu_roaring` struct with RAII (rmm::device_uvector), `from_sorted_ids()`, set operations, `to_bitset()` decompression
-2. **`cuvs/neighbors/roaring_filter.cuh`** — `roaring_filter` and `roaring_filter_warp` implementing the `base_filter` interface
-3. **CAGRA kernel instantiations** for all 4 data types (float, half, int8, uint8) x roaring filter
+1. **`cuvs/core/roaring.hpp`** — `gpu_roaring` with RAII (rmm), `from_sorted_ids()`, set ops, `to_bitset()`
+2. **`cuvs/neighbors/roaring_filter.cuh`** — One-line filter constructor, warp-cooperative queries
+3. **CAGRA kernel instantiations** — float, half, int8, uint8
 
-Remaining work for upstream:
-- Port `promote_to_bitmap()` into `cuvs::core::gpu_roaring`
+Remaining for upstream PR:
+- Port `PROMOTE_AUTO`, `upload_from_ids` (sort+dedup), `total_cardinality` into cuVS `gpu_roaring`
 - Add `FilterType::Roaring` to IVF runtime dispatch
 - Python bindings via `pylibcuvs`
 - Integration tests in cuVS CI
 
-### Broader NVIDIA ecosystem
+### Broader NVIDIA Ecosystem
 
 | Library | Use Case | Fit |
 |---------|----------|-----|
 | **cuVS** | Filtered ANN search | Primary target (prototyped) |
-| **RAFT** | Core data structure (like `raft::core::bitset`) | Natural home for the container type |
-| **cuDF** | DataFrame predicate masks | Strong fit for compound WHERE clauses |
-| **cuGraph** | Vertex/edge filtering for subgraph ops | Similar traversal pattern to CAGRA |
+| **RAFT** | Core data structure (`raft::core::bitset` peer) | Natural home for the container |
+| **cuDF** | DataFrame predicate masks | Compound WHERE on large tables |
+| **cuGraph** | Vertex/edge filtering | Same traversal pattern as CAGRA |
 
 ---
 
@@ -328,15 +294,10 @@ Remaining work for upstream:
 ### Running Benchmarks
 
 ```bash
-# Standalone benchmarks (cu-roaring-filter)
 cd cu-roaring-filter/build
-./bench/bench_point_query           # B6: point query throughput (48 configs)
-./bench/bench_optimized_query       # B7: optimization analysis (32 configs)
+./bench/bench_point_query           # B6: point query throughput
+./bench/bench_optimized_query       # B7: optimization analysis
 ./bench/bench_comprehensive         # B1/B3/B4/B5: construction, memory, E2E
-
-# cuVS CAGRA benchmark
-cd cuvs/cpp/bench/prims/core/build
-LD_LIBRARY_PATH=../../../build:../../../build/_deps/rmm-build ./bench_cagra_roaring
 ```
 
 ### Methodology
@@ -344,5 +305,5 @@ LD_LIBRARY_PATH=../../../build:../../../build/_deps/rmm-build ./bench_cagra_roar
 - 10 warmup iterations
 - Median reported (not mean) to reduce outlier sensitivity
 - GPU timing via `cudaEvent` pairs (microsecond precision)
-- Correctness verified via bitwise comparison against flat bitset ground truth for every configuration
-- All results in `results/raw/*.json` with full statistics (median, mean, p5, p95, stdev, min, max)
+- Correctness verified via bitwise comparison against flat bitset ground truth
+- All results in `results/raw/*.json` with full statistics
