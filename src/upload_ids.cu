@@ -8,11 +8,11 @@
 
 namespace cu_roaring {
 
-GpuRoaring upload_from_sorted_ids(const uint32_t* sorted_ids,
-                                  uint32_t n_ids,
-                                  uint32_t universe_size,
-                                  cudaStream_t stream,
-                                  uint32_t bitmap_threshold)
+GpuRoaring upload_from_ids(const uint32_t* sorted_ids,
+                           uint32_t n_ids,
+                           uint32_t universe_size,
+                           cudaStream_t stream,
+                           uint32_t bitmap_threshold)
 {
   // Resolve PROMOTE_AUTO to a concrete threshold
   uint32_t effective_threshold = bitmap_threshold;
@@ -21,9 +21,14 @@ GpuRoaring upload_from_sorted_ids(const uint32_t* sorted_ids,
   }
 
   GpuRoaring result{};
-  result.universe_size     = universe_size;
-  result.total_cardinality = n_ids;
+  result.universe_size = universe_size;
   if (n_ids == 0) return result;
+
+  // Sort and deduplicate — callers don't need to pre-sort
+  std::vector<uint32_t> ids(sorted_ids, sorted_ids + n_ids);
+  std::sort(ids.begin(), ids.end());
+  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  result.total_cardinality = ids.size();
 
   // Partition IDs into containers by high 16 bits
   struct Container {
@@ -32,11 +37,11 @@ GpuRoaring upload_from_sorted_ids(const uint32_t* sorted_ids,
   };
   std::vector<Container> containers;
 
-  uint16_t cur_key = static_cast<uint16_t>(sorted_ids[0] >> 16);
+  uint16_t cur_key = static_cast<uint16_t>(ids[0] >> 16);
   containers.push_back({cur_key, {}});
-  for (uint32_t i = 0; i < n_ids; ++i) {
-    uint16_t key = static_cast<uint16_t>(sorted_ids[i] >> 16);
-    uint16_t val = static_cast<uint16_t>(sorted_ids[i] & 0xFFFF);
+  for (size_t i = 0; i < ids.size(); ++i) {
+    uint16_t key = static_cast<uint16_t>(ids[i] >> 16);
+    uint16_t val = static_cast<uint16_t>(ids[i] & 0xFFFF);
     if (key != cur_key) {
       cur_key = key;
       containers.push_back({key, {}});

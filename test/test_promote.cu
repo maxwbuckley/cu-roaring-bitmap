@@ -334,3 +334,71 @@ TEST_F(PromoteTest, UploadDefaultIsAuto) {
     cu_roaring::gpu_roaring_free(small);
     cu_roaring::gpu_roaring_free(large);
 }
+
+// ============================================================================
+// upload_from_ids — unsorted and duplicate input handling
+// ============================================================================
+
+TEST_F(PromoteTest, UploadFromIdsUnsorted) {
+    // IDs completely out of order, spanning multiple containers
+    std::vector<uint32_t> ids = {200, 5, 100000, 42, 65536, 0, 100000, 5};
+    // Expected unique sorted: {0, 5, 42, 200, 65536, 100000}
+
+    auto bm = cu_roaring::upload_from_ids(
+        ids.data(), static_cast<uint32_t>(ids.size()), 200000, 0,
+        cu_roaring::PROMOTE_NONE);
+
+    // Should have deduplicated: 8 input → 6 unique
+    EXPECT_EQ(bm.total_cardinality, 6u);
+
+    // Verify via decompression
+    auto bs = to_host_bitset(bm);
+    auto bit_set = [&](uint32_t id) -> bool {
+        return (bs[id / 32] >> (id % 32)) & 1u;
+    };
+
+    EXPECT_TRUE(bit_set(0));
+    EXPECT_TRUE(bit_set(5));
+    EXPECT_TRUE(bit_set(42));
+    EXPECT_TRUE(bit_set(200));
+    EXPECT_TRUE(bit_set(65536));
+    EXPECT_TRUE(bit_set(100000));
+    EXPECT_FALSE(bit_set(1));
+    EXPECT_FALSE(bit_set(100));
+    EXPECT_FALSE(bit_set(65535));
+
+    cu_roaring::gpu_roaring_free(bm);
+}
+
+TEST_F(PromoteTest, UploadFromIdsAllDuplicates) {
+    std::vector<uint32_t> ids = {42, 42, 42, 42};
+
+    auto bm = cu_roaring::upload_from_ids(
+        ids.data(), static_cast<uint32_t>(ids.size()), 100, 0,
+        cu_roaring::PROMOTE_NONE);
+
+    EXPECT_EQ(bm.total_cardinality, 1u);
+    EXPECT_EQ(bm.n_containers, 1u);
+
+    cu_roaring::gpu_roaring_free(bm);
+}
+
+TEST_F(PromoteTest, UploadFromIdsReversed) {
+    // Worst case for naive sorted assumption: fully reversed
+    std::vector<uint32_t> ids;
+    for (int i = 999; i >= 0; --i)
+        ids.push_back(static_cast<uint32_t>(i));
+
+    auto bm = cu_roaring::upload_from_ids(
+        ids.data(), static_cast<uint32_t>(ids.size()), 1000, 0,
+        cu_roaring::PROMOTE_NONE);
+
+    EXPECT_EQ(bm.total_cardinality, 1000u);
+
+    // Verify all bits set
+    auto bs = to_host_bitset(bm);
+    uint64_t count = popcount(bs);
+    EXPECT_EQ(count, 1000u);
+
+    cu_roaring::gpu_roaring_free(bm);
+}

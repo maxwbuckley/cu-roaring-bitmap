@@ -51,18 +51,18 @@ auto fast       = cu_roaring::upload(cpu_bm, stream, cu_roaring::PROMOTE_ALL);  
 roaring_bitmap_free(cpu_bm);  // CPU copy no longer needed
 ```
 
-### Build directly from sorted IDs (no CRoaring dependency)
+### Build from ID array (no CRoaring dependency)
 
 ```cpp
 #include <cu_roaring/detail/upload_ids.cuh>
 
-std::vector<uint32_t> pass_ids = {0, 5, 12, 99, 1042, ...};
-auto gpu_bm = cu_roaring::upload_from_sorted_ids(
+// IDs can be unsorted and contain duplicates — handled internally
+std::vector<uint32_t> pass_ids = {1042, 5, 99, 12, 0, 5, ...};
+auto gpu_bm = cu_roaring::upload_from_ids(
     pass_ids.data(), pass_ids.size(), universe_size, stream);
 
-// Default (PROMOTE_AUTO) picks the optimal format for your GPU.
-// Override manually if needed:
-auto fast_bm = cu_roaring::upload_from_sorted_ids(
+// Override the cache-aware default if needed:
+auto fast_bm = cu_roaring::upload_from_ids(
     pass_ids.data(), pass_ids.size(), universe_size, stream,
     cu_roaring::PROMOTE_ALL);  // force all-bitmap for max query speed
 ```
