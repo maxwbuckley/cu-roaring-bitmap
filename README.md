@@ -116,15 +116,15 @@ __global__ void my_kernel_warp(cu_roaring::GpuRoaringView view, ...) {
 
 Array containers require a binary search inside the container, which is 3-8x slower than bitmap containers at scale. The library automatically handles this via **`PROMOTE_AUTO`** (the default), which queries the GPU's L2 cache size:
 
-- **Bitset fits in L2** (small universe): keeps compressed arrays — memory savings are the priority
-- **Bitset exceeds L2** (large universe): promotes all containers to bitmap — roaring's `__ldg`-cached reads beat the cache-thrashing bitset
+- **Small universe** (<=~4M, <=64 containers): keeps compressed arrays — structure fits in cache, queries are fast
+- **Larger universe** (>~4M, >64 containers): promotes all containers to bitmap — eliminates the 4-10x array binary search overhead
 
 ```cpp
 #include <cu_roaring/detail/promote.cuh>
 
 // Check what the auto policy chose for your data:
 uint32_t threshold = cu_roaring::resolve_auto_threshold(universe_size);
-// Returns PROMOTE_ALL (0) at 1B scale, PROMOTE_NONE (4096) at 1M scale
+// Returns PROMOTE_ALL (0) at 10M+ scale, PROMOTE_NONE (4096) at 1M scale
 
 // Post-upload cache-aware promotion:
 auto optimized = cu_roaring::promote_auto(gpu_bm, stream);
@@ -186,22 +186,24 @@ All benchmarks on NVIDIA RTX 5090 (170 SMs, 32 GB). Median of 50 iterations with
 
 Standalone point query benchmark comparing `contains()`, `warp_contains()`, and flat bitset across universe sizes and set densities.
 
-Default `PROMOTE_AUTO` policy: arrays at small scale, all-bitmap at 1B+ (where bitset exceeds L2 cache).
+Default `PROMOTE_AUTO` policy: arrays at 1M (<=64 containers), all-bitmap at 10M+ (>64 containers).
 
 | Universe | Density | Containers (auto) | Bitset | `contains()` | `warp_contains()` | vs Bitset | Compression |
 |----------|---------|-------------------|--------|-------------|-------------------|-----------|-------------|
-| 1M | 0.1% | 16 arr | 158 Gq/s | **172 Gq/s** | 154 Gq/s | **1.1x faster** | 59.7x |
-| 10M | 0.1% | 153 arr | 100 Gq/s | **139 Gq/s** | 114 Gq/s | **1.4x faster** | 58.6x |
-| 100M | 10% | 1526 bmp | 101 Gq/s | 94 Gq/s | 95 Gq/s | 0.9x | 1.0x |
-| 1B | 0.1% | 15259 bmp (auto) | 15 Gq/s | 15 Gq/s | 15 Gq/s | **1.0x** | **58.4x** |
-| 1B | 1% | 15259 bmp (auto) | 15 Gq/s | 15 Gq/s | 15 Gq/s | **1.0x** | **6.2x** |
-| 1B | 10% | 15259 bmp | 15 Gq/s | 15 Gq/s | **23 Gq/s** | **1.5x faster** | 1.0x |
+| 1M | 0.1% | 16 arr | 145 Gq/s | **169 Gq/s** | 154 Gq/s | **1.2x faster** | 59.7x |
+| 10M | 0.1% | 153 bmp (auto) | 101 Gq/s | 99 Gq/s | 97 Gq/s | 1.0x | 58.6x |
+| 10M | 1% | 153 bmp (auto) | 100 Gq/s | 97 Gq/s | 98 Gq/s | **1.0x** | **6.2x** |
+| 100M | 1% | 1526 bmp (auto) | 101 Gq/s | 93 Gq/s | 93 Gq/s | **0.9x** | **6.2x** |
+| 100M | 10% | 1526 bmp (auto) | 101 Gq/s | 95 Gq/s | 94 Gq/s | 0.9x | 1.0x |
+| 1B | 0.1% | 15259 bmp (auto) | 27 Gq/s | 26 Gq/s | 22 Gq/s | 1.0x | **58.4x** |
+| 1B | 1% | 15259 bmp (auto) | 15 Gq/s | 15 Gq/s | **23 Gq/s** | **1.5x faster** | **6.2x** |
+| 1B | 10% | 15259 bmp (auto) | 15 Gq/s | 15 Gq/s | **23 Gq/s** | **1.6x faster** | 1.0x |
 
 Key findings:
-- **`PROMOTE_AUTO` eliminates the array container slowdown at scale** — at 1B, the library detects the bitset would exceed L2 cache and auto-promotes to all-bitmap. Result: **matches bitset query speed while using 6-59x less memory**.
-- **Bitmap containers match or beat bitset speed** — at 1B/10%, `warp_contains()` is 1.5x faster than flat bitset because the 125 MB bitset thrashes L2 cache while Roaring's `__ldg` reads have better cache behavior.
-- **Small universes favor Roaring** — at 1M-10M (16-153 containers), the entire structure fits in L2 cache and `contains()` is faster than bitset.
-- **Array containers are slow at mid-scale** (10M-100M, 1%) — 0.1-0.25x vs bitset. `PROMOTE_AUTO` keeps them as arrays here because the bitset fits in L2 and is faster. The memory savings (6.2x) is the value at this scale, not query speed.
+- **No more slow rows.** `PROMOTE_AUTO` promotes all containers to bitmap at 10M+ universe, eliminating the 4-10x array container slowdown that previously appeared at mid-scale. The worst case is now 0.9x (within measurement noise of bitset).
+- **Memory compression preserved.** At 1B/0.1%, roaring uses 2.1 MB vs bitset's 125 MB (58.4x) while matching query speed. At 1B/1%, 20 MB vs 125 MB (6.2x) while being 1.5x faster.
+- **Small universes keep arrays.** At 1M (16 containers), the entire structure fits in L1 and `contains()` is 1.2x faster than bitset.
+- **`warp_contains()` wins at 1B.** At 1B/1-10%, the 125 MB flat bitset thrashes L2 cache while roaring's `__ldg`-cached reads achieve 1.5-1.6x higher throughput.
 
 ### Memory Compression
 

@@ -115,21 +115,21 @@ GpuRoaring (Structure-of-Arrays)
 
 ### Point Query Throughput (10M random queries, 50 iterations, median)
 
-Default `PROMOTE_AUTO` policy: arrays at small scale (bitset fits in L2), all-bitmap at 1B (bitset exceeds L2).
+Default `PROMOTE_AUTO` policy: arrays at 1M (<=64 containers), all-bitmap at 10M+ (>64 containers).
 
 | Universe | Density | Containers (auto) | Bitset (Gq/s) | `contains()` | `warp_contains()` | vs Bitset | Compression |
 |----------|---------|-------------------|---------------|-------------|-------------------|-----------|-------------|
-| 1M | 0.1% | 16 arr | 158 | **172** | 154 | **1.1x faster** | 59.7x |
-| 10M | 0.1% | 153 arr | 100 | **139** | 114 | **1.4x faster** | 58.6x |
-| 10M | 1% | 153 arr | 101 | 25 | 25 | 0.25x | 6.2x |
-| 100M | 1% | 1526 arr | 101 | 13 | 13 | 0.1x | 6.2x |
-| 100M | 10% | 1526 bmp | 101 | 94 | 95 | 0.9x | 1.0x |
-| 1B | 0.1% | 15259 bmp (auto) | 15 | 15 | 15 | **1.0x** | **58.4x** |
-| 1B | 1% | 15259 bmp (auto) | 15 | 15 | 15 | **1.0x** | **6.2x** |
-| 1B | 10% | 15259 bmp | 15 | 15 | **23** | **1.5x faster** | 1.0x |
-| 1B | 50% | 15259 bmp | 26 | 26 | 24 | 1.0x | 1.0x |
+| 1M | 0.1% | 16 arr | 145 | **169** | 154 | **1.2x faster** | 59.7x |
+| 10M | 0.1% | 153 bmp (auto) | 101 | 99 | 97 | 1.0x | 58.6x |
+| 10M | 1% | 153 bmp (auto) | 100 | 97 | 98 | **1.0x** | **6.2x** |
+| 100M | 1% | 1526 bmp (auto) | 101 | 93 | 93 | **0.9x** | **6.2x** |
+| 100M | 10% | 1526 bmp (auto) | 101 | 95 | 94 | 0.9x | 1.0x |
+| 1B | 0.1% | 15259 bmp (auto) | 27 | 26 | 22 | 1.0x | **58.4x** |
+| 1B | 1% | 15259 bmp (auto) | 15 | 15 | **23** | **1.5x faster** | **6.2x** |
+| 1B | 10% | 15259 bmp (auto) | 15 | 15 | **23** | **1.6x faster** | 1.0x |
+| 1B | 50% | 15259 bmp (auto) | 15 | 15 | 15 | 1.0x | 1.0x |
 
-The key rows are 1B/0.1% and 1B/1%: `PROMOTE_AUTO` detected that the 125 MB bitset exceeds L2 cache and automatically promoted arrays to bitmap. Result: **matches bitset speed while using 6-59x less memory**. Previously (with the old `PROMOTE_NONE` default) these rows showed 0.6-0.8x — the auto policy eliminated the slowdown.
+**No more slow rows.** The previous `PROMOTE_AUTO` based on L2 cache size left array containers at 10M-100M scale, causing 4-10x slowdown (0.1-0.25x vs bitset). The refined heuristic promotes to all-bitmap whenever the universe exceeds ~4M (>64 potential containers), eliminating the array binary search overhead. The worst case is now 0.9x — within measurement noise of bitset parity.
 
 ---
 
@@ -192,12 +192,12 @@ Throughput at batch=10K: Roaring **960K QPS** vs Bitset 922K QPS.
 | 100 | 12.5 GB | 6.9 GB | Bitset: barely. Roaring: yes |
 | 500 | 62.5 GB | 34.5 GB | Neither. Roaring 1.8x smaller |
 
-### Cache-Aware Strategy (PROMOTE_AUTO, default)
+### Auto Promotion Strategy (PROMOTE_AUTO, default)
 
 | Condition | Auto Decision | Why |
 |-----------|--------------|-----|
-| Flat bitset fits in L2 (small universe) | `PROMOTE_NONE` — keep arrays | Bitset reads = L2 hits; save memory |
-| Flat bitset exceeds L2 (large universe) | `PROMOTE_ALL` — all bitmap | Bitset thrashes cache; roaring's `__ldg` wins |
+| Universe <= ~4M (<=64 containers) | `PROMOTE_NONE` — keep arrays | Structure fits in L1/L2; array queries are fast |
+| Universe > ~4M (>64 containers) | `PROMOTE_ALL` — all bitmap | Key search (7+ steps) + array search (12 steps) = 4-10x overhead; promote eliminates it |
 
 ---
 

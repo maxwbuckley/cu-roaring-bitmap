@@ -19,15 +19,13 @@ namespace cu_roaring {
 //   (3-8x faster than array containers), but uses more memory for sparse
 //   filters.
 //
-// PROMOTE_AUTO (UINT32_MAX): Let the library choose based on the GPU's
-//   L2 cache size and the bitmap's memory footprint. This is the default.
-//   The heuristic:
-//     - If the equivalent flat bitset fits in L2 cache: keep compressed
-//       (the bitset path would be faster, but the user chose roaring for
-//       memory savings or set operations — don't over-promote)
-//     - If the flat bitset exceeds L2 cache: promote all containers to
-//       bitmap, because roaring's __ldg-cached reads outperform the
-//       cache-thrashing flat bitset at this scale
+// PROMOTE_AUTO (UINT32_MAX): Let the library choose based on the universe
+//   size. This is the default. The heuristic:
+//     - Universe <= ~4M (<=64 containers): keep arrays. The entire
+//       structure fits in L1/L2 cache and array queries are fast.
+//     - Universe > ~4M (>64 containers): promote all to bitmap. The key
+//       binary search (7+ steps) combined with array binary search
+//       (up to 12 steps) makes array queries 4-10x slower than bitmap.
 //
 // Any other value N: containers with cardinality > N use bitmap format.
 // ============================================================================

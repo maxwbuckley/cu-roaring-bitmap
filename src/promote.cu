@@ -183,27 +183,29 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
 
 uint32_t resolve_auto_threshold(uint32_t universe_size, int device_id)
 {
-    if (device_id < 0) {
-        CUDA_CHECK(cudaGetDevice(&device_id));
-    }
+    (void)device_id;
 
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
-
-    size_t l2_bytes          = static_cast<size_t>(prop.l2CacheSize);
-    size_t flat_bitset_bytes = (static_cast<size_t>(universe_size) + 7) / 8;
-
-    // If the flat bitset exceeds L2 cache, scattered bitset reads will
-    // thrash the cache. Roaring with all-bitmap containers wins here
-    // because __ldg routes through the read-only texture cache and the
-    // key-indexed access pattern has better spatial locality than random
-    // bitset lookups across a 100+ MB array.
+    // Promote all containers to bitmap whenever the universe has more than
+    // ~64 potential containers (universe > ~4M). At this scale the key
+    // binary search (7+ steps) combined with array container binary search
+    // (up to 12 steps) makes array queries 4-10x slower than bitmap queries
+    // (which replace the inner search with a single word read).
     //
-    // If the flat bitset fits in L2, bitset point queries are essentially
-    // free (single L2-cached read), so there's no query speed reason to
-    // promote. The user chose roaring for memory savings or set operations,
-    // not for query speed at this scale.
-    if (flat_bitset_bytes > l2_bytes) {
+    // Below ~4M universe (<=64 containers, <=6 key search steps), array
+    // containers are fast enough and the memory savings (2*card bytes vs
+    // 8 KB per container) are worthwhile — a 1M/0.1% bitmap uses 2 KB
+    // compressed vs 128 KB if promoted.
+    //
+    // The threshold of 64 containers (~4M universe) is conservative:
+    //   <= 64 containers: 6-step key search, array overhead tolerable
+    //   > 64 containers:  7+ step key search, array overhead dominates
+    //
+    // Users who want minimum memory at any scale: pass PROMOTE_NONE.
+    // Users who want maximum speed at any scale: pass PROMOTE_ALL.
+    constexpr uint32_t CONTAINER_THRESHOLD = 64;
+    uint32_t n_possible_containers = (universe_size + 65535) / 65536;
+
+    if (n_possible_containers > CONTAINER_THRESHOLD) {
         return PROMOTE_ALL;
     }
     return PROMOTE_NONE;
