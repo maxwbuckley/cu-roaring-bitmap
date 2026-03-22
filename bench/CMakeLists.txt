@@ -23,3 +23,13 @@ add_cu_roaring_bench(bench_transfer)
 add_executable(bench_comprehensive bench_comprehensive.cu)
 target_link_libraries(bench_comprehensive PRIVATE cu_roaring_filter)
 set_target_properties(bench_comprehensive PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# Point query benchmark (standalone, no google benchmark dependency)
+add_executable(bench_point_query bench_point_query.cu)
+target_link_libraries(bench_point_query PRIVATE cu_roaring_filter)
+set_target_properties(bench_point_query PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# Optimized query benchmark (direct-map + AoS + all-bitmap variants)
+add_executable(bench_optimized_query bench_optimized_query.cu)
+target_link_libraries(bench_optimized_query PRIVATE cu_roaring_filter)
+set_target_properties(bench_optimized_query PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
