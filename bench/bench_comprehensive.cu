@@ -286,7 +286,6 @@ static void run_bench1(const char* path)
         cu_roaring::GpuRoaring r;
         if (np == 1) {
           // Just decompress
-          uint32_t nw = (U + 31) / 32;
           auto* bs    = cu_roaring::decompress_to_bitset(gpu[0]);
           cudaFree(bs);
           return;

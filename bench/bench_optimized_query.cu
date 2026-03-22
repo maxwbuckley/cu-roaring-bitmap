@@ -324,8 +324,7 @@ struct AllBitmapView {
     size_t total_bytes;
 };
 
-static AllBitmapView build_allbitmap_view(const roaring_bitmap_t* cpu_bm,
-                                           const cu_roaring::GpuRoaring& g)
+static AllBitmapView build_allbitmap_view(const cu_roaring::GpuRoaring& g)
 {
     AllBitmapView result{};
 
@@ -719,7 +718,7 @@ int main()
             // Build views
             auto base_view = cu_roaring::make_view(gpu_bm);
             auto opt = build_opt_view(gpu_bm);
-            auto abm = build_allbitmap_view(cpu_bm, gpu_bm);
+            auto abm = build_allbitmap_view(gpu_bm);
             auto* d_bitset = make_gpu_bitset(cpu_bm, U);
 
             size_t bitset_bytes = ((size_t)U + 31) / 32 * sizeof(uint32_t);

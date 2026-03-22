@@ -25,6 +25,43 @@ set(ROARING_BUILD_C_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(ROARING_BUILD_CXX_BENCHMARKS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/CRoaring EXCLUDE_FROM_ALL)
 
+# ============================================================================
+# Strict warning policy — applied to ALL our targets (library, tests, benches)
+#
+# CXX:  Full GCC/Clang warning set with -Werror
+# CUDA: nvcc --Werror all-warnings, forwarding the same flags to the host
+#       compiler via -Xcompiler.  -Wold-style-cast and -Wconversion are
+#       excluded because CUDA/thrust headers and nvcc-generated code trigger
+#       them in ways we cannot fix.
+# ============================================================================
+set(CU_ROARING_CXX_WARNINGS
+    -Wall -Wextra -Werror
+    -Wshadow
+    -Wnon-virtual-dtor
+    -Woverloaded-virtual
+    -Wcast-align
+    -Wformat=2
+    -Wimplicit-fallthrough
+    -Wmisleading-indentation
+    -Wnull-dereference
+    -Wdouble-promotion
+    -Wunused
+    -Wpedantic
+)
+
+# For CUDA files, forward a subset via -Xcompiler.  Flags that fire inside
+# nvcc-generated host stubs or CUDA toolkit headers are omitted.
+set(CU_ROARING_CUDA_XCOMPILER
+    -Wall,-Wextra,-Wshadow,-Wnon-virtual-dtor,-Woverloaded-virtual,-Wcast-align,-Wformat=2,-Wimplicit-fallthrough,-Wunused,-Wnull-dereference)
+
+# Helper: apply our strict warnings to a target
+function(cu_roaring_target_strict_warnings target)
+    target_compile_options(${target} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:${CU_ROARING_CXX_WARNINGS}>
+        $<$<COMPILE_LANGUAGE:CUDA>:--Werror all-warnings -Xcompiler=${CU_ROARING_CUDA_XCOMPILER}>
+    )
+endfunction()
+
 # Main library
 # upload.cpp is compiled by g++ (not nvcc) because it touches CRoaring internals
 # which include GCC 13 intrinsics that nvcc 12.4 cannot parse.
@@ -45,11 +82,7 @@ set_target_properties(cu_roaring_filter PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
-# Apply strict warnings only to our library target
-target_compile_options(cu_roaring_filter PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Werror -Wno-unused-parameter>
-    $<$<COMPILE_LANGUAGE:CUDA>:--Werror all-warnings -Xcompiler=-Wall,-Wextra,-Wno-unused-parameter>
-)
+cu_roaring_target_strict_warnings(cu_roaring_filter)
 
 # Tests
 option(CU_ROARING_BUILD_TESTS "Build tests" ON)
