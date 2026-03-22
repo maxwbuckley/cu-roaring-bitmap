@@ -26,11 +26,27 @@ struct GpuRoaringView {
   const uint16_t* key_index;    // key_index[high16] = container idx, 0xFFFF = absent
   uint32_t        max_key;      // highest valid key value
 
+  // When true, all containers are bitmap and offsets are sequential
+  // (idx * 1024). The fast path skips type/offset/cardinality reads
+  // entirely: 2 global reads instead of 4.
+  bool            all_bitmap;
+
   __device__ __forceinline__ bool contains(uint32_t id) const
   {
     const uint16_t key = static_cast<uint16_t>(id >> 16);
     const uint16_t low = static_cast<uint16_t>(id & 0xFFFF);
 
+    // Fast path: key_index + all-bitmap → 2 reads total
+    if (all_bitmap && key_index) {
+      if (key > max_key) return false;
+      uint16_t idx = __ldg(key_index + key);
+      if (idx == 0xFFFF) return false;
+      // Offset is implicit: idx * 1024 words
+      uint64_t word = __ldg(bitmap_data + static_cast<uint32_t>(idx) * 1024 + (low >> 6));
+      return (word >> (low & 63)) & 1;
+    }
+
+    // General path: lookup key, read metadata, dispatch by type
     int idx = lookup_key(key);
     if (idx < 0) return false;
 
@@ -53,12 +69,10 @@ struct GpuRoaringView {
   __device__ __forceinline__ int lookup_key(uint16_t key) const
   {
     if (key_index) {
-      // O(1) direct-map lookup
       if (key > max_key) return -1;
       uint16_t idx = __ldg(key_index + key);
       return (idx == 0xFFFF) ? -1 : static_cast<int>(idx);
     }
-    // Fallback: binary search (for views created without key_index)
     return binary_search_keys(key);
   }
 
