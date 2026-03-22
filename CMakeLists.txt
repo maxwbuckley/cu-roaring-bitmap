@@ -71,6 +71,7 @@ add_library(cu_roaring_filter
     src/decompress.cu
     src/bloom.cu
     src/upload_ids.cu
+    src/promote.cu
 )
 
 # Header-only interface target for device-side API (roaring_view, warp_query)

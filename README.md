@@ -41,6 +41,10 @@ roaring_bitmap_add_range(cpu_bm, 0, 500000);
 // Transfer to GPU in compressed SoA format
 cu_roaring::GpuRoaring gpu_bm = cu_roaring::upload(cpu_bm, stream);
 
+// For hot filters queried millions of times (e.g., CAGRA graph traversal),
+// promote all containers to bitmap for 3-8x faster point queries:
+auto fast_bm = cu_roaring::upload(cpu_bm, stream, cu_roaring::PROMOTE_ALL);
+
 roaring_bitmap_free(cpu_bm);  // CPU copy no longer needed
 ```
 
@@ -52,6 +56,11 @@ roaring_bitmap_free(cpu_bm);  // CPU copy no longer needed
 std::vector<uint32_t> pass_ids = {0, 5, 12, 99, 1042, ...};
 auto gpu_bm = cu_roaring::upload_from_sorted_ids(
     pass_ids.data(), pass_ids.size(), universe_size, stream);
+
+// Or with all-bitmap promotion for fastest queries:
+auto fast_bm = cu_roaring::upload_from_sorted_ids(
+    pass_ids.data(), pass_ids.size(), universe_size, stream,
+    cu_roaring::PROMOTE_ALL);
 ```
 
 ### Set operations on GPU
@@ -97,6 +106,22 @@ __global__ void my_kernel_warp(cu_roaring::GpuRoaringView view, ...) {
         // candidate passes filter
     }
 }
+```
+
+### Promote containers to bitmap (faster queries)
+
+Array containers require a binary search inside the container, which is 3-8x slower than bitmap containers at scale. For filters that will be queried many times (e.g., during CAGRA graph traversal), promote all containers to bitmap:
+
+```cpp
+#include <cu_roaring/detail/promote.cuh>
+
+// Post-upload promotion (returns a new GpuRoaring; original is not modified)
+auto promoted = cu_roaring::promote_to_bitmap(gpu_bm, stream);
+cu_roaring::gpu_roaring_free(gpu_bm);  // free the original
+gpu_bm = promoted;
+
+// Or use a custom threshold: containers with >256 elements become bitmap
+auto custom = cu_roaring::upload(cpu_bm, stream, 256);
 ```
 
 ### Decompress to flat bitset (when needed)
@@ -219,11 +244,11 @@ Roaring bitmap: id → key search (11 reads) →
 
 ### Optimization Results
 
-| Strategy | What it does | Best speedup | When to use |
-|----------|-------------|-------------|-------------|
-| **All-bitmap promotion** | Convert array containers to bitmap at upload time | **7.4x** (100M/1%) | Hot filters queried millions of times |
-| **Direct-map key index** | Replace O(log n) key binary search with O(1) table lookup | **1.75x** (1B/10%) | Large universe (1B+) with bitmap containers |
-| **`__ldg()` + warp broadcast** | Read-only cache for global loads; leader broadcasts metadata | **1.6x** (1B/10%) | Already applied in library |
+| Strategy | What it does | Best speedup | Status |
+|----------|-------------|-------------|--------|
+| **All-bitmap promotion** | Convert array containers to bitmap at upload time | **7.4x** (100M/1%) | `upload(bm, stream, PROMOTE_ALL)` or `promote_to_bitmap()` |
+| **`__ldg()` + warp broadcast** | Read-only cache for global loads; leader broadcasts metadata | **1.6x** (1B/10%) | Applied in library (`roaring_view.cuh`, `roaring_warp_query.cuh`) |
+| **Direct-map key index** | Replace O(log n) key binary search with O(1) table lookup | **1.75x** (1B/10%) | Prototyped in `bench_optimized_query.cu` |
 
 ### Recommendations for cuVS Integration
 
@@ -293,7 +318,7 @@ cu-roaring-filter/
 │       ├── roaring_warp_query.cuh  warp-cooperative contains() with broadcast
 │       └── make_view.cuh           GpuRoaring → GpuRoaringView
 ├── src/                            implementation (.cpp, .cu)
-├── test/                           4 test suites (Google Test)
+├── test/                           5 test suites (Google Test)
 ├── bench/                          benchmarks (B1-B7)
 │   ├── bench_comprehensive.cu      B1/B3/B4/B5: construction, memory, E2E
 │   ├── bench_point_query.cu        B6: point query throughput

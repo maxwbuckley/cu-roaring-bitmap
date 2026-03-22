@@ -65,7 +65,8 @@ GpuRoaringMeta get_meta(const roaring_bitmap_t* cpu_bitmap) {
     return meta;
 }
 
-GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap, cudaStream_t stream) {
+GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap, cudaStream_t stream,
+                  uint32_t bitmap_threshold) {
     const roaring_array_t& ra = cpu_bitmap->high_low_container;
     const uint32_t n = static_cast<uint32_t>(ra.size);
 
@@ -224,6 +225,14 @@ GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap, cudaStream_t stream) {
     if (h_bitmap_pool) cudaFreeHost(h_bitmap_pool);
     if (h_array_pool)  cudaFreeHost(h_array_pool);
     if (h_run_pool)    cudaFreeHost(h_run_pool);
+
+    // Promote containers to bitmap if requested
+    if (bitmap_threshold < PROMOTE_NONE &&
+        (result.n_array_containers > 0 || result.n_run_containers > 0)) {
+        GpuRoaring promoted = promote_to_bitmap(result, stream);
+        gpu_roaring_free(result);
+        return promoted;
+    }
 
     return result;
 }

@@ -10,7 +10,8 @@ namespace cu_roaring {
 GpuRoaring upload_from_sorted_ids(const uint32_t* sorted_ids,
                                   uint32_t n_ids,
                                   uint32_t universe_size,
-                                  cudaStream_t stream)
+                                  cudaStream_t stream,
+                                  uint32_t bitmap_threshold)
 {
   GpuRoaring result{};
   result.universe_size = universe_size;
@@ -51,7 +52,7 @@ GpuRoaring upload_from_sorted_ids(const uint32_t* sorted_ids,
     uint32_t card = static_cast<uint32_t>(containers[i].values.size());
     h_cards[i] = static_cast<uint16_t>(card > 65535 ? 0 : card);
 
-    if (card > 4096) {
+    if (card > bitmap_threshold) {
       h_types[i]  = ContainerType::BITMAP;
       h_offsets[i] = static_cast<uint32_t>(h_bitmap_pool.size() * sizeof(uint64_t));
       size_t base  = h_bitmap_pool.size();
