@@ -32,4 +32,27 @@ inline GpuRoaring upload_from_sorted_ids(const uint32_t* ids,
   return upload_from_ids(ids, n_ids, universe_size, stream, bitmap_threshold);
 }
 
+// ============================================================================
+// Upload from flat bitset — skips sort/dedupe/scatter entirely.
+//
+// The bitset words ARE the bitmap containers. This path just partitions
+// into 65536-bit chunks, identifies non-empty containers, builds metadata,
+// and applies the complement optimization if density > 50%.
+//
+// Accepts uint32_t words (C++ bitset convention): bit i is set if
+// (words[i/32] >> (i%32)) & 1. n_words = ceil(universe_size / 32).
+//
+// Host version: bitset is in host memory, transferred to GPU internally.
+// Device version: bitset is already in GPU memory (zero-copy).
+// ============================================================================
+GpuRoaring upload_from_bitset(const uint32_t* host_bitset,
+                               uint32_t n_words,
+                               uint32_t universe_size,
+                               cudaStream_t stream = 0);
+
+GpuRoaring upload_from_device_bitset(const uint32_t* d_bitset,
+                                      uint32_t n_words,
+                                      uint32_t universe_size,
+                                      cudaStream_t stream = 0);
+
 }  // namespace cu_roaring

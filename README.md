@@ -68,6 +68,23 @@ auto fast_bm = cu_roaring::upload_from_ids(
     cu_roaring::PROMOTE_ALL);  // force all-bitmap for max query speed
 ```
 
+### Build from flat bitset (fastest path)
+
+```cpp
+#include <cu_roaring/detail/upload_ids.cuh>
+
+// From a host-side bitset (uint32_t words, bit i = words[i/32] >> (i%32) & 1)
+uint32_t n_words = (universe_size + 31) / 32;
+auto gpu_bm = cu_roaring::upload_from_bitset(
+    bitset_words, n_words, universe_size, stream);
+
+// From a device-side bitset (already on GPU — zero-copy, no H→D transfer)
+auto gpu_bm = cu_roaring::upload_from_device_bitset(
+    d_bitset, n_words, universe_size, stream);
+```
+
+This is the fastest upload path: the bitset words map directly to Roaring bitmap containers with no sort, dedupe, or scatter. Just popcount each 65536-bit chunk, compact non-empty chunks, and build metadata. Complement optimization applies automatically when density > 50%.
+
 ### Set operations on GPU
 
 ```cpp

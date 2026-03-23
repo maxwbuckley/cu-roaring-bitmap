@@ -581,3 +581,124 @@ TEST_F(ComplementTest, MultiAnd_AllNegated) {
     roaring_bitmap_free(r2);
     roaring_bitmap_free(r3);
 }
+
+// ============================================================================
+// 7. Upload from bitset — direct container extraction, no sort/dedupe
+// ============================================================================
+
+TEST_F(ComplementTest, UploadFromBitset_Sparse) {
+    uint32_t universe = 100000;
+    uint32_t n_words = (universe + 31) / 32;
+    std::vector<uint32_t> bitset(n_words, 0);
+
+    std::mt19937 gen(42);
+    std::vector<bool> truth(universe, false);
+    for (uint32_t i = 0; i < universe; ++i) {
+        if (gen() % 10 == 0) {
+            bitset[i / 32] |= (1u << (i % 32));
+            truth[i] = true;
+        }
+    }
+
+    auto gpu = cu_roaring::upload_from_bitset(bitset.data(), n_words, universe);
+    EXPECT_FALSE(gpu.negated);  // 10% density
+
+    std::vector<uint32_t> queries;
+    std::vector<bool> expected;
+    for (uint32_t i = 0; i < universe; i += 7) {
+        queries.push_back(i);
+        expected.push_back(truth[i]);
+    }
+    verify_queries(gpu, queries, expected, false);
+    cu_roaring::gpu_roaring_free(gpu);
+}
+
+TEST_F(ComplementTest, UploadFromBitset_Dense) {
+    uint32_t universe = 100000;
+    uint32_t n_words = (universe + 31) / 32;
+    std::vector<uint32_t> bitset(n_words, 0);
+
+    std::mt19937 gen(42);
+    std::vector<bool> truth(universe, false);
+    for (uint32_t i = 0; i < universe; ++i) {
+        if (gen() % 10 != 0) {
+            bitset[i / 32] |= (1u << (i % 32));
+            truth[i] = true;
+        }
+    }
+
+    auto gpu = cu_roaring::upload_from_bitset(bitset.data(), n_words, universe);
+    EXPECT_TRUE(gpu.negated);  // 90% density → complement
+
+    std::vector<uint32_t> queries;
+    std::vector<bool> expected;
+    for (uint32_t i = 0; i < universe; i += 3) {
+        queries.push_back(i);
+        expected.push_back(truth[i]);
+    }
+    verify_queries(gpu, queries, expected, false);
+    verify_queries(gpu, queries, expected, true);
+    cu_roaring::gpu_roaring_free(gpu);
+}
+
+TEST_F(ComplementTest, UploadFromBitset_RoundTrip) {
+    // bitset → Roaring → decompress → compare against original
+    uint32_t universe = 200000;
+    uint32_t n_words = (universe + 31) / 32;
+    std::vector<uint32_t> bitset(n_words, 0);
+
+    std::mt19937 gen(99);
+    for (uint32_t i = 0; i < universe; ++i) {
+        if (gen() % 3 == 0) bitset[i / 32] |= (1u << (i % 32));
+    }
+
+    auto gpu = cu_roaring::upload_from_bitset(bitset.data(), n_words, universe);
+
+    uint32_t* d_result = nullptr;
+    cudaMalloc(&d_result, n_words * sizeof(uint32_t));
+    cu_roaring::decompress_to_bitset(gpu, d_result, n_words);
+
+    std::vector<uint32_t> result(n_words);
+    cudaMemcpy(result.data(), d_result, n_words * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaFree(d_result);
+
+    for (uint32_t w = 0; w < n_words; ++w) {
+        uint32_t mask = (w == n_words - 1 && universe % 32 != 0)
+                        ? ((1u << (universe % 32)) - 1u) : 0xFFFFFFFF;
+        EXPECT_EQ(result[w] & mask, bitset[w] & mask) << "Mismatch at word " << w;
+    }
+    cu_roaring::gpu_roaring_free(gpu);
+}
+
+TEST_F(ComplementTest, UploadFromDeviceBitset) {
+    uint32_t universe = 100000;
+    uint32_t n_words = (universe + 31) / 32;
+    std::vector<uint32_t> bitset(n_words, 0);
+
+    std::mt19937 gen(42);
+    std::vector<bool> truth(universe, false);
+    for (uint32_t i = 0; i < universe; ++i) {
+        if (gen() % 4 == 0) {
+            bitset[i / 32] |= (1u << (i % 32));
+            truth[i] = true;
+        }
+    }
+
+    uint32_t* d_bitset = nullptr;
+    cudaMalloc(&d_bitset, n_words * sizeof(uint32_t));
+    cudaMemcpy(d_bitset, bitset.data(), n_words * sizeof(uint32_t), cudaMemcpyHostToDevice);
+
+    auto gpu = cu_roaring::upload_from_device_bitset(d_bitset, n_words, universe);
+    cudaFree(d_bitset);
+
+    EXPECT_FALSE(gpu.negated);  // 25% density
+
+    std::vector<uint32_t> queries;
+    std::vector<bool> expected;
+    for (uint32_t i = 0; i < universe; i += 11) {
+        queries.push_back(i);
+        expected.push_back(truth[i]);
+    }
+    verify_queries(gpu, queries, expected, false);
+    cu_roaring::gpu_roaring_free(gpu);
+}

@@ -589,4 +589,312 @@ GpuRoaring upload_from_ids(const uint32_t* raw_ids,
     return cpu_upload(raw_ids, n_ids, universe_size, effective_threshold, stream);
 }
 
+// ============================================================================
+// Upload from flat bitset — direct container extraction, no sort/dedupe.
+//
+// A flat bitset of N bits maps directly to ceil(N/65536) potential Roaring
+// containers, each 2048 uint32_t words (= 1024 uint64_t = 8 KB). We just
+// need to identify which chunks are non-empty (popcount > 0), compact them
+// into the bitmap pool, and build metadata.
+//
+// GPU kernel: one block per chunk, popcounts + compaction.
+// ============================================================================
+
+// Per-chunk popcount: each block handles one 65536-bit chunk (2048 uint32_t words).
+// Writes the chunk's popcount to d_chunk_popcounts[chunk_idx].
+__global__ void chunk_popcount_kernel(const uint32_t* bitset,
+                                       uint32_t* chunk_popcounts,
+                                       uint32_t n_chunks,
+                                       uint32_t n_words_total)
+{
+    uint32_t chunk = blockIdx.x;
+    if (chunk >= n_chunks) return;
+
+    uint32_t base = chunk * 2048u;
+    uint32_t local_count = 0;
+
+    for (uint32_t i = threadIdx.x; i < 2048u; i += blockDim.x) {
+        uint32_t idx = base + i;
+        if (idx < n_words_total) {
+            local_count += __popc(bitset[idx]);
+        }
+    }
+
+    // Warp reduction
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_count += __shfl_down_sync(0xFFFFFFFF, local_count, offset);
+    }
+
+    __shared__ uint32_t warp_counts[8];
+    uint32_t warp_id = threadIdx.x / 32;
+    uint32_t lane_id = threadIdx.x % 32;
+    if (lane_id == 0) warp_counts[warp_id] = local_count;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        uint32_t total = 0;
+        uint32_t n_warps = (blockDim.x + 31) / 32;
+        for (uint32_t w = 0; w < n_warps; ++w) total += warp_counts[w];
+        chunk_popcounts[chunk] = total;
+    }
+}
+
+// Copy non-empty chunks into the compacted bitmap pool and build metadata.
+// d_chunk_map[i] = output container index for chunk i, or 0xFFFFFFFF if empty.
+__global__ void compact_chunks_kernel(const uint32_t* bitset,
+                                       const uint32_t* chunk_map,
+                                       const uint32_t* chunk_popcounts,
+                                       uint64_t* bitmap_pool,
+                                       uint16_t* out_keys,
+                                       ContainerType* out_types,
+                                       uint32_t* out_offsets,
+                                       uint16_t* out_cardinalities,
+                                       uint32_t n_chunks,
+                                       uint32_t n_words_total)
+{
+    uint32_t chunk = blockIdx.x;
+    if (chunk >= n_chunks) return;
+
+    uint32_t out_idx = chunk_map[chunk];
+    if (out_idx == 0xFFFFFFFF) return;  // empty chunk
+
+    uint32_t base_word = chunk * 2048u;
+
+    // Copy bitset words into bitmap pool (reinterpreted as uint64_t)
+    // 2048 uint32_t words = 1024 uint64_t words
+    uint64_t* dst = bitmap_pool + static_cast<size_t>(out_idx) * 1024;
+    const uint64_t* src = reinterpret_cast<const uint64_t*>(bitset + base_word);
+    uint32_t n_words_in_chunk = 2048u;
+    if (base_word + 2048u > n_words_total) {
+        n_words_in_chunk = n_words_total - base_word;
+    }
+    uint32_t n_u64 = n_words_in_chunk / 2;
+    uint32_t n_u64_full = 1024u;
+
+    for (uint32_t i = threadIdx.x; i < n_u64_full; i += blockDim.x) {
+        if (i < n_u64) {
+            dst[i] = src[i];
+        } else {
+            dst[i] = 0;  // zero-pad partial chunks
+        }
+    }
+
+    // Build metadata (one thread per block)
+    if (threadIdx.x == 0) {
+        out_keys[out_idx] = static_cast<uint16_t>(chunk);
+        out_types[out_idx] = ContainerType::BITMAP;
+        out_offsets[out_idx] = static_cast<uint32_t>(
+            static_cast<size_t>(out_idx) * 1024 * sizeof(uint64_t));
+        uint32_t pc = chunk_popcounts[chunk];
+        out_cardinalities[out_idx] = static_cast<uint16_t>(pc > 65535 ? 0 : pc);
+    }
+}
+
+// Invert a bitset in-place for complement (uint32_t words)
+__global__ void invert_bitset_u32_kernel(uint32_t* data, uint32_t n_words)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_words) {
+        data[i] = ~data[i];
+    }
+}
+
+// Mask the tail word to universe_size
+__global__ void mask_tail_kernel(uint32_t* data, uint32_t word_idx, uint32_t mask)
+{
+    data[word_idx] &= mask;
+}
+
+// Core implementation: build GpuRoaring from a device-resident bitset.
+static GpuRoaring build_from_device_bitset(const uint32_t* d_bitset,
+                                            uint32_t n_words,
+                                            uint32_t universe_size,
+                                            bool should_negate,
+                                            uint64_t original_cardinality,
+                                            cudaStream_t stream)
+{
+    uint32_t n_chunks = (n_words + 2047) / 2048;
+
+    // 1. Popcount each chunk
+    uint32_t* d_popcounts = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_popcounts, n_chunks * sizeof(uint32_t)));
+    chunk_popcount_kernel<<<n_chunks, 256, 0, stream>>>(
+        d_bitset, d_popcounts, n_chunks, n_words);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Download popcounts (small: n_chunks * 4 bytes, typically < 1 KB)
+    std::vector<uint32_t> h_popcounts(n_chunks);
+    CUDA_CHECK(cudaMemcpyAsync(h_popcounts.data(), d_popcounts,
+                               n_chunks * sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // 2. Identify non-empty chunks and build compaction map
+    std::vector<uint32_t> h_chunk_map(n_chunks, 0xFFFFFFFF);
+    uint32_t n_containers = 0;
+    uint64_t total_card = 0;
+    for (uint32_t i = 0; i < n_chunks; ++i) {
+        total_card += h_popcounts[i];
+        if (h_popcounts[i] > 0) {
+            h_chunk_map[i] = n_containers++;
+        }
+    }
+
+    GpuRoaring result{};
+    result.universe_size = universe_size;
+    result.total_cardinality = should_negate ? original_cardinality : total_card;
+    result.negated = should_negate;
+    result.n_containers = n_containers;
+    result.n_bitmap_containers = n_containers;
+    result.n_array_containers = 0;
+    result.n_run_containers = 0;
+
+    if (n_containers == 0) {
+        cudaFree(d_popcounts);
+        return result;
+    }
+
+    // 3. Upload chunk map and run compaction kernel
+    uint32_t* d_chunk_map = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_chunk_map, n_chunks * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpyAsync(d_chunk_map, h_chunk_map.data(),
+                               n_chunks * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    CUDA_CHECK(cudaMalloc(&result.bitmap_data,
+                          static_cast<size_t>(n_containers) * 1024 * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&result.keys, n_containers * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&result.types, n_containers * sizeof(ContainerType)));
+    CUDA_CHECK(cudaMalloc(&result.offsets, n_containers * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&result.cardinalities, n_containers * sizeof(uint16_t)));
+
+    compact_chunks_kernel<<<n_chunks, 256, 0, stream>>>(
+        d_bitset, d_chunk_map, d_popcounts,
+        result.bitmap_data, result.keys, result.types,
+        result.offsets, result.cardinalities,
+        n_chunks, n_words);
+    CUDA_CHECK(cudaGetLastError());
+
+    cudaFree(d_chunk_map);
+    cudaFree(d_popcounts);
+
+    // 4. Build key_index
+    // Find max_key from the non-empty chunks
+    uint16_t max_key = 0;
+    for (uint32_t i = n_chunks; i > 0; --i) {
+        if (h_chunk_map[i - 1] != 0xFFFFFFFF) {
+            max_key = static_cast<uint16_t>(i - 1);
+            break;
+        }
+    }
+    result.max_key = max_key;
+
+    uint32_t index_size = static_cast<uint32_t>(max_key) + 1;
+    std::vector<uint16_t> h_key_index(index_size, 0xFFFF);
+    for (uint32_t i = 0; i < n_chunks; ++i) {
+        if (h_chunk_map[i] != 0xFFFFFFFF) {
+            h_key_index[i] = static_cast<uint16_t>(h_chunk_map[i]);
+        }
+    }
+    CUDA_CHECK(cudaMalloc(&result.key_index, index_size * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMemcpyAsync(result.key_index, h_key_index.data(),
+                               index_size * sizeof(uint16_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return result;
+}
+
+// ============================================================================
+// Public API: upload from device bitset
+// ============================================================================
+GpuRoaring upload_from_device_bitset(const uint32_t* d_bitset,
+                                      uint32_t n_words,
+                                      uint32_t universe_size,
+                                      cudaStream_t stream)
+{
+    if (n_words == 0) {
+        GpuRoaring result{};
+        result.universe_size = universe_size;
+        return result;
+    }
+
+    // Popcount the full bitset to decide on complement
+    // We'll compute per-chunk popcounts inside build_from_device_bitset anyway,
+    // but we need the total now for the complement decision.
+    // Quick total via chunk_popcount_kernel + host sum:
+    uint32_t n_chunks = (n_words + 2047) / 2048;
+    uint32_t* d_popcounts = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_popcounts, n_chunks * sizeof(uint32_t)));
+    chunk_popcount_kernel<<<n_chunks, 256, 0, stream>>>(
+        d_bitset, d_popcounts, n_chunks, n_words);
+
+    std::vector<uint32_t> h_popcounts(n_chunks);
+    CUDA_CHECK(cudaMemcpyAsync(h_popcounts.data(), d_popcounts,
+                               n_chunks * sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    cudaFree(d_popcounts);
+
+    uint64_t total_card = 0;
+    for (uint32_t i = 0; i < n_chunks; ++i) total_card += h_popcounts[i];
+
+    bool should_negate = (total_card > static_cast<uint64_t>(universe_size) / 2);
+
+    if (should_negate) {
+        // Invert the bitset on GPU, then build from the inverted copy
+        uint32_t* d_inverted = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_inverted, n_words * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemcpyAsync(d_inverted, d_bitset,
+                                   n_words * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToDevice, stream));
+
+        uint32_t inv_blocks = (n_words + 255) / 256;
+        invert_bitset_u32_kernel<<<inv_blocks, 256, 0, stream>>>(d_inverted, n_words);
+
+        // Mask tail bits beyond universe_size
+        uint32_t tail_bits = universe_size % 32;
+        if (tail_bits > 0) {
+            uint32_t tail_word_idx = universe_size / 32;
+            if (tail_word_idx < n_words) {
+                uint32_t tail_mask = (1u << tail_bits) - 1u;
+                mask_tail_kernel<<<1, 1, 0, stream>>>(d_inverted, tail_word_idx, tail_mask);
+            }
+        }
+
+        GpuRoaring result = build_from_device_bitset(
+            d_inverted, n_words, universe_size, true, total_card, stream);
+        cudaFree(d_inverted);
+        return result;
+    }
+
+    return build_from_device_bitset(d_bitset, n_words, universe_size, false, 0, stream);
+}
+
+// ============================================================================
+// Public API: upload from host bitset
+// ============================================================================
+GpuRoaring upload_from_bitset(const uint32_t* host_bitset,
+                               uint32_t n_words,
+                               uint32_t universe_size,
+                               cudaStream_t stream)
+{
+    if (n_words == 0) {
+        GpuRoaring result{};
+        result.universe_size = universe_size;
+        return result;
+    }
+
+    // Upload to GPU, then use the device path
+    uint32_t* d_bitset = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_bitset, n_words * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpyAsync(d_bitset, host_bitset,
+                               n_words * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    GpuRoaring result = upload_from_device_bitset(d_bitset, n_words, universe_size, stream);
+    cudaFree(d_bitset);
+    return result;
+}
+
 }  // namespace cu_roaring
