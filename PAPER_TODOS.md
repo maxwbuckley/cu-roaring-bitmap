@@ -1,106 +1,178 @@
 # PAPER.md — Reviewer Requirements & Action Items
 
+## Session Summary (March 22-23, 2026)
+
+### What We Built
+- **cu-roaring-filter library**: GPU Roaring bitmaps with 2-read query path, direct-map key index, cache-aware PROMOTE_AUTO, fused multi-AND, GPU-native upload pipeline
+- **10 benchmark suites** (B1-B10) across synthetic and real-world data
+- **cuVS/CAGRA integration** with one-line filter constructor
+- **PAPER.md** draft with systems contribution framing
+- **YFCC-10M Big-ANN benchmark** (B10) — downloaded and running on real data
+
+### Key Results
+| Metric | Value |
+|--------|-------|
+| Point query reads per lookup | 2 (down from 17) |
+| vs bitset (10M, random) | 1.08x faster |
+| vs bitset (1B/1%, warp) | 1.6x faster |
+| Memory compression (1B/0.1%) | 58.4x (2.1 MB vs 125 MB) |
+| Upload 100M IDs | 99 ms (66x vs CPU) |
+| 8-way AND at 1B | 5.9 ms (39x vs CPU) |
+| CAGRA search speedup (50% pass) | 1.31x |
+
+### What's Downloaded
+- **YFCC-10M dataset**: `/mnt/c/Users/maxwb/Development/big-ann-benchmarks/data/yfcc100M/`
+  - `base.10M.u8bin` (1.8 GB) — 10M × 192-dim uint8 CLIP vectors
+  - `base.metadata.10M.spmat` (902 MB) — sparse tag matrix (10M × 200K, 108M assignments)
+  - `query.public.100K.u8bin` (19 MB) — 100K query vectors
+  - `query.metadata.public.100K.spmat` (1.9 MB) — query tag requirements
+  - `GT.public.ibin` (7.7 MB) — ground truth (100K × 10 neighbors)
+- **Exported data**: `cu-roaring-filter/bench/yfcc_data/` (316 MB)
+  - 7,910 per-tag ID lists, query metadata, ground truth
+
+---
+
 ## Benchmarks Needed
 
-### 1. Big-ANN Filtered Track (Critical)
-- **Dataset**: 10M YFCC, 192-dim CLIP embeddings (uint8), 200K-vocab tags
-- **Why**: Gold standard since 2023. Every filtered ANN paper uses it. Without it, VLDB/SIGMOD reviewers won't take eval seriously.
-- **Source**: https://big-ann-benchmarks.com/neurips23.html (filtered track)
-- **Repo**: https://github.com/harsha-simhadri/big-ann-benchmarks
-- **Download**: `python create_dataset.py --dataset yfcc-10M`
-- **Run**: `python run.py --neurips23track filter --algorithm faiss --dataset yfcc-10M`
-- **Details**: 10M vectors, 192-dim uint8 (CLIP), L2 distance, 100K queries, each query has 1-2 required tags from 200K vocab
-- **Also need**: SIFT + synthetic filters at varying selectivity
+### 1. Big-ANN Filtered Track — DONE (standalone) / Needs CAGRA Integration
+- **Status**: B10 benchmark runs on exported tag data (upload, AND, point queries)
+- **Still needed**: Full CAGRA search on YFCC vectors with roaring filter vs bitset filter
+- **Blocker**: cuVS standalone benchmark build has ABI mismatch (`std::experimental::extents`). Options:
+  - (a) Full `./build.sh libcuvs` rebuild (~45 min) to pick up latest cu-roaring-filter headers
+  - (b) Fix the `ivf_pq.hpp` header issue in the standalone build
+- **Data location**: `big-ann-benchmarks/data/yfcc100M/`
+- **Export script**: `bench/yfcc_export.py`
+- **Commands**:
+  ```bash
+  # Re-export if needed
+  python3 bench/yfcc_export.py \
+    --data-dir /mnt/c/Users/maxwb/Development/big-ann-benchmarks/data/yfcc100M \
+    --out-dir bench/yfcc_data
+
+  # Run standalone benchmark
+  cd build && ./bench/bench_yfcc ../bench/yfcc_data
+  ```
 
 ### 2. System Baselines (Critical)
-- **ACORN**: CPU SOTA for filtered ANN. Default in Weaviate and Vespa. Must compare.
-- **VecFlow**: Only other GPU filtered search system. Direct competitor.
-- **Current gap**: We only compare against CAGRA's native bitset filter.
+- **ACORN**: CPU SOTA. Default in Weaviate and Vespa.
+  - Paper: https://dl.acm.org/doi/10.1145/3654923
+  - Need to clone, build, run on same YFCC-10M data
+  - Compare: throughput (QPS) vs recall at various selectivities
+- **VecFlow**: Only other GPU filtered search system. 5M QPS at 90% recall on A100.
+  - Paper: https://arxiv.org/abs/2506.00812
+  - Code: https://github.com/Supercomputing-System-AI-Lab/VecFlow
+  - Need to build and run on RTX 5090 for fair comparison
+  - Key difference: VecFlow uses label-centric IVF (pre-indexed), we use predicate-agnostic post-filtering
 
 ### 3. Scale the CAGRA Eval (Critical)
-- Current: 1M vectors, batch=100 — too small for a GPU paper
-- **Need**: 10M+ vectors, 1K+ batch
-- **Selectivity sweep**: 8-10 points from 0.1% to 99% (currently only 3 points: 1%, 10%, 50%)
+- **Current**: 1M vectors, batch=100, 3 selectivity points
+- **Need**:
+  - 10M vectors (YFCC data is ready)
+  - Batch sizes: 100, 1K, 10K
+  - Selectivity sweep: 0.1%, 0.5%, 1%, 5%, 10%, 20%, 50%, 70%, 90%, 99%
+- **How**: Update `bench_cagra_roaring.cu` configs, rebuild cuVS benchmark
+
+---
 
 ## Analysis Needed
 
 ### 4. Roofline Model (Important)
 - Follow Crystal (SIGMOD 2020) template
-- Model analytically when cu-roaring's 2-read path beats flat bitset's 1-read path
+- **Analytical prediction**: crossover at N = L2_size × 8 bits/byte
+  - RTX 5090 (96 MB L2): ~768M vectors
+  - A100 (40 MB L2): ~320M vectors
+  - H100 (50 MB L2): ~400M vectors
+- **Validate against B6 data**: the 1B results should match the prediction
+- **Analysis framework**:
+  ```
+  Bitset:  1 read × (L2 hit if N < L2×8, else DRAM miss)
+  Roaring: 2 reads × (key_index always L2, bitmap word depends on locality)
+  Crossover: when bitset DRAM miss cost > roaring 2× L2 hit cost
+  ```
 
-**Analysis framework:**
-
-```
-Bitset cost per query:
-  If bitset ≤ L2:  ~4 cycles (L2 hit)
-  If bitset > L2:  ~400 cycles (DRAM access, ~200ns at 5 GHz)
-
-Roaring cost per query (2-read path):
-  Read 1: key_index[key] — 30KB table, always L2-resident → ~4 cycles
-  Read 2: bitmap_data[idx*1024 + low/64] — 8KB per container
-    If hot container in L2: ~4 cycles
-    If cold container:      ~400 cycles (DRAM)
-  Total:  ~8 cycles (L2) to ~404 cycles (cold)
-
-Crossover: bitset DRAM (~400 cyc) > roaring L2+DRAM (~404 cyc)
-  → When bitset > L2 AND queries have enough container locality
-  → N > L2_size * 8 = 96MB * 8 = 768M vectors
-```
-
-**Variables to sweep:**
-- N (universe size): 1M to 10B
-- L2 cache size: 40MB (A100), 50MB (H100), 96MB (RTX 5090)
-- Query locality: random vs graph-traversal (CAGRA-like)
-
-**Expected result:** Crossover at ~768M on RTX 5090, ~400M on A100/H100. Below crossover, bitset wins by ~2x (1 read vs 2). Above crossover, roaring wins by 1.5-2x (L2 hits vs DRAM misses).
+---
 
 ## Writing Needed
 
 ### 5. Related Work Expansion (Critical)
 - Current: 6 sentences, 8 references
-- **Need**: ~2 pages, 15+ filtered ANN papers since 2022
-
-Papers to cover (with venues and URLs):
+- **Need**: ~2 pages, 15+ papers
 
 **Filtered ANN algorithms:**
-- **ACORN** — Predicate-agnostic search via predicate subgraph traversal on HNSW. CPU SOTA, default in Weaviate+Vespa. SIGMOD 2024. https://dl.acm.org/doi/10.1145/3654923
-- **Filtered-DiskANN** — Label-partitioned graphs on disk. WWW 2023. (already cited)
-- **VBase** — Relaxed monotonicity for vector+attribute queries. OSDI 2023 (not SIGMOD). https://www.usenix.org/conference/osdi23/presentation/zhang-qianxi
-- **SeRF** — Segment graph for range-filtering ANN, compresses multiple HNSWs. SIGMOD 2024. Proc. ACM Manag. Data 2, 1, Article 69.
-- **UNG** — Unified Navigating Graph for filtered search. arXiv 2024.
-- **SIEVE** — Collection of indexes for effective filtered vector search. arXiv 2025 (July). https://arxiv.org/abs/2507.11907
-- **DIGRA** — Dynamic incremental graph for range-filtered ANN. arXiv 2025 (December).
-- **UNIFY** — Unified index for range filtered ANN. VLDB 2025. https://www.vldb.org/pvldb/vol18/p1118-yao.pdf
-- **PathFinder** — Conjunctions and disjunctions for filtered ANN. arXiv 2025 (November). https://arxiv.org/abs/2511.00995
+- **ACORN** — Predicate subgraph traversal on HNSW. SIGMOD 2024. https://dl.acm.org/doi/10.1145/3654923
+- **Filtered-DiskANN** — Label-partitioned graphs. WWW 2023. (already cited)
+- **VBase** — Relaxed monotonicity. OSDI 2023. https://www.usenix.org/conference/osdi23/presentation/zhang-qianxi
+- **SeRF** — Segment graph for range-filtering. SIGMOD 2024.
+- **UNG** — Unified Navigating Graph. arXiv 2024.
+- **SIEVE** — Collection of indexes. arXiv 2025. https://arxiv.org/abs/2507.11907
+- **DIGRA** — Dynamic graph for range-filtered ANN. arXiv 2025.
+- **UNIFY** — Unified range filter index. VLDB 2025. https://www.vldb.org/pvldb/vol18/p1118-yao.pdf
+- **PathFinder** — Conjunctions/disjunctions. arXiv 2025. https://arxiv.org/abs/2511.00995
 
 **GPU systems:**
-- **VecFlow** — Label-centric IVF on GPU. 5M QPS at 90% recall. SIGMOD 2025. https://arxiv.org/abs/2506.00812 / https://dl.acm.org/doi/10.1145/3749189
-- **GPU-WAH** — GPU word-aligned hybrid compressed bitmaps. Andrzejewski & Wrembel, DEXA 2010. 54x speedup over CPU. https://link.springer.com/chapter/10.1007/978-3-642-15251-1_26
-- **GPU bitmap index enhancements** — Tran et al., DASFAA 2020. Metadata creation, memory pools. https://dl.acm.org/doi/abs/10.1007/978-3-030-59419-0_21
+- **VecFlow** — Label-centric GPU IVF. SIGMOD 2025. https://dl.acm.org/doi/10.1145/3749189
+- **GPU-WAH** — GPU compressed bitmaps. DEXA 2010. https://link.springer.com/chapter/10.1007/978-3-642-15251-1_26
+- **GPU bitmap enhancements** — DASFAA 2020. https://dl.acm.org/doi/abs/10.1007/978-3-030-59419-0_21
 
 **Benchmarks:**
-- **Big-ANN NeurIPS'23** — Filtered track with YFCC-10M. https://big-ann-benchmarks.com/neurips23.html
-- **Filtered ANN Benchmark** — Unified benchmark and systematic study. arXiv 2025 (September). https://arxiv.org/abs/2509.07789
-- **ETH Benchmark** — Benchmarking filtered ANN on transformer embeddings. Htor et al., 2025. http://htor.inf.ethz.ch/publications/img/2025_iff_fanns_benchmark.pdf
+- **Big-ANN NeurIPS'23** — https://big-ann-benchmarks.com/neurips23.html
+- **Filtered ANN Benchmark** — arXiv 2025. https://arxiv.org/abs/2509.07789
+- **ETH Benchmark** — 2025. http://htor.inf.ethz.ch/publications/img/2025_iff_fanns_benchmark.pdf
 
 **Production systems:**
-- **Milvus/Knowhere** — Production filtered search system
-- **Weaviate** — ACORN integration for predicate-agnostic search
-- **Vespa** — HNSW+filter production deployment
+- **Milvus/Knowhere**, **Weaviate** (ACORN), **Vespa** (HNSW+filter)
 
-### 6. Venue Targeting
-- **PVLDB rolling**: 1st of each month. Target June 1 or July 1 2026 after adding benchmarks.
+---
+
+## Venue Targeting
+- **PVLDB rolling**: 1st of each month. Target **July 1, 2026**.
 - **SIGMOD 2027 Industrial Track Round 3**: July 17, 2026 deadline. Strong option given NVIDIA ecosystem angle.
 
-## Status
+---
 
-| Item | Status | Priority |
-|------|--------|----------|
-| Big-ANN filtered track benchmark | Not started | Critical |
-| ACORN baseline comparison | Not started | Critical |
-| VecFlow baseline comparison | Not started | Critical |
-| Scale CAGRA to 10M+, batch 1K+ | Not started | Critical |
-| Selectivity sweep (0.1% to 99%) | Not started | Critical |
-| Roofline model | Not started | Important |
-| Related work expansion | Not started | Critical |
-| PVLDB June 1 submission | Target date | — |
+## Status Tracker
+
+| Item | Status | Priority | Notes |
+|------|--------|----------|-------|
+| YFCC-10M data download | **DONE** | Critical | 2.8 GB in `big-ann-benchmarks/data/yfcc100M/` |
+| YFCC export script | **DONE** | Critical | `bench/yfcc_export.py` → 7,910 tag files |
+| B10 standalone benchmark | **DONE** | Critical | Upload + AND + query on real tags |
+| YFCC CAGRA search benchmark | Not started | Critical | Needs cuVS rebuild or ABI fix |
+| ACORN baseline | Not started | Critical | Clone, build, run on YFCC |
+| VecFlow baseline | Not started | Critical | Clone, build, run on RTX 5090 |
+| Scale CAGRA to 10M+ | Not started | Critical | Update bench_cagra_roaring configs |
+| Selectivity sweep (0.1-99%) | Not started | Critical | 10 points, synthetic + YFCC |
+| Roofline model | Not started | Important | Analytical + validate vs B6 |
+| Related work (2 pages) | Not started | Critical | 15+ papers identified above |
+| Paper draft revision | In progress | Critical | PAPER.md needs eval + related work sections |
+| PVLDB July 1 submission | Target | — | 3 months from now |
+
+---
+
+## File Locations
+
+```
+cu-roaring-filter/
+├── PAPER.md                    — Draft paper
+├── PAPER_TODOS.md              — This file
+├── REPORT.md                   — Technical report
+├── README.md                   — Library documentation
+├── bench/
+│   ├── yfcc_export.py          — YFCC data export script
+│   ├── bench_yfcc.cu           — B10: YFCC standalone benchmark
+│   ├── bench_point_query.cu    — B6: point query throughput
+│   ├── bench_optimized_query.cu — B7: optimization analysis
+│   ├── bench_upload_scale.cu   — B8: upload latency at scale
+│   ├── bench_multi_and.cu      — B9: fused multi-AND
+│   ├── bench_comprehensive.cu  — B1/B3/B4/B5
+│   └── yfcc_data/              — Exported YFCC tag data (gitignored)
+└── results/raw/                — All benchmark JSON results
+
+big-ann-benchmarks/             — NeurIPS'23 benchmark framework
+└── data/yfcc100M/              — Downloaded YFCC-10M dataset (2.8 GB)
+
+cuvs/                           — cuVS fork with roaring integration
+├── cpp/include/cuvs/core/roaring.hpp
+├── cpp/include/cuvs/neighbors/roaring_filter.cuh
+└── cpp/bench/prims/core/bench_cagra_roaring.cu
+```
