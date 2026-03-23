@@ -31,6 +31,11 @@ struct GpuRoaringView {
   // entirely: 2 global reads instead of 4.
   bool            all_bitmap;
 
+  // Complement flag: when true, the stored set is the complement of the
+  // logical set. Absent containers represent "all ones" (full 65536-element
+  // range), and membership test results are flipped via XOR.
+  bool            negated;
+
   __device__ __forceinline__ bool contains(uint32_t id) const
   {
     const uint16_t key = static_cast<uint16_t>(id >> 16);
@@ -38,30 +43,35 @@ struct GpuRoaringView {
 
     // Fast path: key_index + all-bitmap → 2 reads total
     if (all_bitmap && key_index) {
-      if (key > max_key) return false;
+      if (key > max_key) return negated;
       uint16_t idx = __ldg(key_index + key);
-      if (idx == 0xFFFF) return false;
+      if (idx == 0xFFFF) return negated;
       // Offset is implicit: idx * 1024 words
       uint64_t word = __ldg(bitmap_data + static_cast<uint32_t>(idx) * 1024 + (low >> 6));
-      return (word >> (low & 63)) & 1;
+      return static_cast<bool>((word >> (low & 63)) & 1) ^ negated;
     }
 
     // General path: lookup key, read metadata, dispatch by type
     int idx = lookup_key(key);
-    if (idx < 0) return false;
+    if (idx < 0) return negated;
 
     auto type = load_type(idx);
     uint32_t off = load_offset(idx);
 
+    bool result;
     switch (type) {
       case ContainerTypeD::BITMAP:
-        return bitmap_contains(off, low);
+        result = bitmap_contains(off, low);
+        break;
       case ContainerTypeD::ARRAY:
-        return array_contains(off, load_cardinality(idx), low);
+        result = array_contains(off, load_cardinality(idx), low);
+        break;
       case ContainerTypeD::RUN:
-        return run_contains(off, load_cardinality(idx), low);
-      default: return false;
+        result = run_contains(off, load_cardinality(idx), low);
+        break;
+      default: result = false;
     }
+    return result ^ negated;
   }
 
   // ---- Key lookup: O(1) direct-map or O(log n) binary search fallback ----

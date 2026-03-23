@@ -65,13 +65,19 @@ GpuRoaringMeta get_meta(const roaring_bitmap_t* cpu_bitmap) {
     return meta;
 }
 
-GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap, cudaStream_t stream,
-                  uint32_t bitmap_threshold) {
+// Internal: upload a CRoaring bitmap (possibly already complemented) to GPU.
+// The negated flag is set by the caller if this bitmap is a complement.
+static GpuRoaring upload_impl(const roaring_bitmap_t* cpu_bitmap,
+                                uint32_t explicit_universe_size,
+                                cudaStream_t stream,
+                                uint32_t bitmap_threshold) {
     const roaring_array_t& ra = cpu_bitmap->high_low_container;
     const uint32_t n = static_cast<uint32_t>(ra.size);
 
     if (n == 0) {
-        return GpuRoaring{};
+        GpuRoaring result{};
+        result.universe_size = explicit_universe_size;
+        return result;
     }
 
     // Phase 1: Scan containers and build host-side SoA buffers
@@ -168,7 +174,9 @@ GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap, cudaStream_t stream,
     result.n_array_containers  = n_array;
     result.n_run_containers    = n_run;
 
-    if (n > 0) {
+    if (explicit_universe_size > 0) {
+        result.universe_size = explicit_universe_size;
+    } else if (n > 0) {
         uint16_t max_key = ra.keys[ra.size - 1];
         result.universe_size = (static_cast<uint32_t>(max_key) + 1) << 16;
     }
@@ -257,6 +265,35 @@ GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap, cudaStream_t stream,
     }
 
     return result;
+}
+
+// Original overload: infer universe from max key, no auto-complement
+GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap, cudaStream_t stream,
+                  uint32_t bitmap_threshold) {
+    return upload_impl(cpu_bitmap, 0, stream, bitmap_threshold);
+}
+
+// New overload with explicit universe_size: enables auto-complement
+GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap,
+                  uint32_t universe_size,
+                  cudaStream_t stream,
+                  uint32_t bitmap_threshold) {
+    uint64_t card = roaring_bitmap_get_cardinality(cpu_bitmap);
+
+    if (card > static_cast<uint64_t>(universe_size) / 2) {
+        // Complement: flip the bitmap, upload that, set negated=true
+        roaring_bitmap_t* complement = roaring_bitmap_copy(cpu_bitmap);
+        roaring_bitmap_flip_inplace(complement, 0, static_cast<uint64_t>(universe_size));
+
+        GpuRoaring result = upload_impl(complement, universe_size, stream, bitmap_threshold);
+        result.negated = true;
+        // total_cardinality is the logical cardinality (original set, not complement)
+        result.total_cardinality = card;
+        roaring_bitmap_free(complement);
+        return result;
+    }
+
+    return upload_impl(cpu_bitmap, universe_size, stream, bitmap_threshold);
 }
 
 void gpu_roaring_free(GpuRoaring& bitmap) {

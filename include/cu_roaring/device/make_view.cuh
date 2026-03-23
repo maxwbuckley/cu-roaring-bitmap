@@ -22,6 +22,7 @@ inline GpuRoaringView make_view(const GpuRoaring& bitmap)
   v.all_bitmap     = (bitmap.n_array_containers == 0 &&
                       bitmap.n_run_containers == 0 &&
                       bitmap.key_index != nullptr);
+  v.negated        = bitmap.negated;
   return v;
 }
 

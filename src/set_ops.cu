@@ -501,19 +501,84 @@ static void launch_bitmap_bitmap(
 // ============================================================================
 // Main set_operation implementation
 // ============================================================================
+// ============================================================================
+// DeMorgan transform: rewrite set ops when inputs are negated.
+//
+// When a GpuRoaring has negated=true, its stored set is the complement of
+// the logical set. We transform the operation + swap operands so existing
+// kernels work on the physical (stored) sets, then set the result's negated
+// flag accordingly.
+//
+// Truth table (all 16 cases):
+//   AND(~A,B)  = B &~A       → ANDNOT(B,A), neg=F  [swap]
+//   AND(A,~B)  = A &~B       → ANDNOT(A,B), neg=F
+//   AND(~A,~B) = ~(A|B)      → OR(A,B),     neg=T
+//   OR(~A,B)   = ~(A &~B)    → ANDNOT(A,B), neg=T
+//   OR(A,~B)   = ~(B &~A)    → ANDNOT(B,A), neg=T  [swap]
+//   OR(~A,~B)  = ~(A&B)      → AND(A,B),    neg=T
+//   ANDNOT(~A,B) = ~A &~B = ~(A|B)  → OR(A,B),     neg=T
+//   ANDNOT(A,~B) = A & ~~B = A&B    → AND(A,B),    neg=F
+//   ANDNOT(~A,~B) = ~A&~~B = ~A&B = B&~A → ANDNOT(B,A), neg=F [swap]
+//   XOR(~A,B)  = ~(A^B)      → XOR(A,B),    neg=T
+//   XOR(A,~B)  = ~(A^B)      → XOR(A,B),    neg=T
+//   XOR(~A,~B) = A^B         → XOR(A,B),    neg=F
+// ============================================================================
+static void resolve_negation(SetOp& op,
+                              const GpuRoaring*& a,
+                              const GpuRoaring*& b,
+                              bool& result_negated)
+{
+    bool na = a->negated;
+    bool nb = b->negated;
+    result_negated = false;
+
+    if (!na && !nb) return;  // fast path: nothing to transform
+
+    switch (op) {
+    case SetOp::AND:
+        if (na && !nb)       { op = SetOp::ANDNOT; std::swap(a, b); }
+        else if (!na && nb)  { op = SetOp::ANDNOT; }
+        else /* na && nb */  { op = SetOp::OR;  result_negated = true; }
+        break;
+    case SetOp::OR:
+        if (na && !nb)       { op = SetOp::ANDNOT; result_negated = true; }
+        else if (!na && nb)  { op = SetOp::ANDNOT; std::swap(a, b); result_negated = true; }
+        else /* na && nb */  { op = SetOp::AND; result_negated = true; }
+        break;
+    case SetOp::ANDNOT:
+        if (na && !nb)       { op = SetOp::OR;  result_negated = true; }
+        else if (!na && nb)  { op = SetOp::AND; }
+        else /* na && nb */  { op = SetOp::ANDNOT; std::swap(a, b); }
+        break;
+    case SetOp::XOR:
+        if (na && nb)        { /* op stays XOR, negated stays false */ }
+        else                 { result_negated = true; /* op stays XOR */ }
+        break;
+    }
+}
+
 GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
                          SetOp op, cudaStream_t stream)
 {
-    HostIndex ha = download_index(a, stream);
-    HostIndex hb = download_index(b, stream);
+    // DeMorgan transform for negated inputs
+    const GpuRoaring* pa = &a;
+    const GpuRoaring* pb = &b;
+    bool result_negated = false;
+    resolve_negation(op, pa, pb, result_negated);
+
+    HostIndex ha = download_index(*pa, stream);
+    HostIndex hb = download_index(*pb, stream);
 
     auto work = match_containers(
-        ha.keys.data(), ha.types.data(), a.n_containers,
-        hb.keys.data(), hb.types.data(), b.n_containers,
+        ha.keys.data(), ha.types.data(), pa->n_containers,
+        hb.keys.data(), hb.types.data(), pb->n_containers,
         op);
 
     if (work.empty()) {
-        return GpuRoaring{};
+        GpuRoaring empty{};
+        empty.universe_size = std::max(pa->universe_size, pb->universe_size);
+        empty.negated = result_negated;
+        return empty;
     }
 
     // Classify work items by type pair
@@ -646,7 +711,7 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
 
         uint32_t n_bb = static_cast<uint32_t>(bb_work.size());
         launch_bitmap_bitmap(op, n_bb, d_bb_work,
-                             a.bitmap_data, b.bitmap_data,
+                             pa->bitmap_data, pb->bitmap_data,
                              d_out_bitmap, d_bb_cards, stream);
         CUDA_CHECK(cudaGetLastError());
 
@@ -705,12 +770,12 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
 
         // Expand A-side non-bitmap containers
         expand_to_bitmap_kernel<<<n_mixed, 256, 0, stream>>>(
-            d_exp_a, n_mixed, a.array_data, a.run_data, d_temp_a_bitmaps);
+            d_exp_a, n_mixed, pa->array_data, pa->run_data, d_temp_a_bitmaps);
         CUDA_CHECK(cudaGetLastError());
 
         // Expand B-side non-bitmap containers
         expand_to_bitmap_kernel<<<n_mixed, 256, 0, stream>>>(
-            d_exp_b, n_mixed, b.array_data, b.run_data, d_temp_b_bitmaps);
+            d_exp_b, n_mixed, pb->array_data, pb->run_data, d_temp_b_bitmaps);
         CUDA_CHECK(cudaGetLastError());
 
         // For containers that are already bitmaps, copy from actual bitmap pool
@@ -719,14 +784,14 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
             if (mixed_work[i].a_is_bitmap) {
                 CUDA_CHECK(cudaMemcpyAsync(
                     d_temp_a_bitmaps + i * 1024,
-                    a.bitmap_data + mixed_work[i].a_offset,
+                    pa->bitmap_data + mixed_work[i].a_offset,
                     1024 * sizeof(uint64_t),
                     cudaMemcpyDeviceToDevice, stream));
             }
             if (mixed_work[i].b_is_bitmap) {
                 CUDA_CHECK(cudaMemcpyAsync(
                     d_temp_b_bitmaps + i * 1024,
-                    b.bitmap_data + mixed_work[i].b_offset,
+                    pb->bitmap_data + mixed_work[i].b_offset,
                     1024 * sizeof(uint64_t),
                     cudaMemcpyDeviceToDevice, stream));
             }
@@ -778,7 +843,7 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
                                    cudaMemcpyHostToDevice, stream));
         copy_bitmap_kernel<<<n_copy, 256, 0, stream>>>(
             d_copy_work, n_copy,
-            a.bitmap_data, b.bitmap_data,
+            pa->bitmap_data, pb->bitmap_data,
             d_out_bitmap,
             static_cast<uint32_t>(bb_work.size() + mixed_work.size()));
         CUDA_CHECK(cudaGetLastError());
@@ -841,8 +906,8 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
 
         bitmap_array_and_kernel<<<n_ba, 256, smem_size, stream>>>(
             d_ba_work, n_ba,
-            a.bitmap_data, b.bitmap_data,
-            a.array_data, b.array_data,
+            pa->bitmap_data, pb->bitmap_data,
+            pa->array_data, pb->array_data,
             d_out_array, d_ba_offsets, d_ba_cards);
         CUDA_CHECK(cudaGetLastError());
 
@@ -885,7 +950,7 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
 
         array_array_and_kernel<<<n_aa, 256, smem_size, stream>>>(
             d_aa_work, n_aa,
-            a.array_data, b.array_data,
+            pa->array_data, pb->array_data,
             d_out_array, d_aa_offsets, d_aa_cards);
         CUDA_CHECK(cudaGetLastError());
 
@@ -915,7 +980,7 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
                                    cudaMemcpyHostToDevice, stream));
 
         copy_array_kernel<<<n_ca, 256, 0, stream>>>(
-            d_copy, n_ca, a.array_data, b.array_data,
+            d_copy, n_ca, pa->array_data, pb->array_data,
             d_out_array, d_offsets);
         CUDA_CHECK(cudaGetLastError());
 
@@ -949,7 +1014,7 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
                                    cudaMemcpyHostToDevice, stream));
 
         copy_run_kernel<<<n_cr, 256, 0, stream>>>(
-            d_copy, n_cr, a.run_data, b.run_data,
+            d_copy, n_cr, pa->run_data, pb->run_data,
             d_out_run, d_offsets);
         CUDA_CHECK(cudaGetLastError());
 
@@ -1085,7 +1150,8 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
     // Build final GpuRoaring
     GpuRoaring result{};
     result.n_containers = static_cast<uint32_t>(out_keys.size());
-    result.universe_size = std::max(a.universe_size, b.universe_size);
+    result.universe_size = std::max(pa->universe_size, pb->universe_size);
+    result.negated = result_negated;
     result.bitmap_data = d_out_bitmap;
     result.n_bitmap_containers = out_n_bitmap;
     result.array_data = d_out_array;
@@ -1132,11 +1198,15 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
 // Each block handles one output container. For each common key,
 // AND the 1024 words across all N input bitmaps.
 // bitmap_ptrs[i] points to the start of input i's bitmap for this key.
+// For negated inputs missing a key, the pointer points to a static all-ones
+// sentinel (absent key in negated bitmap = all ones = no effect on AND).
+// negation_mask: bit i set = input i is negated (apply ~word before AND).
 __global__ void fused_multi_and_kernel(
     const uint64_t* const* bitmap_ptrs,  // [n_common_keys][n_inputs]
     uint64_t* output,                     // [n_common_keys * 1024]
     uint32_t n_inputs,
-    uint32_t n_common_keys)
+    uint32_t n_common_keys,
+    uint32_t negation_mask)
 {
     uint32_t key_idx = blockIdx.x;
     if (key_idx >= n_common_keys) return;
@@ -1145,9 +1215,11 @@ __global__ void fused_multi_and_kernel(
     uint64_t* dst = output + static_cast<size_t>(key_idx) * 1024;
 
     for (uint32_t w = threadIdx.x; w < 1024u; w += blockDim.x) {
-        uint64_t val = ptrs[0][w];
-        for (uint32_t i = 1; i < n_inputs; ++i) {
-            val &= ptrs[i][w];
+        uint64_t val = ~0ULL;  // identity for AND
+        for (uint32_t i = 0; i < n_inputs; ++i) {
+            uint64_t word = ptrs[i][w];
+            if ((negation_mask >> i) & 1) word = ~word;
+            val &= word;
         }
         dst[w] = val;
     }
@@ -1155,10 +1227,20 @@ __global__ void fused_multi_and_kernel(
 
 // Fused multi-AND for all-bitmap inputs: one kernel launch instead of
 // N-1 pairwise set_operation calls.
+//
+// Handles negated inputs natively: negated inputs contribute ~word to the AND,
+// and absent keys in negated inputs contribute all-ones (no effect on AND).
+// Only non-negated inputs can eliminate keys from the result.
 static GpuRoaring fused_multi_and_allbitmap(const GpuRoaring* bitmaps,
                                              uint32_t count,
                                              cudaStream_t stream)
 {
+    // Build negation mask (bit i = input i is negated). Max 32 inputs.
+    uint32_t neg_mask = 0;
+    for (uint32_t i = 0; i < count && i < 32; ++i) {
+        if (bitmaps[i].negated) neg_mask |= (1u << i);
+    }
+
     // 1. Download key arrays (small: count × n_containers × 2 bytes)
     std::vector<std::vector<uint16_t>> all_keys(count);
     for (uint32_t i = 0; i < count; ++i) {
@@ -1172,21 +1254,52 @@ static GpuRoaring fused_multi_and_allbitmap(const GpuRoaring* bitmaps,
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // 2. Multi-way intersection of sorted key arrays
-    // Start with keys from bitmap 0, intersect with each subsequent
-    std::vector<uint16_t> common_keys(all_keys[0].begin(), all_keys[0].end());
-    for (uint32_t i = 1; i < count && !common_keys.empty(); ++i) {
-        std::vector<uint16_t> intersected;
-        std::set_intersection(common_keys.begin(), common_keys.end(),
-                              all_keys[i].begin(), all_keys[i].end(),
-                              std::back_inserter(intersected));
-        common_keys = std::move(intersected);
+    // 2. Key intersection — only non-negated inputs can eliminate keys.
+    //    A negated input missing a key contributes all-ones (no effect on AND).
+    //    A non-negated input missing a key contributes all-zeros (key drops out).
+    //
+    //    If there are non-negated inputs: start with their key intersection.
+    //    If ALL inputs are negated: every key in the universe survives, because
+    //    absent keys in negated inputs are all-ones, and AND of all-ones = all-ones.
+    std::vector<uint16_t> common_keys;
+    bool has_non_negated = (neg_mask != (1u << count) - 1u);
+
+    if (has_non_negated) {
+        // Start with the first non-negated input's keys, intersect with rest
+        bool first = true;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (bitmaps[i].negated) continue;
+            if (first) {
+                common_keys = all_keys[i];
+                first = false;
+            } else {
+                std::vector<uint16_t> intersected;
+                std::set_intersection(common_keys.begin(), common_keys.end(),
+                                      all_keys[i].begin(), all_keys[i].end(),
+                                      std::back_inserter(intersected));
+                common_keys = std::move(intersected);
+            }
+        }
+    } else {
+        // All inputs are negated: every key in the universe survives.
+        uint32_t max_universe = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            max_universe = std::max(max_universe, bitmaps[i].universe_size);
+        }
+        uint16_t max_key = static_cast<uint16_t>((max_universe + 65535) / 65536 - 1);
+        common_keys.reserve(max_key + 1);
+        for (uint32_t k = 0; k <= max_key; ++k) {
+            common_keys.push_back(static_cast<uint16_t>(k));
+        }
     }
 
     uint32_t n_common = static_cast<uint32_t>(common_keys.size());
 
     GpuRoaring result{};
     result.universe_size       = bitmaps[0].universe_size;
+    for (uint32_t i = 1; i < count; ++i) {
+        result.universe_size = std::max(result.universe_size, bitmaps[i].universe_size);
+    }
     result.n_containers        = n_common;
     result.n_bitmap_containers = n_common;
     result.n_array_containers  = 0;
@@ -1194,19 +1307,36 @@ static GpuRoaring fused_multi_and_allbitmap(const GpuRoaring* bitmaps,
 
     if (n_common == 0) return result;
 
-    // 3. Build pointer table: for each common key × each input, find the
-    //    bitmap data pointer. Since all inputs are sorted by key, use
-    //    binary search to find the container index.
+    // 3. Allocate an all-ones sentinel on GPU (1024 words of 0xFFFFFFFFFFFFFFFF).
+    //    Used for negated inputs that are missing a key — their contribution to
+    //    AND is all-ones, which after ~word becomes all-zeros... wait, no:
+    //    the kernel applies ~word for negated inputs, so the sentinel should be
+    //    all-ZEROS (which becomes all-ones after ~). This way missing negated
+    //    inputs contribute all-ones to the AND (identity element).
+    uint64_t* d_sentinel = nullptr;
+    bool need_sentinel = (neg_mask != 0);
+    if (need_sentinel) {
+        CUDA_CHECK(cudaMalloc(&d_sentinel, 1024 * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemsetAsync(d_sentinel, 0, 1024 * sizeof(uint64_t), stream));
+    }
+
+    // 4. Build pointer table: for each common key × each input, find the
+    //    bitmap data pointer. For negated inputs missing a key, use sentinel.
     std::vector<const uint64_t*> h_ptrs(static_cast<size_t>(n_common) * count);
 
     for (uint32_t k = 0; k < n_common; ++k) {
         uint16_t key = common_keys[k];
         for (uint32_t i = 0; i < count; ++i) {
-            // Binary search in all_keys[i] for this key
             auto it = std::lower_bound(all_keys[i].begin(), all_keys[i].end(), key);
-            uint32_t idx = static_cast<uint32_t>(it - all_keys[i].begin());
-            // Offset is idx * 1024 words (all-bitmap, sequential layout)
-            h_ptrs[k * count + i] = bitmaps[i].bitmap_data + static_cast<size_t>(idx) * 1024;
+            if (it != all_keys[i].end() && *it == key) {
+                uint32_t idx = static_cast<uint32_t>(it - all_keys[i].begin());
+                h_ptrs[k * count + i] = bitmaps[i].bitmap_data + static_cast<size_t>(idx) * 1024;
+            } else {
+                // Key not present in this input. Must be a negated input
+                // (non-negated inputs were filtered in key intersection).
+                // Point to all-zeros sentinel; kernel will ~0 = all-ones.
+                h_ptrs[k * count + i] = d_sentinel;
+            }
         }
     }
 
@@ -1217,14 +1347,15 @@ static GpuRoaring fused_multi_and_allbitmap(const GpuRoaring* bitmaps,
                                h_ptrs.size() * sizeof(const uint64_t*),
                                cudaMemcpyHostToDevice, stream));
 
-    // 4. Allocate output and launch fused kernel
+    // 5. Allocate output and launch fused kernel
     CUDA_CHECK(cudaMalloc(&result.bitmap_data,
                           static_cast<size_t>(n_common) * 1024 * sizeof(uint64_t)));
 
     fused_multi_and_kernel<<<n_common, 256, 0, stream>>>(
-        d_ptrs, result.bitmap_data, count, n_common);
+        d_ptrs, result.bitmap_data, count, n_common, neg_mask);
 
     cudaFree(d_ptrs);
+    if (d_sentinel) cudaFree(d_sentinel);
 
     // 5. Build metadata
     std::vector<uint16_t> h_cards(n_common);
@@ -1281,7 +1412,9 @@ GpuRoaring multi_and(const GpuRoaring* bitmaps, uint32_t count,
         return set_operation(bitmaps[0], bitmaps[0], SetOp::AND, stream);
     }
 
-    // Fast path: if all inputs are all-bitmap, use fused kernel
+    // Fast path: if all inputs are all-bitmap, use fused kernel.
+    // The fused kernel handles negated inputs natively via per-input ~word
+    // and an all-zeros sentinel for absent keys — no pairwise fallback needed.
     bool all_bitmap = true;
     for (uint32_t i = 0; i < count; ++i) {
         if (bitmaps[i].n_array_containers > 0 || bitmaps[i].n_run_containers > 0) {
@@ -1289,7 +1422,7 @@ GpuRoaring multi_and(const GpuRoaring* bitmaps, uint32_t count,
             break;
         }
     }
-    if (all_bitmap) {
+    if (all_bitmap && count <= 32) {
         return fused_multi_and_allbitmap(bitmaps, count, stream);
     }
 

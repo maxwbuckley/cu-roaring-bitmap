@@ -106,16 +106,204 @@ __global__ void build_metadata_kernel(const uint16_t* unique_keys,
 }
 
 // ============================================================================
-// GPU-native upload: sort + unique + partition + build, all on GPU
+// GPU-native complement kernels
+//
+// When density > 50%, we compute the complement set (the "gaps" between
+// existing IDs) on-GPU and build the Roaring bitmap from that instead.
+// This guarantees the stored bitmap always has density <= 50%.
+// ============================================================================
+
+// Compute the size of each gap between consecutive sorted unique IDs.
+// gap[0]     = d_unique[0]                        (IDs before first element)
+// gap[i]     = d_unique[i] - d_unique[i-1] - 1    (interior gaps)
+// gap[n]     = universe_size - d_unique[n-1] - 1   (IDs after last element)
+__global__ void compute_gap_sizes_kernel(const uint32_t* d_unique,
+                                          uint32_t* gap_sizes,
+                                          uint32_t n_unique,
+                                          uint32_t universe_size)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    // n_unique + 1 gaps total
+    if (i > n_unique) return;
+
+    if (i == 0) {
+        gap_sizes[0] = d_unique[0];
+    } else if (i == n_unique) {
+        gap_sizes[n_unique] = universe_size - d_unique[n_unique - 1] - 1;
+    } else {
+        gap_sizes[i] = d_unique[i] - d_unique[i - 1] - 1;
+    }
+}
+
+// Expand gaps into complement IDs using precomputed offsets.
+// Each thread handles one gap and writes sequential IDs.
+__global__ void expand_gaps_kernel(const uint32_t* d_unique,
+                                    const uint32_t* gap_offsets,
+                                    const uint32_t* gap_sizes,
+                                    uint32_t* complement_ids,
+                                    uint32_t n_unique,
+                                    uint32_t universe_size)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i > n_unique) return;
+
+    uint32_t size = gap_sizes[i];
+    if (size == 0) return;
+
+    uint32_t out_offset = gap_offsets[i];
+    uint32_t start_id;
+
+    if (i == 0) {
+        start_id = 0;
+    } else {
+        start_id = d_unique[i - 1] + 1;
+    }
+
+    for (uint32_t j = 0; j < size; ++j) {
+        complement_ids[out_offset + j] = start_id + j;
+    }
+}
+
+// ============================================================================
+// Helper: build a GpuRoaring from sorted unique IDs already on GPU.
+// Shared by both the direct and complement paths.
+// ============================================================================
+static GpuRoaring build_from_device_ids(uint32_t* d_unique,
+                                         uint32_t h_num_unique,
+                                         uint32_t universe_size,
+                                         cudaStream_t stream)
+{
+    GpuRoaring result{};
+    result.universe_size = universe_size;
+    result.total_cardinality = h_num_unique;
+
+    if (h_num_unique == 0) {
+        cudaFree(d_unique);
+        return result;
+    }
+
+    // 1. Extract high-16 keys from sorted unique IDs
+    uint16_t* d_all_keys = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_all_keys, h_num_unique * sizeof(uint16_t)));
+    {
+        uint32_t blocks = (h_num_unique + 255) / 256;
+        extract_keys_kernel<<<blocks, 256, 0, stream>>>(
+            d_unique, d_all_keys, h_num_unique);
+    }
+
+    // 2. CUB RunLengthEncode on keys → unique container keys + counts + n_containers
+    uint16_t* d_container_keys = nullptr;
+    uint32_t* d_counts = nullptr;
+    uint32_t* d_n_containers = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_container_keys, h_num_unique * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&d_counts, h_num_unique * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_n_containers, sizeof(uint32_t)));
+
+    size_t rle_temp_bytes = 0;
+    cub::DeviceRunLengthEncode::Encode(nullptr, rle_temp_bytes,
+                                       d_all_keys, d_container_keys,
+                                       d_counts, d_n_containers,
+                                       h_num_unique, stream);
+    void* d_rle_temp = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_rle_temp, rle_temp_bytes));
+    cub::DeviceRunLengthEncode::Encode(d_rle_temp, rle_temp_bytes,
+                                       d_all_keys, d_container_keys,
+                                       d_counts, d_n_containers,
+                                       h_num_unique, stream);
+    cudaFree(d_rle_temp);
+    cudaFree(d_all_keys);
+
+    // Download n_containers (small sync — 4 bytes)
+    uint32_t h_n_containers = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&h_n_containers, d_n_containers, sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    cudaFree(d_n_containers);
+
+    result.n_containers        = h_n_containers;
+    result.n_bitmap_containers = h_n_containers;
+    result.n_array_containers  = 0;
+    result.n_run_containers    = 0;
+
+    // 3. Exclusive prefix sum on counts → container start offsets into d_unique
+    uint32_t* d_offsets_into_ids = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_offsets_into_ids, h_n_containers * sizeof(uint32_t)));
+
+    size_t scan_temp_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, scan_temp_bytes,
+                                  d_counts, d_offsets_into_ids,
+                                  h_n_containers, stream);
+    void* d_scan_temp = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_scan_temp, scan_temp_bytes));
+    cub::DeviceScan::ExclusiveSum(d_scan_temp, scan_temp_bytes,
+                                  d_counts, d_offsets_into_ids,
+                                  h_n_containers, stream);
+    cudaFree(d_scan_temp);
+
+    // 4. Allocate bitmap pool and scatter IDs into containers (all on GPU)
+    size_t bitmap_pool_size = static_cast<size_t>(h_n_containers) * 1024;
+    CUDA_CHECK(cudaMalloc(&result.bitmap_data, bitmap_pool_size * sizeof(uint64_t)));
+
+    scatter_to_bitmaps_kernel<<<h_n_containers, 256, 0, stream>>>(
+        d_unique, d_offsets_into_ids, d_counts,
+        result.bitmap_data, h_n_containers);
+
+    cudaFree(d_unique);
+    cudaFree(d_offsets_into_ids);
+
+    // 5. Build metadata arrays on GPU
+    CUDA_CHECK(cudaMalloc(&result.keys, h_n_containers * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&result.types, h_n_containers * sizeof(ContainerType)));
+    CUDA_CHECK(cudaMalloc(&result.offsets, h_n_containers * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&result.cardinalities, h_n_containers * sizeof(uint16_t)));
+
+    {
+        uint32_t blocks = (h_n_containers + 255) / 256;
+        build_metadata_kernel<<<blocks, 256, 0, stream>>>(
+            d_container_keys, d_counts,
+            result.keys, result.types, result.offsets, result.cardinalities,
+            h_n_containers);
+    }
+
+    // 6. Build direct-map key index on GPU
+    // Get max_key (last element of d_container_keys)
+    uint16_t h_max_key = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&h_max_key,
+                               d_container_keys + h_n_containers - 1,
+                               sizeof(uint16_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    result.max_key = h_max_key;
+
+    uint32_t index_size = static_cast<uint32_t>(h_max_key) + 1;
+    CUDA_CHECK(cudaMalloc(&result.key_index, index_size * sizeof(uint16_t)));
+    // Fill with 0xFFFF
+    CUDA_CHECK(cudaMemsetAsync(result.key_index, 0xFF,
+                               index_size * sizeof(uint16_t), stream));
+    // Write container indices
+    {
+        uint32_t blocks = (h_n_containers + 255) / 256;
+        populate_key_index_kernel<<<blocks, 256, 0, stream>>>(
+            d_container_keys, result.key_index, h_n_containers);
+    }
+
+    cudaFree(d_container_keys);
+    cudaFree(d_counts);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    return result;
+}
+
+// ============================================================================
+// GPU-native upload: sort + unique + partition + build, all on GPU.
+// When density > 50%, automatically computes the complement on-GPU
+// (gap-expand pipeline) so the stored bitmap has density <= 50%.
 // ============================================================================
 static GpuRoaring gpu_upload(const uint32_t* host_ids,
                               uint32_t n_ids,
                               uint32_t universe_size,
                               cudaStream_t stream)
 {
-    GpuRoaring result{};
-    result.universe_size = universe_size;
-
     // 1. Upload unsorted IDs to GPU
     uint32_t* d_in = nullptr;
     uint32_t* d_sorted = nullptr;
@@ -157,122 +345,73 @@ static GpuRoaring gpu_upload(const uint32_t* host_ids,
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     cudaFree(d_num_unique);
-    result.total_cardinality = h_num_unique;
 
     if (h_num_unique == 0) {
         cudaFree(d_unique);
+        GpuRoaring result{};
+        result.universe_size = universe_size;
         return result;
     }
 
-    // 4. Extract high-16 keys from sorted unique IDs
-    uint16_t* d_all_keys = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_all_keys, h_num_unique * sizeof(uint16_t)));
-    {
-        uint32_t blocks = (h_num_unique + 255) / 256;
-        extract_keys_kernel<<<blocks, 256, 0, stream>>>(
-            d_unique, d_all_keys, h_num_unique);
+    // 4. Complement decision: if density > 50%, build from complement IDs.
+    //    The complement is computed entirely on-GPU via gap expansion —
+    //    no additional host↔device transfers.
+    bool should_negate = (static_cast<uint64_t>(h_num_unique) > static_cast<uint64_t>(universe_size) / 2);
+
+    if (should_negate) {
+        uint32_t n_complement = universe_size - h_num_unique;
+
+        // 4a. Compute gap sizes: n_unique + 1 gaps
+        uint32_t n_gaps = h_num_unique + 1;
+        uint32_t* d_gap_sizes = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_gap_sizes, n_gaps * sizeof(uint32_t)));
+        {
+            uint32_t blocks = (n_gaps + 255) / 256;
+            compute_gap_sizes_kernel<<<blocks, 256, 0, stream>>>(
+                d_unique, d_gap_sizes, h_num_unique, universe_size);
+        }
+
+        // 4b. Prefix sum on gap sizes → output offsets
+        uint32_t* d_gap_offsets = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_gap_offsets, n_gaps * sizeof(uint32_t)));
+
+        size_t scan_temp_bytes = 0;
+        cub::DeviceScan::ExclusiveSum(nullptr, scan_temp_bytes,
+                                      d_gap_sizes, d_gap_offsets,
+                                      n_gaps, stream);
+        void* d_scan_temp = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_scan_temp, scan_temp_bytes));
+        cub::DeviceScan::ExclusiveSum(d_scan_temp, scan_temp_bytes,
+                                      d_gap_sizes, d_gap_offsets,
+                                      n_gaps, stream);
+        cudaFree(d_scan_temp);
+
+        // 4c. Expand gaps into complement IDs
+        uint32_t* d_complement = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_complement, n_complement * sizeof(uint32_t)));
+        {
+            uint32_t blocks = (n_gaps + 255) / 256;
+            expand_gaps_kernel<<<blocks, 256, 0, stream>>>(
+                d_unique, d_gap_offsets, d_gap_sizes,
+                d_complement, h_num_unique, universe_size);
+        }
+
+        cudaFree(d_unique);
+        cudaFree(d_gap_sizes);
+        cudaFree(d_gap_offsets);
+
+        // 4d. Build Roaring from complement IDs (reuses shared helper)
+        GpuRoaring result = build_from_device_ids(
+            d_complement, n_complement, universe_size, stream);
+        result.negated = true;
+        // total_cardinality is the logical cardinality (the original set)
+        result.total_cardinality = h_num_unique;
+        return result;
     }
 
-    // 5. CUB RunLengthEncode on keys → unique container keys + counts + n_containers
-    uint16_t* d_container_keys = nullptr;
-    uint32_t* d_counts = nullptr;
-    uint32_t* d_n_containers = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_container_keys, h_num_unique * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&d_counts, h_num_unique * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_n_containers, sizeof(uint32_t)));
-
-    size_t rle_temp_bytes = 0;
-    cub::DeviceRunLengthEncode::Encode(nullptr, rle_temp_bytes,
-                                       d_all_keys, d_container_keys,
-                                       d_counts, d_n_containers,
-                                       h_num_unique, stream);
-    void* d_rle_temp = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_rle_temp, rle_temp_bytes));
-    cub::DeviceRunLengthEncode::Encode(d_rle_temp, rle_temp_bytes,
-                                       d_all_keys, d_container_keys,
-                                       d_counts, d_n_containers,
-                                       h_num_unique, stream);
-    cudaFree(d_rle_temp);
-    cudaFree(d_all_keys);
-
-    // Download n_containers (small sync — 4 bytes)
-    uint32_t h_n_containers = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&h_n_containers, d_n_containers, sizeof(uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    cudaFree(d_n_containers);
-
-    result.n_containers        = h_n_containers;
-    result.n_bitmap_containers = h_n_containers;
-    result.n_array_containers  = 0;
-    result.n_run_containers    = 0;
-
-    // 6. Exclusive prefix sum on counts → container start offsets into d_unique
-    uint32_t* d_offsets_into_ids = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_offsets_into_ids, h_n_containers * sizeof(uint32_t)));
-
-    size_t scan_temp_bytes = 0;
-    cub::DeviceScan::ExclusiveSum(nullptr, scan_temp_bytes,
-                                  d_counts, d_offsets_into_ids,
-                                  h_n_containers, stream);
-    void* d_scan_temp = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_scan_temp, scan_temp_bytes));
-    cub::DeviceScan::ExclusiveSum(d_scan_temp, scan_temp_bytes,
-                                  d_counts, d_offsets_into_ids,
-                                  h_n_containers, stream);
-    cudaFree(d_scan_temp);
-
-    // 7. Allocate bitmap pool and scatter IDs into containers (all on GPU)
-    size_t bitmap_pool_size = static_cast<size_t>(h_n_containers) * 1024;
-    CUDA_CHECK(cudaMalloc(&result.bitmap_data, bitmap_pool_size * sizeof(uint64_t)));
-
-    scatter_to_bitmaps_kernel<<<h_n_containers, 256, 0, stream>>>(
-        d_unique, d_offsets_into_ids, d_counts,
-        result.bitmap_data, h_n_containers);
-
-    cudaFree(d_unique);
-    cudaFree(d_offsets_into_ids);
-
-    // 8. Build metadata arrays on GPU
-    CUDA_CHECK(cudaMalloc(&result.keys, h_n_containers * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&result.types, h_n_containers * sizeof(ContainerType)));
-    CUDA_CHECK(cudaMalloc(&result.offsets, h_n_containers * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&result.cardinalities, h_n_containers * sizeof(uint16_t)));
-
-    {
-        uint32_t blocks = (h_n_containers + 255) / 256;
-        build_metadata_kernel<<<blocks, 256, 0, stream>>>(
-            d_container_keys, d_counts,
-            result.keys, result.types, result.offsets, result.cardinalities,
-            h_n_containers);
-    }
-
-    // 9. Build direct-map key index on GPU
-    // Get max_key (last element of d_container_keys)
-    uint16_t h_max_key = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&h_max_key,
-                               d_container_keys + h_n_containers - 1,
-                               sizeof(uint16_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    result.max_key = h_max_key;
-
-    uint32_t index_size = static_cast<uint32_t>(h_max_key) + 1;
-    CUDA_CHECK(cudaMalloc(&result.key_index, index_size * sizeof(uint16_t)));
-    // Fill with 0xFFFF
-    CUDA_CHECK(cudaMemsetAsync(result.key_index, 0xFF,
-                               index_size * sizeof(uint16_t), stream));
-    // Write container indices
-    {
-        uint32_t blocks = (h_n_containers + 255) / 256;
-        populate_key_index_kernel<<<blocks, 256, 0, stream>>>(
-            d_container_keys, result.key_index, h_n_containers);
-    }
-
-    cudaFree(d_container_keys);
-    cudaFree(d_counts);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
+    // 5. Normal path: build directly from unique IDs
+    GpuRoaring result = build_from_device_ids(
+        d_unique, h_num_unique, universe_size, stream);
     return result;
 }
 
@@ -293,6 +432,28 @@ static GpuRoaring cpu_upload(const uint32_t* raw_ids,
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     result.total_cardinality = ids.size();
+
+    // Complement decision: if density > 50%, store the complement instead
+    bool should_negate = (ids.size() > static_cast<size_t>(universe_size) / 2);
+    if (should_negate) {
+        // Sorted set-difference: {0..universe_size-1} \ ids
+        std::vector<uint32_t> complement;
+        complement.reserve(universe_size - ids.size());
+        size_t j = 0;
+        for (uint32_t v = 0; v < universe_size; ++v) {
+            if (j < ids.size() && ids[j] == v) {
+                ++j;
+            } else {
+                complement.push_back(v);
+            }
+        }
+        ids = std::move(complement);
+        result.negated = true;
+    }
+
+    if (ids.empty()) {
+        return result;
+    }
 
     // Partition into containers
     struct Container {

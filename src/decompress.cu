@@ -82,32 +82,68 @@ __global__ void decompress_kernel(
     }
 }
 
+// Invert full words of a bitset in-place
+__global__ void invert_bitset_kernel(uint32_t* data, uint32_t n_words)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_words) {
+        data[i] = ~data[i];
+    }
+}
+
+// Invert only the valid bits in the tail word (bits beyond universe_size stay 0)
+__global__ void invert_tail_word_kernel(uint32_t* data, uint32_t word_idx, uint32_t mask)
+{
+    data[word_idx] ^= mask;
+}
+
 void decompress_to_bitset(const GpuRoaring& bitmap,
                           uint32_t* output,
                           uint32_t output_size_words,
                           cudaStream_t stream) {
-    if (bitmap.n_containers == 0) return;
-
     // Zero the output buffer
     CUDA_CHECK(cudaMemsetAsync(output, 0,
                                output_size_words * sizeof(uint32_t), stream));
 
-    dim3 grid(bitmap.n_containers);
-    dim3 block(256);
+    if (bitmap.n_containers > 0) {
+        dim3 grid(bitmap.n_containers);
+        dim3 block(256);
 
-    decompress_kernel<<<grid, block, 0, stream>>>(
-        bitmap.keys,
-        bitmap.types,
-        bitmap.offsets,
-        bitmap.cardinalities,
-        bitmap.n_containers,
-        bitmap.bitmap_data,
-        bitmap.array_data,
-        bitmap.run_data,
-        output,
-        output_size_words);
+        decompress_kernel<<<grid, block, 0, stream>>>(
+            bitmap.keys,
+            bitmap.types,
+            bitmap.offsets,
+            bitmap.cardinalities,
+            bitmap.n_containers,
+            bitmap.bitmap_data,
+            bitmap.array_data,
+            bitmap.run_data,
+            output,
+            output_size_words);
 
-    CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Complement: invert the bitset and mask off bits beyond universe_size.
+    // This also handles the edge case of a negated empty bitmap (n_containers==0),
+    // which logically represents the full universe — all bits should be set.
+    if (bitmap.negated) {
+        uint32_t n_full_words = bitmap.universe_size / 32u;
+        uint32_t tail_bits    = bitmap.universe_size % 32u;
+
+        if (n_full_words > 0) {
+            uint32_t inv_blocks = (n_full_words + 255) / 256;
+            invert_bitset_kernel<<<inv_blocks, 256, 0, stream>>>(output, n_full_words);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // Handle the partial tail word: invert only the valid bits
+        if (tail_bits > 0 && n_full_words < output_size_words) {
+            uint32_t tail_mask = (1u << tail_bits) - 1u;
+            invert_tail_word_kernel<<<1, 1, 0, stream>>>(output, n_full_words, tail_mask);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
 }
 
 uint32_t* decompress_to_bitset(const GpuRoaring& bitmap, cudaStream_t stream) {

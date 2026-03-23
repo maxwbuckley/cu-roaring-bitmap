@@ -22,7 +22,7 @@ cd cu-roaring-filter
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="89"
 make -j$(nproc)
-ctest --output-on-failure   # 5 test suites
+ctest --output-on-failure   # 6 test suites
 ```
 
 Requires: CUDA 12.4+, CMake 3.25+, GCC 13+ (or any C++17 compiler).
@@ -136,6 +136,43 @@ auto promoted = cu_roaring::promote_to_bitmap(gpu_bm, stream);
 // Or set a custom threshold: containers with >256 elements become bitmap
 auto custom = cu_roaring::upload(cpu_bm, stream, 256);
 ```
+
+### Complement optimization (automatic)
+
+Roaring compression is asymmetric: a 1% density filter compresses 59x, but a 99% density filter gets ~1x (no savings). The complement optimization fixes this by transparently storing the *complement* (the rejects) when density exceeds 50%, then flipping the `contains()` result at query time.
+
+This makes compression **symmetric around 50%**: a 99% pass-rate filter stores only the 1% rejects, achieving the same 59x compression.
+
+| Pass Rate | Without Complement | With Complement | Stored Density |
+|-----------|-------------------|-----------------|---------------|
+| 1% | 59x | 59x | 1% |
+| 10% | 6.2x | 6.2x | 10% |
+| 50% | ~1x | ~1x | 50% |
+| 70% | ~1x | **3.3x** | 30% |
+| 90% | ~1x | **6.2x** | 10% |
+| 99% | ~1x | **59x** | 1% |
+
+**Automatic**: `upload_from_ids()` detects density > 50% and stores the complement on-GPU (no additional host transfers). The complement is computed via a GPU-native gap-expansion pipeline using CUB.
+
+```cpp
+// Automatic: >50% density triggers complement storage
+auto gpu_bm = cu_roaring::upload_from_ids(
+    pass_ids.data(), pass_ids.size(), universe_size, stream);
+
+// gpu_bm.negated == true if complement was stored
+// contains() and warp_contains() handle this transparently
+```
+
+**From CRoaring**: Use the `universe_size` overload to enable complement detection:
+
+```cpp
+// With explicit universe_size: enables auto-complement
+auto gpu_bm = cu_roaring::upload(cpu_bm, universe_size, stream);
+```
+
+**Set operations**: DeMorgan's laws are applied automatically. `AND(~A, B)` becomes `ANDNOT(B, A)`, etc. All 16 combinations of `{AND,OR,ANDNOT,XOR} × {negated,normal}` inputs are handled correctly.
+
+**Decompression**: `decompress_to_bitset()` inverts the output when `negated == true`, producing the correct logical bitset.
 
 ### Decompress to flat bitset (when needed)
 
@@ -348,7 +385,7 @@ cu-roaring-filter/
 │       ├── roaring_warp_query.cuh  warp-cooperative contains() with broadcast
 │       └── make_view.cuh           GpuRoaring → GpuRoaringView
 ├── src/                            implementation (.cpp, .cu)
-├── test/                           5 test suites (Google Test)
+├── test/                           6 test suites (Google Test)
 ├── bench/                          benchmarks (B1-B8)
 │   ├── bench_comprehensive.cu      B1/B3/B4/B5: construction, memory, E2E
 │   ├── bench_point_query.cu        B6: point query throughput

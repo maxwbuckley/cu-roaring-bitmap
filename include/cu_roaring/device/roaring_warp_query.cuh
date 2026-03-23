@@ -10,6 +10,9 @@ namespace cu_roaring {
 // broadcasts container idx, each thread does 1 read (bitmap word).
 // Total: 2 global reads, same as per-thread contains() fast path but
 // with the key lookup amortised across matching lanes.
+//
+// Complement support: when r.negated is true, absent containers return
+// true and membership results are flipped via XOR (1 cycle, 0 extra reads).
 __device__ __forceinline__ bool warp_contains(const GpuRoaringView& r, uint32_t id)
 {
   const uint16_t key = static_cast<uint16_t>(id >> 16);
@@ -37,12 +40,12 @@ __device__ __forceinline__ bool warp_contains(const GpuRoaringView& r, uint32_t 
       }
     }
     container_idx = __shfl_sync(active_mask, container_idx, leader_lane);
-    if (container_idx < 0) return false;
+    if (container_idx < 0) return r.negated;
 
     // Each thread reads its own bitmap word — offset is implicit
     uint64_t word = __ldg(r.bitmap_data +
                           static_cast<uint32_t>(container_idx) * 1024 + (low >> 6));
-    return (word >> (low & 63)) & 1;
+    return static_cast<bool>((word >> (low & 63)) & 1) ^ r.negated;
   }
 
   // General path: leader reads key + metadata, broadcasts everything
@@ -62,21 +65,26 @@ __device__ __forceinline__ bool warp_contains(const GpuRoaringView& r, uint32_t 
   }
 
   container_idx = __shfl_sync(active_mask, container_idx, leader_lane);
-  if (container_idx < 0) return false;
+  if (container_idx < 0) return r.negated;
 
   meta_type   = __shfl_sync(active_mask, meta_type, leader_lane);
   meta_offset = __shfl_sync(active_mask, meta_offset, leader_lane);
   meta_card   = __shfl_sync(active_mask, meta_card, leader_lane);
 
+  bool result;
   switch (static_cast<ContainerTypeD>(meta_type)) {
     case ContainerTypeD::BITMAP:
-      return r.bitmap_contains(meta_offset, low);
+      result = r.bitmap_contains(meta_offset, low);
+      break;
     case ContainerTypeD::ARRAY:
-      return r.array_contains(meta_offset, static_cast<uint16_t>(meta_card), low);
+      result = r.array_contains(meta_offset, static_cast<uint16_t>(meta_card), low);
+      break;
     case ContainerTypeD::RUN:
-      return r.run_contains(meta_offset, static_cast<uint16_t>(meta_card), low);
-    default: return false;
+      result = r.run_contains(meta_offset, static_cast<uint16_t>(meta_card), low);
+      break;
+    default: result = false;
   }
+  return result ^ r.negated;
 }
 
 }  // namespace cu_roaring

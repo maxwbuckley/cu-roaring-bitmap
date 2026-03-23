@@ -36,6 +36,13 @@ struct GpuRoaring {
     // Built automatically during upload. Memory: (max_key + 1) * 2 bytes.
     uint16_t* key_index          = nullptr; // [max_key + 1] or nullptr
     uint32_t  max_key            = 0;       // highest container key value
+
+    // Complement optimization: when true, the stored set is the complement
+    // of the logical set. contains() results are flipped at query time.
+    // This guarantees the stored bitmap always has density <= 50%, making
+    // Roaring compression symmetric around 50% (e.g., a 99% pass-rate
+    // filter stores only the 1% rejects → 59x compression).
+    bool      negated            = false;
 };
 
 struct GpuRoaringMeta {
