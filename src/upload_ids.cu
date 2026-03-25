@@ -660,23 +660,17 @@ __global__ void compact_chunks_kernel(const uint32_t* bitset,
 
     uint32_t base_word = chunk * 2048u;
 
-    // Copy bitset words into bitmap pool (reinterpreted as uint64_t)
-    // 2048 uint32_t words = 1024 uint64_t words
+    // Copy bitset words into bitmap pool as uint64_t.
+    // Read individual uint32_t words with bounds checking to handle
+    // partial chunks where n_words_total is odd.
     uint64_t* dst = bitmap_pool + static_cast<size_t>(out_idx) * 1024;
-    const uint64_t* src = reinterpret_cast<const uint64_t*>(bitset + base_word);
-    uint32_t n_words_in_chunk = 2048u;
-    if (base_word + 2048u > n_words_total) {
-        n_words_in_chunk = n_words_total - base_word;
-    }
-    uint32_t n_u64 = n_words_in_chunk / 2;
-    uint32_t n_u64_full = 1024u;
 
-    for (uint32_t i = threadIdx.x; i < n_u64_full; i += blockDim.x) {
-        if (i < n_u64) {
-            dst[i] = src[i];
-        } else {
-            dst[i] = 0;  // zero-pad partial chunks
-        }
+    for (uint32_t i = threadIdx.x; i < 1024u; i += blockDim.x) {
+        uint32_t w0_idx = base_word + i * 2;
+        uint32_t w1_idx = base_word + i * 2 + 1;
+        uint32_t w0 = (w0_idx < n_words_total) ? bitset[w0_idx] : 0u;
+        uint32_t w1 = (w1_idx < n_words_total) ? bitset[w1_idx] : 0u;
+        dst[i] = static_cast<uint64_t>(w0) | (static_cast<uint64_t>(w1) << 32);
     }
 
     // Build metadata (one thread per block)

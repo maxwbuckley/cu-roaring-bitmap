@@ -130,6 +130,53 @@
 
 ---
 
+## Session Summary (March 24, 2026)
+
+### What Was Produced
+- **Selectivity sweep benchmark (B11)**: `bench/bench_selectivity_sweep.cu` — 13 selectivity points (0.1%–99%) × 4 universe sizes (1M–1B), comparing flat_bitset vs roaring::contains vs roaring::warp_contains. Added to `bench/CMakeLists.txt`. **Not yet built or run.**
+- **Roofline model analysis**: `analysis/roofline_model.md` — full algebraic derivation of bitset vs roaring crossover points (RTX 5090 ~805M, A100 ~336M, H100 ~419M vectors), validated against B6 empirical data, analysis of 1B/10% warp anomaly. **Ready for integration into PAPER.md.**
+- **Related work draft**: `analysis/related_work.md` — ~2,270 words, 7 subsections, 24 references covering filtered ANN algorithms (ACORN, DiskANN, VBase, SeRF, UNG, SIEVE, DIGRA, UNIFY, PathFinder), GPU systems (VecFlow, GPU-WAH), benchmarks, and production systems. **Ready for integration into PAPER.md.**
+- **Baseline setup scripts**: `scripts/setup_baselines.sh` (ACORN + VecFlow clone/build), `scripts/run_baselines.py` (evaluation on YFCC-10M), `scripts/compare_results.py` (QPS-recall comparison tables). **Not yet run.**
+
+### Known Issues (from March 24 early session)
+- VecFlow only ships a CUDA 11 wheel — building from source may be needed on CUDA 12
+- ACORN's filter_ids_map is O(nq × N) bytes — run script batches queries to stay under 500MB
+
+---
+
+## Session Summary (March 24-25, 2026 — cuVS Integration)
+
+### What Was Done
+1. **cuVS ABI investigation** — root cause identified: libcuvs.so uses Kokkos `std::experimental::mdspan`, conda libs use `cuda::std::mdspan`, system CUDA 12.4 uses `cuda::__4::mr::resource_ref` vs conda's `cuda::mr::__4::basic_resource_ref`. All three are incompatible.
+2. **Working build configuration** — conda `cuvs` env headers + local libcuvs.so + shared cu-roaring-filter lib. See memory file `project_cuvs_abi.md` for full build commands.
+3. **CUB ODR crash fixed** — cu-roaring-filter must be built as SHARED library (`-DBUILD_SHARED_LIBS=ON`) to isolate CUB device symbols from conda's CUB.
+4. **Comprehensive benchmark** (`bench_cagra_roaring_comprehensive.cu`) — 15 search configs (1M + 10M, 0.1%-99% selectivity) + 3 multi-AND configs on RTX 5090.
+5. **Report generated** — `cuvs/cpp/bench/prims/core/ROARING_BENCHMARK_REPORT.md`
+6. **cuVS RAII wrapper updated** — `roaring.hpp` (key_index, negated, total_cardinality fields), `roaring.cu` (builds key_index in from_sorted_ids)
+
+### Benchmark Results (decompress-to-bitset path)
+| Metric | Result |
+|--------|--------|
+| Search perf (roaring vs bitset) | ~identical (both use bitset_filter after decompression) |
+| Recall@10 | 0.95-1.00 across all configs |
+| Compression at 1M | 0.9x (no advantage — all containers promoted to bitmap) |
+| Compression at 10M | 1.0x (same — 153 bitmap containers) |
+| Build time (roaring vs bitset) | 0.5-6ms vs 0.08ms (roaring slower due to GPU sort) |
+| Multi-AND (roaring vs bitset) | 0.2ms vs 0.007ms (roaring slower at 1M) |
+| Complement optimization | Works correctly at >50% selectivity |
+
+### What the Benchmark Does NOT Show (needs rebuilt libcuvs)
+- **Direct roaring_filter kernel** — warp-cooperative 2-read path without decompression. Expected to show 10-30% search speedup (from cu-roaring-filter's own B6 benchmarks).
+- **Billion-scale compression** — 1B/0.1% → 59x compression (2.1MB vs 125MB). Current benchmark maxes at 10M.
+- **Multi-AND on compressed data** — at billion scale, roaring AND avoids full O(N/8) scans.
+
+### Key Technical Discoveries
+- **RTTI mismatch** — `dynamic_cast<roaring_filter&>` fails when benchmark and libcuvs are compiled with different headers, causing silent fallback to bitset_filter (reads wrong memory → recall=0). Workaround: decompress to bitset.
+- **CUB ODR violation** — static linking cu-roaring-filter.a mixes CUB device symbols from two CCCL versions. Fix: shared library.
+- **RMM header migration** — new RMM moves `rmm/mr/device/*.hpp` to `rmm/mr/*.hpp`, breaking cuVS source.
+
+---
+
 ## Status Tracker
 
 | Item | Status | Priority | Notes |
@@ -137,15 +184,18 @@
 | YFCC-10M data download | **DONE** | Critical | 2.8 GB in `big-ann-benchmarks/data/yfcc100M/` |
 | YFCC export script | **DONE** | Critical | `bench/yfcc_export.py` → 7,910 tag files |
 | B10 standalone benchmark | **DONE** | Critical | Upload + AND + query on real tags |
-| YFCC CAGRA search benchmark | Not started | Critical | Needs cuVS rebuild or ABI fix |
-| ACORN baseline | Not started | Critical | Clone, build, run on YFCC |
-| VecFlow baseline | Not started | Critical | Clone, build, run on RTX 5090 |
-| Scale CAGRA to 10M+ | Not started | Critical | Update bench_cagra_roaring configs |
-| Selectivity sweep (0.1-99%) | Not started | Critical | 10 points, synthetic + YFCC |
-| Roofline model | Not started | Important | Analytical + validate vs B6 |
-| Related work (2 pages) | Not started | Critical | 15+ papers identified above |
+| CAGRA benchmark (decompress path) | **DONE** | Critical | 15 configs + 3 multi-AND on RTX 5090 |
+| CAGRA benchmark (direct roaring path) | **Blocked** | Critical | Needs libcuvs rebuild with matching headers |
+| ACORN baseline | **Scripts ready** | Critical | `scripts/setup_baselines.sh` |
+| VecFlow baseline | **Scripts ready** | Critical | CUDA 11 wheel caveat |
+| Baseline comparison | **Scripts ready** | Critical | `scripts/run_baselines.py` + `scripts/compare_results.py` |
+| Selectivity sweep (B11) | **Code written** | Critical | `bench/bench_selectivity_sweep.cu` — needs build + run |
+| Roofline model | **Draft done** | Important | `analysis/roofline_model.md` — needs PAPER.md integration |
+| Related work (2 pages) | **Draft done** | Critical | `analysis/related_work.md` — needs PAPER.md integration |
+| cuVS RAII wrapper | **Updated** | Medium | roaring.hpp + roaring.cu (key_index, negated, total_cardinality) |
+| cuVS benchmark report | **DONE** | Critical | `ROARING_BENCHMARK_REPORT.md` (decompress path) |
 | Paper draft revision | In progress | Critical | PAPER.md needs eval + related work sections |
-| PVLDB July 1 submission | Target | — | 3 months from now |
+| PVLDB July 1 submission | Target | — | ~3 months from now |
 
 ---
 
@@ -157,22 +207,37 @@ cu-roaring-filter/
 ├── PAPER_TODOS.md              — This file
 ├── REPORT.md                   — Technical report
 ├── README.md                   — Library documentation
+├── analysis/
+│   ├── roofline_model.md       — Roofline model analysis (NEW, ready for PAPER.md)
+│   └── related_work.md         — Related work draft (NEW, ready for PAPER.md)
 ├── bench/
 │   ├── yfcc_export.py          — YFCC data export script
 │   ├── bench_yfcc.cu           — B10: YFCC standalone benchmark
+│   ├── bench_selectivity_sweep.cu — B11: selectivity sweep (NEW, needs build+run)
 │   ├── bench_point_query.cu    — B6: point query throughput
 │   ├── bench_optimized_query.cu — B7: optimization analysis
 │   ├── bench_upload_scale.cu   — B8: upload latency at scale
 │   ├── bench_multi_and.cu      — B9: fused multi-AND
 │   ├── bench_comprehensive.cu  — B1/B3/B4/B5
 │   └── yfcc_data/              — Exported YFCC tag data (gitignored)
+├── scripts/
+│   ├── setup_baselines.sh      — Clone/build ACORN + VecFlow (NEW)
+│   ├── run_baselines.py        — Evaluate baselines on YFCC-10M (NEW)
+│   └── compare_results.py      — Generate comparison tables (NEW)
 └── results/raw/                — All benchmark JSON results
 
 big-ann-benchmarks/             — NeurIPS'23 benchmark framework
 └── data/yfcc100M/              — Downloaded YFCC-10M dataset (2.8 GB)
 
 cuvs/                           — cuVS fork with roaring integration
-├── cpp/include/cuvs/core/roaring.hpp
+├── cpp/include/cuvs/core/roaring.hpp          — Updated (key_index, negated, total_cardinality)
 ├── cpp/include/cuvs/neighbors/roaring_filter.cuh
-└── cpp/bench/prims/core/bench_cagra_roaring.cu
+├── cpp/src/core/roaring/roaring.cu            — Updated (builds key_index in from_sorted_ids)
+└── cpp/bench/prims/core/
+    ├── bench_cagra_roaring.cu                 — Original benchmark (5 configs)
+    ├── bench_cagra_roaring_comprehensive.cu   — NEW: 15 search + 3 multi-AND configs
+    ├── generate_report.py                     — NEW: JSON → markdown report
+    ├── ROARING_BENCHMARK_REPORT.md            — NEW: Generated comparison report
+    ├── bench_cagra_roaring_comprehensive.json — NEW: Raw benchmark data
+    └── CMakeLists.txt                         — Updated (conda paths, shared lib, CRoaring link)
 ```

@@ -5,3 +5,5 @@ build/
 *.a
 *.so
 bench/yfcc_data/
+baselines/
+data/

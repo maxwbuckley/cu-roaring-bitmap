@@ -381,11 +381,14 @@ class DeMorganTest : public ComplementTest {
         tb.cpu = logical;
 
         if (force_negate) {
-            // Upload the complement, set negated=true
+            // Upload the complement, set negated=true.
+            // Use upload() without universe_size to avoid auto-complement
+            // (which would double-negate since the complement is >50% dense).
             roaring_bitmap_t* complement = roaring_bitmap_copy(logical);
             roaring_bitmap_flip_inplace(complement, 0, UNIVERSE);
-            tb.gpu = cu_roaring::upload(complement, UNIVERSE);
+            tb.gpu = cu_roaring::upload(complement);
             tb.gpu.negated = true;
+            tb.gpu.universe_size = UNIVERSE;
             tb.gpu.total_cardinality = roaring_bitmap_get_cardinality(logical);
             roaring_bitmap_free(complement);
         } else {
@@ -418,7 +421,7 @@ class DeMorganTest : public ComplementTest {
 
     // Test one DeMorgan combination
     void test_demorgan(cu_roaring::SetOp op, bool negate_a, bool negate_b,
-                        const char* label) {
+                        const char* /*label*/) {
         auto a = make_bitmap(0.3, 42, negate_a);
         auto b = make_bitmap(0.4, 99, negate_b);
 

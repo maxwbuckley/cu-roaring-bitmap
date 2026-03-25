@@ -112,7 +112,7 @@ int main()
       printf("  Generating predicate %d (density=%.1f%%)...\n", i, densities[i] * 100);
       fflush(stdout);
       cpu_bms[i] = make_bitmap(cfg.universe, densities[i], 42 + i * 100);
-      gpu_bms[i] = cu_roaring::upload(cpu_bms[i]);
+      gpu_bms[i] = cu_roaring::upload(cpu_bms[i], cfg.universe);
       printf("    card=%llu containers=%u (bmp=%u arr=%u)\n",
              (unsigned long long)roaring_bitmap_get_cardinality(cpu_bms[i]),
              gpu_bms[i].n_containers,

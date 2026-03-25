@@ -21,8 +21,8 @@ struct BenchState {
         if (initialized) return;
         cpu_a = cu_roaring::bench::generate_bitmap(universe, density_a, seed_a);
         cpu_b = cu_roaring::bench::generate_bitmap(universe, density_b, seed_b);
-        gpu_a = cu_roaring::upload(cpu_a);
-        gpu_b = cu_roaring::upload(cpu_b);
+        gpu_a = cu_roaring::upload(cpu_a, universe);
+        gpu_b = cu_roaring::upload(cpu_b, universe);
         cudaEventCreate(&start_ev);
         cudaEventCreate(&stop_ev);
         initialized = true;
@@ -83,8 +83,8 @@ static void BM_GPU_AND_DenseDense(benchmark::State& state) {
     uint32_t universe = static_cast<uint32_t>(state.range(0));
     auto* cpu_a = cu_roaring::bench::generate_bitmap(universe, 0.5, 42);
     auto* cpu_b = cu_roaring::bench::generate_bitmap(universe, 0.3, 123);
-    auto gpu_a = cu_roaring::upload(cpu_a);
-    auto gpu_b = cu_roaring::upload(cpu_b);
+    auto gpu_a = cu_roaring::upload(cpu_a, universe);
+    auto gpu_b = cu_roaring::upload(cpu_b, universe);
 
     cudaEvent_t start_ev, stop_ev;
     cudaEventCreate(&start_ev);
@@ -124,8 +124,8 @@ static void BM_GPU_AND_SparseSparse(benchmark::State& state) {
     uint32_t universe = static_cast<uint32_t>(state.range(0));
     auto* cpu_a = cu_roaring::bench::generate_bitmap(universe, 0.01, 42);
     auto* cpu_b = cu_roaring::bench::generate_bitmap(universe, 0.005, 123);
-    auto gpu_a = cu_roaring::upload(cpu_a);
-    auto gpu_b = cu_roaring::upload(cpu_b);
+    auto gpu_a = cu_roaring::upload(cpu_a, universe);
+    auto gpu_b = cu_roaring::upload(cpu_b, universe);
 
     cudaEvent_t start_ev, stop_ev;
     cudaEventCreate(&start_ev);
@@ -164,8 +164,8 @@ static void BM_GPU_AND_DenseSparse(benchmark::State& state) {
     uint32_t universe = static_cast<uint32_t>(state.range(0));
     auto* cpu_a = cu_roaring::bench::generate_bitmap(universe, 0.5, 42);
     auto* cpu_b = cu_roaring::bench::generate_bitmap(universe, 0.01, 123);
-    auto gpu_a = cu_roaring::upload(cpu_a);
-    auto gpu_b = cu_roaring::upload(cpu_b);
+    auto gpu_a = cu_roaring::upload(cpu_a, universe);
+    auto gpu_b = cu_roaring::upload(cpu_b, universe);
 
     cudaEvent_t start_ev, stop_ev;
     cudaEventCreate(&start_ev);

@@ -179,8 +179,8 @@ static void run_bench5(const char* path)
 
       auto* cpu_a = make_bitmap(U, d, 42);
       auto* cpu_b = make_bitmap(U, d * 0.7, 123);
-      auto gpu_a  = cu_roaring::upload(cpu_a);
-      auto gpu_b  = cu_roaring::upload(cpu_b);
+      auto gpu_a  = cu_roaring::upload(cpu_a, U);
+      auto gpu_b  = cu_roaring::upload(cpu_b, U);
 
       uint32_t nw = (U + 31) / 32;
       uint32_t* d_out;
@@ -252,7 +252,7 @@ static void run_bench1(const char* path)
     // Upload to GPU
     std::vector<cu_roaring::GpuRoaring> gpu;
     for (int i = 0; i < 8; ++i)
-      gpu.push_back(cu_roaring::upload(tags.bitmaps[i]));
+      gpu.push_back(cu_roaring::upload(tags.bitmaps[i], U));
 
     for (auto np : preds) {
       printf("  np=%u: ", np);
@@ -434,7 +434,7 @@ static void run_bench4(const char* path)
     for (int i = 0; i < 4; ++i) {
       auto* bm = make_bitmap(U, dens[i], 42 + i * 100);
       cpus.push_back(bm);
-      gpus.push_back(cu_roaring::upload(bm));
+      gpus.push_back(cu_roaring::upload(bm, U));
     }
 
     uint32_t nw = (U + 31) / 32;

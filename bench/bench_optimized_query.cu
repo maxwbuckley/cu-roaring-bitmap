@@ -710,7 +710,7 @@ int main()
             uint64_t card = roaring_bitmap_get_cardinality(cpu_bm);
             printf("  card=%llu (%.2f%%)\n", (unsigned long long)card, 100.0*card/U);
 
-            auto gpu_bm = cu_roaring::upload(cpu_bm);
+            auto gpu_bm = cu_roaring::upload(cpu_bm, U);
             printf("  containers=%u (bmp=%u arr=%u run=%u)\n",
                    gpu_bm.n_containers, gpu_bm.n_bitmap_containers,
                    gpu_bm.n_array_containers, gpu_bm.n_run_containers);

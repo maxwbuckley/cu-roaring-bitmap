@@ -9,7 +9,7 @@ static void BM_GPU_Decompress(benchmark::State& state) {
     double density = state.range(1) / 1000.0;  // e.g., 100 → 0.1
 
     auto* cpu_bm = cu_roaring::bench::generate_bitmap(universe, density, 42);
-    auto gpu_bm = cu_roaring::upload(cpu_bm);
+    auto gpu_bm = cu_roaring::upload(cpu_bm, universe);
 
     uint32_t n_words = (gpu_bm.universe_size + 31) / 32;
     uint32_t* d_output = nullptr;

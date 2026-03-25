@@ -73,7 +73,7 @@ static void BM_CompressedTransferAndDecompress(benchmark::State& state) {
         cudaEventRecord(start_ev);
 
         // Upload compressed
-        auto gpu_bm = cu_roaring::upload(cpu_bm);
+        auto gpu_bm = cu_roaring::upload(cpu_bm, universe);
         // Decompress on GPU
         cu_roaring::decompress_to_bitset(gpu_bm, d_output, n_words);
         cudaDeviceSynchronize();

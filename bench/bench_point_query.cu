@@ -346,7 +346,7 @@ int main()
              (unsigned long long)card, 100.0 * card / U, gen_sec);
 
       // Upload to GPU
-      auto gpu_bm = cu_roaring::upload(cpu_bm);
+      auto gpu_bm = cu_roaring::upload(cpu_bm, U);
       printf("  Containers: %u (bmp=%u arr=%u run=%u)\n",
              gpu_bm.n_containers, gpu_bm.n_bitmap_containers,
              gpu_bm.n_array_containers, gpu_bm.n_run_containers);
