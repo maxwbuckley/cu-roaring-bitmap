@@ -324,6 +324,26 @@ GPU-resident filtering breaks even at ~50M and dominates at 100M+ where CPU filt
 | 1B | 0.23 ms | 538 GB/s |
 | 100M | 0.018 ms | 713 GB/s |
 
+### enumerate_ids (CSR Export) (B9)
+
+`enumerate_ids()` extracts sorted element IDs directly from the compressed Roaring bitmap, producing CSR column indices without decompressing to a flat bitset intermediate. Compared against the two-step alternative: `decompress_to_bitset()` + bitset-to-CSR scan (popcount + CUB prefix sum + bit extraction).
+
+| Universe | Density | Cardinality | enumerate_ids | Baseline (decomp+scan) | Speedup |
+|----------|---------|-------------|--------------|----------------------|---------|
+| 1M | 0.1% | 975 | 0.567 ms | 0.557 ms | 1.0x |
+| 10M | 0.1% | 10K | 0.533 ms | 0.604 ms | **1.1x** |
+| 10M | 50% | 5M | 0.588 ms | 0.633 ms | **1.1x** |
+| 100M | 1% | 1M | 0.549 ms | 0.590 ms | **1.1x** |
+| 100M | 10% | 10M | 0.624 ms | 0.683 ms | **1.1x** |
+| **1B** | **0.1%** | **1M** | **0.692 ms** | **3.089 ms** | **4.5x** |
+| **1B** | **1%** | **10M** | **0.726 ms** | **3.103 ms** | **4.3x** |
+| **1B** | **10%** | **100M** | **3.590 ms** | **3.829 ms** | **1.1x** |
+
+Key findings:
+- **4-4.5x faster at 1B scale with sparse filters** (0.1-1% density). The baseline must scan the full 119 MB bitset regardless of how many bits are set; `enumerate_ids` processes only non-empty containers.
+- **At parity or slightly faster at all other scales.** The device-side prefix sum (CUB `ExclusiveSum`) avoids the host roundtrip overhead that would otherwise dominate at small scales.
+- **Crossover to write-bound at high density.** At 100M/50% (50M output IDs), the baseline's bitset-to-CSR kernel distributes writes across more thread blocks, achieving better write parallelism.
+
 ### CAGRA Filtered Search (1M vectors, 128-dim, k=10, batch=100)
 
 | Pass Rate | cuVS bitset | roaring_warp | Speedup | Agreement* |
@@ -430,11 +450,12 @@ cu-roaring-filter/
 │       └── make_view.cuh           GpuRoaring → GpuRoaringView
 ├── src/                            implementation (.cpp, .cu)
 ├── test/                           6 test suites (Google Test)
-├── bench/                          benchmarks (B1-B8)
+├── bench/                          benchmarks (B1-B9)
 │   ├── bench_comprehensive.cu      B1/B3/B4/B5: construction, memory, E2E
 │   ├── bench_point_query.cu        B6: point query throughput
 │   ├── bench_optimized_query.cu    B7: optimization analysis
 │   ├── bench_upload_scale.cu       B8: upload latency at XL scale
+│   ├── bench_enumerate_ids.cu      B9: enumerate_ids / CSR export
 │   ├── bench_set_ops.cu            set operation microbenchmarks
 │   ├── bench_decompress.cu         decompression microbenchmarks
 │   └── bench_transfer.cu           PCIe transfer comparison
@@ -474,6 +495,7 @@ cd build
 ./bench/bench_point_query           # B6: point query throughput
 ./bench/bench_optimized_query       # B7: optimization analysis
 ./bench/bench_upload_scale          # B8: upload latency at XL scale
+./bench/bench_enumerate_ids         # B9: enumerate_ids / CSR export
 ./bench/bench_comprehensive         # B1/B3/B4/B5: construction, memory, E2E
 ./bench/bench_set_ops               # set operation microbenchmarks
 ./bench/bench_decompress            # decompression microbenchmarks

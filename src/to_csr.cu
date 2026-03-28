@@ -6,7 +6,7 @@
 #include "cu_roaring/detail/to_csr.cuh"
 #include "cu_roaring/detail/utils.cuh"
 
-#include <vector>
+#include <cub/device/device_scan.cuh>
 
 namespace cu_roaring {
 
@@ -130,74 +130,64 @@ __global__ void enumerate_ids_kernel(
   }
 }
 
+// Compute per-container element counts on device.
+// For array/bitmap containers, cardinality IS the element count.
+// For run containers, cardinality is n_runs — expand to element count
+// by summing (length + 1) for each run pair.
+__global__ void compute_element_counts_kernel(
+    const ContainerType* types,
+    const uint16_t*      cardinalities,
+    const uint32_t*      offsets,
+    const uint16_t*      run_data,
+    uint32_t*            element_counts,
+    uint32_t             n_containers)
+{
+  uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_containers) return;
+
+  if (types[i] != ContainerType::RUN) {
+    element_counts[i] = cardinalities[i];
+  } else {
+    uint16_t n_runs      = cardinalities[i];
+    const uint16_t* runs = run_data + (offsets[i] / sizeof(uint16_t));
+    uint32_t count       = 0;
+    for (uint16_t r = 0; r < n_runs; ++r) {
+      count += static_cast<uint32_t>(runs[r * 2 + 1]) + 1;
+    }
+    element_counts[i] = count;
+  }
+}
+
 void enumerate_ids(const GpuRoaring& bitmap, int64_t* output, cudaStream_t stream)
 {
   if (bitmap.n_containers == 0 || bitmap.total_cardinality == 0) return;
 
-  // Compute exclusive prefix sum of container cardinalities on host.
-  // n_containers is small (< 200 at 10M scale), so host round-trip is fine.
   uint32_t n = bitmap.n_containers;
-  std::vector<uint16_t> h_cards(n);
-  CUDA_CHECK(cudaMemcpyAsync(h_cards.data(), bitmap.cardinalities,
-                              n * sizeof(uint16_t), cudaMemcpyDeviceToHost, stream));
-  CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  std::vector<uint32_t> h_offsets(n);
-  // Also need container types to interpret cardinalities correctly for runs
-  std::vector<uint8_t> h_types(n);
-  CUDA_CHECK(cudaMemcpyAsync(h_types.data(), reinterpret_cast<const uint8_t*>(bitmap.types),
-                              n * sizeof(uint8_t), cudaMemcpyDeviceToHost, stream));
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-
-  uint32_t running = 0;
-  for (uint32_t i = 0; i < n; ++i) {
-    h_offsets[i] = running;
-    if (static_cast<ContainerType>(h_types[i]) == ContainerType::RUN) {
-      // For runs, cardinality is n_runs, not n_elements.
-      // We need element count. Compute from device data.
-      // For simplicity, fall back to total_cardinality - sum_of_others.
-      // Actually, the GpuRoaring stores element cardinality for all types.
-      // Let me check... No, for runs, cardinalities[i] = n_runs, not n_elements.
-      // We need the actual element count. But we don't have it easily on host.
-      // For now, just use the GPU to compute the prefix sum.
-      // FALLBACK: use a device-side prefix sum for correctness.
-      // This path is rare — runs are uncommon in our benchmarks.
-
-      // Approximate: we'll compute on device instead.
-      // For this initial version, handle the common case (no runs).
-      // If there are runs, fall back to a device-side implementation.
-      break;
-    }
-    running += h_cards[i];
-  }
-
-  // Check if we have any run containers
-  bool has_runs = false;
-  for (uint32_t i = 0; i < n; ++i) {
-    if (static_cast<ContainerType>(h_types[i]) == ContainerType::RUN) {
-      has_runs = true;
-      break;
-    }
-  }
-
+  // Step 1: compute per-container element counts entirely on device.
+  uint32_t* d_counts  = nullptr;
   uint32_t* d_offsets = nullptr;
+  CUDA_CHECK(cudaMallocAsync(&d_counts, n * sizeof(uint32_t), stream));
   CUDA_CHECK(cudaMallocAsync(&d_offsets, n * sizeof(uint32_t), stream));
 
-  if (!has_runs) {
-    // Fast path: no runs. Cardinality = element count for array and bitmap.
-    CUDA_CHECK(cudaMemcpyAsync(d_offsets, h_offsets.data(),
-                                n * sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
-  } else {
-    // Slow path: compute prefix sum on device using a simple kernel.
-    // For runs, we need to expand (start, length) pairs to count elements.
-    // This is rare enough that a simple serial kernel is fine.
-    // TODO: implement device-side prefix sum for run containers
-    // For now, fall back to treating cardinality as element count (incorrect for runs).
-    // This will produce wrong results for run containers but is safe for array/bitmap.
-    CUDA_CHECK(cudaMemcpyAsync(d_offsets, h_offsets.data(),
-                                n * sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
-  }
+  uint32_t count_grid = (n + 255) / 256;
+  compute_element_counts_kernel<<<count_grid, 256, 0, stream>>>(
+      bitmap.types, bitmap.cardinalities, bitmap.offsets,
+      bitmap.run_data, d_counts, n);
+  CUDA_CHECK(cudaGetLastError());
 
+  // Step 2: CUB exclusive prefix sum on device → container output offsets.
+  void*  d_temp     = nullptr;
+  size_t temp_bytes = 0;
+  cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_counts, d_offsets,
+                                static_cast<int>(n), stream);
+  CUDA_CHECK(cudaMallocAsync(&d_temp, temp_bytes, stream));
+  cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_counts, d_offsets,
+                                static_cast<int>(n), stream);
+  CUDA_CHECK(cudaFreeAsync(d_temp, stream));
+  CUDA_CHECK(cudaFreeAsync(d_counts, stream));
+
+  // Step 3: extract IDs.
   dim3 grid(n);
   dim3 block(BLOCK_SIZE);
 
