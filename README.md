@@ -205,6 +205,32 @@ uint32_t n_words = (universe_size + 31) / 32;
 cu_roaring::decompress_to_bitset(gpu_bm, my_buffer, n_words, stream);
 ```
 
+### Enumerate IDs / CSR export
+
+`enumerate_ids` exports all set element IDs as a sorted `int64_t` array on the GPU in a single kernel launch. This is the natural output format for CSR column indices and avoids the round-trip through a flat bitset when downstream consumers need explicit ID lists.
+
+```cpp
+#include <cu_roaring/detail/to_csr.cuh>
+
+// Auto-allocating: returns a device pointer the caller must cudaFree
+int64_t* ids = cu_roaring::enumerate_ids(bitmap, stream);
+// ids now contains bitmap.total_cardinality sorted int64_t values
+// Use as CSR column indices with trivial indptr construction
+
+// Or with a pre-allocated buffer:
+int64_t* output;  // pre-allocated with at least total_cardinality elements
+cu_roaring::enumerate_ids(bitmap, output, stream);
+```
+
+**Per-container extraction strategy:**
+
+- **Array containers**: Direct copy. The stored `uint16_t` values are already sorted, so each element is widened to `int64_t` with the container's 16-bit key prefix OR'd in. Work is O(cardinality).
+- **Bitmap containers**: Block-cooperative bit extraction. Each block (256 threads) processes one container's 1024 `uint64_t` words (4 words per thread). A shared-memory prefix sum of per-thread popcounts determines each thread's write offset, ensuring sorted output without post-sort. Work is O(65536) per container regardless of density (popcount + scan all words), but actual writes are O(cardinality).
+- **Run containers**: Run expansion via shared-memory prefix sum on run lengths. Each (start, length) pair is expanded to individual IDs at the correct sorted position.
+- **Absent containers**: Skipped entirely (zero work, zero output).
+
+**Motivation**: This enables a fused roaring-to-SDDMM path in cuVS brute-force search. Instead of decompressing to a flat bitset (which requires scanning all N bits) and then converting bitset-to-CSR (another full scan), `enumerate_ids` produces the CSR column indices directly from the compressed representation. This bypasses the bitset intermediate entirely and reduces the kernel launch count from 7 to 4 in the brute-force filtered search pipeline.
+
 ## Integration with NVIDIA cuVS (CAGRA)
 
 cu-roaring-filter integrates natively with CAGRA's filtered search. The Roaring bitmap is queried directly during graph traversal — no decompression step.
@@ -396,6 +422,7 @@ cu-roaring-filter/
 │   │   ├── decompress.cuh          GPU → flat bitset
 │   │   ├── set_ops.cuh             AND/OR/ANDNOT/XOR
 │   │   ├── promote.cuh             array/run → bitmap promotion
+│   │   ├── to_csr.cuh             enumerate_ids() → sorted int64_t export
 │   │   └── utils.cuh               CUDA_CHECK, helpers
 │   └── device/
 │       ├── roaring_view.cuh        device-side contains() with __ldg
