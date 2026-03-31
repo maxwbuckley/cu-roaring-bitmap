@@ -102,6 +102,9 @@ auto result = cu_roaring::multi_and(bitmaps, 3, stream);
 
 cu_roaring::gpu_roaring_free(intersection);
 cu_roaring::gpu_roaring_free(result);
+
+// Stream-ordered free (no device sync — use in hot loops)
+cu_roaring::gpu_roaring_free_async(intermediate, stream);
 ```
 
 ### Point queries inside CUDA kernels
@@ -203,6 +206,32 @@ cudaFree(flat);
 // Into pre-allocated buffer
 uint32_t n_words = (universe_size + 31) / 32;
 cu_roaring::decompress_to_bitset(gpu_bm, my_buffer, n_words, stream);
+```
+
+### Stream-Ordered Allocation and Pool Tuning
+
+All internal temporary allocations use `cudaMallocAsync`/`cudaFreeAsync` (CUDA 12+ stream-ordered memory pool). This eliminates device-wide synchronization on every `cudaFree`, which was the primary allocation bottleneck — a single `set_operation()` call previously triggered ~19 implicit device syncs from temporary buffer cleanup.
+
+For best performance, configure the CUDA memory pool to retain freed memory between operations instead of releasing it back to the OS:
+
+```cpp
+// Call once at application startup — prevents pool from releasing memory
+cudaMemPool_t pool;
+cudaDeviceGetDefaultMemPool(&pool, 0);
+uint64_t threshold = UINT64_MAX;
+cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+```
+
+This gives RMM-pool-equivalent behavior: sub-microsecond allocation from a persistent device-side free list, with no external dependency. The library's `cudaMallocAsync` calls automatically use this pool.
+
+**`gpu_roaring_free_async()`** is provided for hot loops where the synchronous `gpu_roaring_free()` (which calls `cudaFree`) would stall the pipeline. `multi_and()` and `multi_or()` use this internally for their pairwise chains.
+
+```cpp
+// Synchronous free (fine for cleanup, causes device sync)
+cu_roaring::gpu_roaring_free(bitmap);
+
+// Stream-ordered free (no device sync, use in performance-critical paths)
+cu_roaring::gpu_roaring_free_async(bitmap, stream);
 ```
 
 ### Enumerate IDs / CSR export
@@ -344,6 +373,35 @@ Key findings:
 - **At parity or slightly faster at all other scales.** The device-side prefix sum (CUB `ExclusiveSum`) avoids the host roundtrip overhead that would otherwise dominate at small scales.
 - **Crossover to write-bound at high density.** At 100M/50% (50M output IDs), the baseline's bitset-to-CSR kernel distributes writes across more thread blocks, achieving better write parallelism.
 
+### Stream-Ordered Allocation Impact (B10)
+
+All internal allocations use `cudaMallocAsync`/`cudaFreeAsync` with CUDA's stream-ordered memory pool. The benchmark compares two pool configurations: default (threshold=0, OS may reclaim freed memory) vs tuned (threshold=UINT64_MAX, memory stays in pool for reuse — equivalent to RMM's `pool_memory_resource`).
+
+**set_operation** (50 iterations, 10 warmup):
+
+| Condition | Containers | Default Pool | Tuned Pool | Speedup |
+|-----------|-----------|-------------|-----------|---------|
+| dense AND 100M | 1526 | 1477 us | 448 us | **3.30x** |
+| dense AND 1M | 16 | 478 us | 331 us | **1.44x** |
+| sparse AND 1M | 16 | 463 us | 381 us | **1.21x** |
+| mixed OR 10M | 153 | 1452 us | 1377 us | 1.05x |
+
+**upload_from_ids** (50 iterations, 10 warmup):
+
+| Condition | IDs | Default Pool | Tuned Pool | Speedup |
+|-----------|-----|-------------|-----------|---------|
+| 1M 10% | 100K | 1309 us | 466 us | **2.81x** |
+| 10M 10% | 1M | 1699 us | 613 us | **2.77x** |
+| 10M 50% | 5M | 3188 us | 1659 us | **1.92x** |
+| 100M 10% | 10M | 8675 us | 3684 us | **2.35x** |
+
+Key findings:
+- **upload_from_ids consistently 1.9-2.8x faster** with the tuned pool — the GPU-native sort/partition pipeline has many CUB temp buffers that benefit from pool reuse.
+- **set_operation up to 3.3x faster** at large scale (1526 containers), where ~19 temporary alloc/free pairs per call dominate. Smaller inputs see 1.2-1.4x.
+- **Variance reduction is dramatic**: upload_from_ids at 100M dropped from stdev=1058 us to 225 us (4.7x tighter), which matters for tail latency in production.
+- The improvement vs the old `cudaMalloc`/`cudaFree` baseline is larger still, since every `cudaFree` previously forced a full device synchronization.
+- The tuned pool (`release_threshold = UINT64_MAX`) provides the same core behavior as RMM's `pool_memory_resource` without an external dependency.
+
 ### CAGRA Filtered Search (1M vectors, 128-dim, k=10, batch=100)
 
 | Pass Rate | cuVS bitset | roaring_warp | Speedup | Agreement* |
@@ -456,6 +514,7 @@ cu-roaring-filter/
 │   ├── bench_optimized_query.cu    B7: optimization analysis
 │   ├── bench_upload_scale.cu       B8: upload latency at XL scale
 │   ├── bench_enumerate_ids.cu      B9: enumerate_ids / CSR export
+│   ├── bench_alloc_strategy.cu     B10: stream-ordered allocation impact
 │   ├── bench_set_ops.cu            set operation microbenchmarks
 │   ├── bench_decompress.cu         decompression microbenchmarks
 │   └── bench_transfer.cu           PCIe transfer comparison
@@ -496,6 +555,7 @@ cd build
 ./bench/bench_optimized_query       # B7: optimization analysis
 ./bench/bench_upload_scale          # B8: upload latency at XL scale
 ./bench/bench_enumerate_ids         # B9: enumerate_ids / CSR export
+./bench/bench_alloc_strategy        # B10: stream-ordered allocation impact
 ./bench/bench_comprehensive         # B1/B3/B4/B5: construction, memory, E2E
 ./bench/bench_set_ops               # set operation microbenchmarks
 ./bench/bench_decompress            # decompression microbenchmarks

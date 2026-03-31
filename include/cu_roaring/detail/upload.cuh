@@ -33,6 +33,11 @@ GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap,
 
 void gpu_roaring_free(GpuRoaring& bitmap);
 
+// Stream-ordered free: returns memory to the CUDA pool without synchronizing
+// the device. Use this in hot loops (e.g., pairwise multi_and chains).
+// Memory is freed on the given stream after all preceding operations complete.
+void gpu_roaring_free_async(GpuRoaring& bitmap, cudaStream_t stream);
+
 GpuRoaringMeta get_meta(const roaring_bitmap_t* cpu_bitmap);
 
 }  // namespace cu_roaring

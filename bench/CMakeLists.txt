@@ -67,3 +67,33 @@ add_executable(bench_enumerate_ids bench_enumerate_ids.cu)
 target_link_libraries(bench_enumerate_ids PRIVATE cu_roaring_filter)
 set_target_properties(bench_enumerate_ids PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 cu_roaring_target_strict_warnings(bench_enumerate_ids)
+
+# Cache hierarchy profiling benchmark (standalone, companion to ncu_cache_profile.sh)
+add_executable(bench_cache_profile bench_cache_profile.cu)
+target_link_libraries(bench_cache_profile PRIVATE cu_roaring_filter)
+set_target_properties(bench_cache_profile PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+cu_roaring_target_strict_warnings(bench_cache_profile)
+
+# YFCC sorted vs unsorted benchmark (bitset, unsorted roaring, lex-sorted roaring)
+add_executable(bench_yfcc_sorted bench_yfcc_sorted.cu)
+target_link_libraries(bench_yfcc_sorted PRIVATE cu_roaring_filter)
+set_target_properties(bench_yfcc_sorted PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+cu_roaring_target_strict_warnings(bench_yfcc_sorted)
+
+# Run container benchmark: contiguous ranges, ideal case for Roaring
+add_executable(bench_run_containers bench_run_containers.cu)
+target_link_libraries(bench_run_containers PRIVATE cu_roaring_filter)
+set_target_properties(bench_run_containers PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+cu_roaring_target_strict_warnings(bench_run_containers)
+
+# From-disk benchmark: load CRoaring .bin files, compare roaring vs bitset
+add_executable(bench_from_disk bench_from_disk.cu)
+target_link_libraries(bench_from_disk PRIVATE cu_roaring_filter)
+set_target_properties(bench_from_disk PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+cu_roaring_target_strict_warnings(bench_from_disk)
+
+# Stream-ordered allocation benchmark (default pool vs tuned pool)
+add_executable(bench_alloc_strategy bench_alloc_strategy.cu)
+target_link_libraries(bench_alloc_strategy PRIVATE cu_roaring_filter)
+set_target_properties(bench_alloc_strategy PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+cu_roaring_target_strict_warnings(bench_alloc_strategy)

@@ -178,13 +178,13 @@ static GpuRoaring build_from_device_ids(uint32_t* d_unique,
     result.total_cardinality = h_num_unique;
 
     if (h_num_unique == 0) {
-        cudaFree(d_unique);
+        CUDA_CHECK(cudaFreeAsync(d_unique, stream));
         return result;
     }
 
     // 1. Extract high-16 keys from sorted unique IDs
     uint16_t* d_all_keys = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_all_keys, h_num_unique * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMallocAsync(&d_all_keys, h_num_unique * sizeof(uint16_t), stream));
     {
         uint32_t blocks = (h_num_unique + 255) / 256;
         extract_keys_kernel<<<blocks, 256, 0, stream>>>(
@@ -195,9 +195,9 @@ static GpuRoaring build_from_device_ids(uint32_t* d_unique,
     uint16_t* d_container_keys = nullptr;
     uint32_t* d_counts = nullptr;
     uint32_t* d_n_containers = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_container_keys, h_num_unique * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&d_counts, h_num_unique * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_n_containers, sizeof(uint32_t)));
+    CUDA_CHECK(cudaMallocAsync(&d_container_keys, h_num_unique * sizeof(uint16_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_counts, h_num_unique * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_n_containers, sizeof(uint32_t), stream));
 
     size_t rle_temp_bytes = 0;
     cub::DeviceRunLengthEncode::Encode(nullptr, rle_temp_bytes,
@@ -205,20 +205,20 @@ static GpuRoaring build_from_device_ids(uint32_t* d_unique,
                                        d_counts, d_n_containers,
                                        h_num_unique, stream);
     void* d_rle_temp = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_rle_temp, rle_temp_bytes));
+    CUDA_CHECK(cudaMallocAsync(&d_rle_temp, rle_temp_bytes, stream));
     cub::DeviceRunLengthEncode::Encode(d_rle_temp, rle_temp_bytes,
                                        d_all_keys, d_container_keys,
                                        d_counts, d_n_containers,
                                        h_num_unique, stream);
-    cudaFree(d_rle_temp);
-    cudaFree(d_all_keys);
+    CUDA_CHECK(cudaFreeAsync(d_rle_temp, stream));
+    CUDA_CHECK(cudaFreeAsync(d_all_keys, stream));
 
     // Download n_containers (small sync — 4 bytes)
     uint32_t h_n_containers = 0;
     CUDA_CHECK(cudaMemcpyAsync(&h_n_containers, d_n_containers, sizeof(uint32_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    cudaFree(d_n_containers);
+    CUDA_CHECK(cudaFreeAsync(d_n_containers, stream));
 
     result.n_containers        = h_n_containers;
     result.n_bitmap_containers = h_n_containers;
@@ -227,35 +227,35 @@ static GpuRoaring build_from_device_ids(uint32_t* d_unique,
 
     // 3. Exclusive prefix sum on counts → container start offsets into d_unique
     uint32_t* d_offsets_into_ids = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_offsets_into_ids, h_n_containers * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMallocAsync(&d_offsets_into_ids, h_n_containers * sizeof(uint32_t), stream));
 
     size_t scan_temp_bytes = 0;
     cub::DeviceScan::ExclusiveSum(nullptr, scan_temp_bytes,
                                   d_counts, d_offsets_into_ids,
                                   h_n_containers, stream);
     void* d_scan_temp = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_scan_temp, scan_temp_bytes));
+    CUDA_CHECK(cudaMallocAsync(&d_scan_temp, scan_temp_bytes, stream));
     cub::DeviceScan::ExclusiveSum(d_scan_temp, scan_temp_bytes,
                                   d_counts, d_offsets_into_ids,
                                   h_n_containers, stream);
-    cudaFree(d_scan_temp);
+    CUDA_CHECK(cudaFreeAsync(d_scan_temp, stream));
 
     // 4. Allocate bitmap pool and scatter IDs into containers (all on GPU)
     size_t bitmap_pool_size = static_cast<size_t>(h_n_containers) * 1024;
-    CUDA_CHECK(cudaMalloc(&result.bitmap_data, bitmap_pool_size * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMallocAsync(&result.bitmap_data, bitmap_pool_size * sizeof(uint64_t), stream));
 
     scatter_to_bitmaps_kernel<<<h_n_containers, 256, 0, stream>>>(
         d_unique, d_offsets_into_ids, d_counts,
         result.bitmap_data, h_n_containers);
 
-    cudaFree(d_unique);
-    cudaFree(d_offsets_into_ids);
+    CUDA_CHECK(cudaFreeAsync(d_unique, stream));
+    CUDA_CHECK(cudaFreeAsync(d_offsets_into_ids, stream));
 
     // 5. Build metadata arrays on GPU
-    CUDA_CHECK(cudaMalloc(&result.keys, h_n_containers * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&result.types, h_n_containers * sizeof(ContainerType)));
-    CUDA_CHECK(cudaMalloc(&result.offsets, h_n_containers * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&result.cardinalities, h_n_containers * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMallocAsync(&result.keys, h_n_containers * sizeof(uint16_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.types, h_n_containers * sizeof(ContainerType), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.offsets, h_n_containers * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.cardinalities, h_n_containers * sizeof(uint16_t), stream));
 
     {
         uint32_t blocks = (h_n_containers + 255) / 256;
@@ -276,7 +276,7 @@ static GpuRoaring build_from_device_ids(uint32_t* d_unique,
     result.max_key = h_max_key;
 
     uint32_t index_size = static_cast<uint32_t>(h_max_key) + 1;
-    CUDA_CHECK(cudaMalloc(&result.key_index, index_size * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMallocAsync(&result.key_index, index_size * sizeof(uint16_t), stream));
     // Fill with 0xFFFF
     CUDA_CHECK(cudaMemsetAsync(result.key_index, 0xFF,
                                index_size * sizeof(uint16_t), stream));
@@ -287,8 +287,8 @@ static GpuRoaring build_from_device_ids(uint32_t* d_unique,
             d_container_keys, result.key_index, h_n_containers);
     }
 
-    cudaFree(d_container_keys);
-    cudaFree(d_counts);
+    CUDA_CHECK(cudaFreeAsync(d_container_keys, stream));
+    CUDA_CHECK(cudaFreeAsync(d_counts, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     return result;
@@ -307,8 +307,8 @@ static GpuRoaring gpu_upload(const uint32_t* host_ids,
     // 1. Upload unsorted IDs to GPU
     uint32_t* d_in = nullptr;
     uint32_t* d_sorted = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_in, n_ids * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_sorted, n_ids * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMallocAsync(&d_in, n_ids * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_sorted, n_ids * sizeof(uint32_t), stream));
     CUDA_CHECK(cudaMemcpyAsync(d_in, host_ids, n_ids * sizeof(uint32_t),
                                cudaMemcpyHostToDevice, stream));
 
@@ -317,37 +317,37 @@ static GpuRoaring gpu_upload(const uint32_t* host_ids,
     cub::DeviceRadixSort::SortKeys(nullptr, sort_temp_bytes,
                                    d_in, d_sorted, n_ids, 0, 32, stream);
     void* d_sort_temp = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_sort_temp, sort_temp_bytes));
+    CUDA_CHECK(cudaMallocAsync(&d_sort_temp, sort_temp_bytes, stream));
     cub::DeviceRadixSort::SortKeys(d_sort_temp, sort_temp_bytes,
                                    d_in, d_sorted, n_ids, 0, 32, stream);
-    cudaFree(d_sort_temp);
-    cudaFree(d_in);
+    CUDA_CHECK(cudaFreeAsync(d_sort_temp, stream));
+    CUDA_CHECK(cudaFreeAsync(d_in, stream));
 
     // 3. CUB Unique (deduplicate)
     uint32_t* d_unique = nullptr;
     uint32_t* d_num_unique = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_unique, n_ids * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_num_unique, sizeof(uint32_t)));
+    CUDA_CHECK(cudaMallocAsync(&d_unique, n_ids * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_num_unique, sizeof(uint32_t), stream));
 
     size_t unique_temp_bytes = 0;
     cub::DeviceSelect::Unique(nullptr, unique_temp_bytes,
                               d_sorted, d_unique, d_num_unique, n_ids, stream);
     void* d_unique_temp = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_unique_temp, unique_temp_bytes));
+    CUDA_CHECK(cudaMallocAsync(&d_unique_temp, unique_temp_bytes, stream));
     cub::DeviceSelect::Unique(d_unique_temp, unique_temp_bytes,
                               d_sorted, d_unique, d_num_unique, n_ids, stream);
-    cudaFree(d_unique_temp);
-    cudaFree(d_sorted);
+    CUDA_CHECK(cudaFreeAsync(d_unique_temp, stream));
+    CUDA_CHECK(cudaFreeAsync(d_sorted, stream));
 
     // Download unique count (small sync — 4 bytes)
     uint32_t h_num_unique = 0;
     CUDA_CHECK(cudaMemcpyAsync(&h_num_unique, d_num_unique, sizeof(uint32_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    cudaFree(d_num_unique);
+    CUDA_CHECK(cudaFreeAsync(d_num_unique, stream));
 
     if (h_num_unique == 0) {
-        cudaFree(d_unique);
+        CUDA_CHECK(cudaFreeAsync(d_unique, stream));
         GpuRoaring result{};
         result.universe_size = universe_size;
         return result;
@@ -364,7 +364,7 @@ static GpuRoaring gpu_upload(const uint32_t* host_ids,
         // 4a. Compute gap sizes: n_unique + 1 gaps
         uint32_t n_gaps = h_num_unique + 1;
         uint32_t* d_gap_sizes = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_gap_sizes, n_gaps * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocAsync(&d_gap_sizes, n_gaps * sizeof(uint32_t), stream));
         {
             uint32_t blocks = (n_gaps + 255) / 256;
             compute_gap_sizes_kernel<<<blocks, 256, 0, stream>>>(
@@ -373,22 +373,22 @@ static GpuRoaring gpu_upload(const uint32_t* host_ids,
 
         // 4b. Prefix sum on gap sizes → output offsets
         uint32_t* d_gap_offsets = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_gap_offsets, n_gaps * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocAsync(&d_gap_offsets, n_gaps * sizeof(uint32_t), stream));
 
         size_t scan_temp_bytes = 0;
         cub::DeviceScan::ExclusiveSum(nullptr, scan_temp_bytes,
                                       d_gap_sizes, d_gap_offsets,
                                       n_gaps, stream);
         void* d_scan_temp = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_scan_temp, scan_temp_bytes));
+        CUDA_CHECK(cudaMallocAsync(&d_scan_temp, scan_temp_bytes, stream));
         cub::DeviceScan::ExclusiveSum(d_scan_temp, scan_temp_bytes,
                                       d_gap_sizes, d_gap_offsets,
                                       n_gaps, stream);
-        cudaFree(d_scan_temp);
+        CUDA_CHECK(cudaFreeAsync(d_scan_temp, stream));
 
         // 4c. Expand gaps into complement IDs
         uint32_t* d_complement = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_complement, n_complement * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocAsync(&d_complement, n_complement * sizeof(uint32_t), stream));
         {
             uint32_t blocks = (n_gaps + 255) / 256;
             expand_gaps_kernel<<<blocks, 256, 0, stream>>>(
@@ -396,9 +396,9 @@ static GpuRoaring gpu_upload(const uint32_t* host_ids,
                 d_complement, h_num_unique, universe_size);
         }
 
-        cudaFree(d_unique);
-        cudaFree(d_gap_sizes);
-        cudaFree(d_gap_offsets);
+        CUDA_CHECK(cudaFreeAsync(d_unique, stream));
+        CUDA_CHECK(cudaFreeAsync(d_gap_sizes, stream));
+        CUDA_CHECK(cudaFreeAsync(d_gap_offsets, stream));
 
         // 4d. Build Roaring from complement IDs (reuses shared helper)
         GpuRoaring result = build_from_device_ids(
@@ -512,10 +512,10 @@ static GpuRoaring cpu_upload(const uint32_t* raw_ids,
     result.n_array_containers  = n_array;
     result.n_run_containers    = 0;
 
-    CUDA_CHECK(cudaMalloc(&result.keys, n * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&result.types, n * sizeof(ContainerType)));
-    CUDA_CHECK(cudaMalloc(&result.offsets, n * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&result.cardinalities, n * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMallocAsync(&result.keys, n * sizeof(uint16_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.types, n * sizeof(ContainerType), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.offsets, n * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.cardinalities, n * sizeof(uint16_t), stream));
 
     CUDA_CHECK(cudaMemcpyAsync(result.keys, h_keys.data(),
                                n * sizeof(uint16_t), cudaMemcpyHostToDevice, stream));
@@ -527,15 +527,15 @@ static GpuRoaring cpu_upload(const uint32_t* raw_ids,
                                n * sizeof(uint16_t), cudaMemcpyHostToDevice, stream));
 
     if (!h_bitmap_pool.empty()) {
-        CUDA_CHECK(cudaMalloc(&result.bitmap_data,
-                              h_bitmap_pool.size() * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMallocAsync(&result.bitmap_data,
+                              h_bitmap_pool.size() * sizeof(uint64_t), stream));
         CUDA_CHECK(cudaMemcpyAsync(result.bitmap_data, h_bitmap_pool.data(),
                                    h_bitmap_pool.size() * sizeof(uint64_t),
                                    cudaMemcpyHostToDevice, stream));
     }
     if (!h_array_pool.empty()) {
-        CUDA_CHECK(cudaMalloc(&result.array_data,
-                              h_array_pool.size() * sizeof(uint16_t)));
+        CUDA_CHECK(cudaMallocAsync(&result.array_data,
+                              h_array_pool.size() * sizeof(uint16_t), stream));
         CUDA_CHECK(cudaMemcpyAsync(result.array_data, h_array_pool.data(),
                                    h_array_pool.size() * sizeof(uint16_t),
                                    cudaMemcpyHostToDevice, stream));
@@ -548,8 +548,8 @@ static GpuRoaring cpu_upload(const uint32_t* raw_ids,
         for (uint32_t i = 0; i < n; ++i) {
             h_key_index[h_keys[i]] = static_cast<uint16_t>(i);
         }
-        CUDA_CHECK(cudaMalloc(&result.key_index,
-                              (result.max_key + 1) * sizeof(uint16_t)));
+        CUDA_CHECK(cudaMallocAsync(&result.key_index,
+                              (result.max_key + 1) * sizeof(uint16_t), stream));
         CUDA_CHECK(cudaMemcpyAsync(result.key_index, h_key_index.data(),
                                    (result.max_key + 1) * sizeof(uint16_t),
                                    cudaMemcpyHostToDevice, stream));
@@ -711,7 +711,7 @@ static GpuRoaring build_from_device_bitset(const uint32_t* d_bitset,
 
     // 1. Popcount each chunk
     uint32_t* d_popcounts = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_popcounts, n_chunks * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMallocAsync(&d_popcounts, n_chunks * sizeof(uint32_t), stream));
     chunk_popcount_kernel<<<n_chunks, 256, 0, stream>>>(
         d_bitset, d_popcounts, n_chunks, n_words);
     CUDA_CHECK(cudaGetLastError());
@@ -744,23 +744,23 @@ static GpuRoaring build_from_device_bitset(const uint32_t* d_bitset,
     result.n_run_containers = 0;
 
     if (n_containers == 0) {
-        cudaFree(d_popcounts);
+        CUDA_CHECK(cudaFreeAsync(d_popcounts, stream));
         return result;
     }
 
     // 3. Upload chunk map and run compaction kernel
     uint32_t* d_chunk_map = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_chunk_map, n_chunks * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMallocAsync(&d_chunk_map, n_chunks * sizeof(uint32_t), stream));
     CUDA_CHECK(cudaMemcpyAsync(d_chunk_map, h_chunk_map.data(),
                                n_chunks * sizeof(uint32_t),
                                cudaMemcpyHostToDevice, stream));
 
-    CUDA_CHECK(cudaMalloc(&result.bitmap_data,
-                          static_cast<size_t>(n_containers) * 1024 * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&result.keys, n_containers * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&result.types, n_containers * sizeof(ContainerType)));
-    CUDA_CHECK(cudaMalloc(&result.offsets, n_containers * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&result.cardinalities, n_containers * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMallocAsync(&result.bitmap_data,
+                          static_cast<size_t>(n_containers) * 1024 * sizeof(uint64_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.keys, n_containers * sizeof(uint16_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.types, n_containers * sizeof(ContainerType), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.offsets, n_containers * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.cardinalities, n_containers * sizeof(uint16_t), stream));
 
     compact_chunks_kernel<<<n_chunks, 256, 0, stream>>>(
         d_bitset, d_chunk_map, d_popcounts,
@@ -769,8 +769,8 @@ static GpuRoaring build_from_device_bitset(const uint32_t* d_bitset,
         n_chunks, n_words);
     CUDA_CHECK(cudaGetLastError());
 
-    cudaFree(d_chunk_map);
-    cudaFree(d_popcounts);
+    CUDA_CHECK(cudaFreeAsync(d_chunk_map, stream));
+    CUDA_CHECK(cudaFreeAsync(d_popcounts, stream));
 
     // 4. Build key_index
     // Find max_key from the non-empty chunks
@@ -790,7 +790,7 @@ static GpuRoaring build_from_device_bitset(const uint32_t* d_bitset,
             h_key_index[i] = static_cast<uint16_t>(h_chunk_map[i]);
         }
     }
-    CUDA_CHECK(cudaMalloc(&result.key_index, index_size * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMallocAsync(&result.key_index, index_size * sizeof(uint16_t), stream));
     CUDA_CHECK(cudaMemcpyAsync(result.key_index, h_key_index.data(),
                                index_size * sizeof(uint16_t),
                                cudaMemcpyHostToDevice, stream));
@@ -819,7 +819,7 @@ GpuRoaring upload_from_device_bitset(const uint32_t* d_bitset,
     // Quick total via chunk_popcount_kernel + host sum:
     uint32_t n_chunks = (n_words + 2047) / 2048;
     uint32_t* d_popcounts = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_popcounts, n_chunks * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMallocAsync(&d_popcounts, n_chunks * sizeof(uint32_t), stream));
     chunk_popcount_kernel<<<n_chunks, 256, 0, stream>>>(
         d_bitset, d_popcounts, n_chunks, n_words);
 
@@ -828,7 +828,7 @@ GpuRoaring upload_from_device_bitset(const uint32_t* d_bitset,
                                n_chunks * sizeof(uint32_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    cudaFree(d_popcounts);
+    CUDA_CHECK(cudaFreeAsync(d_popcounts, stream));
 
     uint64_t total_card = 0;
     for (uint32_t i = 0; i < n_chunks; ++i) total_card += h_popcounts[i];
@@ -838,7 +838,7 @@ GpuRoaring upload_from_device_bitset(const uint32_t* d_bitset,
     if (should_negate) {
         // Invert the bitset on GPU, then build from the inverted copy
         uint32_t* d_inverted = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_inverted, n_words * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocAsync(&d_inverted, n_words * sizeof(uint32_t), stream));
         CUDA_CHECK(cudaMemcpyAsync(d_inverted, d_bitset,
                                    n_words * sizeof(uint32_t),
                                    cudaMemcpyDeviceToDevice, stream));
@@ -858,7 +858,7 @@ GpuRoaring upload_from_device_bitset(const uint32_t* d_bitset,
 
         GpuRoaring result = build_from_device_bitset(
             d_inverted, n_words, universe_size, true, total_card, stream);
-        cudaFree(d_inverted);
+        CUDA_CHECK(cudaFreeAsync(d_inverted, stream));
         return result;
     }
 
@@ -881,13 +881,13 @@ GpuRoaring upload_from_bitset(const uint32_t* host_bitset,
 
     // Upload to GPU, then use the device path
     uint32_t* d_bitset = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_bitset, n_words * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMallocAsync(&d_bitset, n_words * sizeof(uint32_t), stream));
     CUDA_CHECK(cudaMemcpyAsync(d_bitset, host_bitset,
                                n_words * sizeof(uint32_t),
                                cudaMemcpyHostToDevice, stream));
 
     GpuRoaring result = upload_from_device_bitset(d_bitset, n_words, universe_size, stream);
-    cudaFree(d_bitset);
+    CUDA_CHECK(cudaFreeAsync(d_bitset, stream));
     return result;
 }
 

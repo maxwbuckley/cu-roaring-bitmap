@@ -1,5 +1,6 @@
 #include "cu_roaring/detail/upload.cuh"
 #include "cu_roaring/detail/utils.cuh"
+#include "cu_roaring/upload_pool.hpp"
 
 #include <roaring/roaring.h>
 #include <roaring/containers/array.h>
@@ -22,6 +23,10 @@ static constexpr uint8_t CROARING_ARRAY  = 2;
 static constexpr uint8_t CROARING_RUN    = 3;
 
 namespace cu_roaring {
+
+static size_t align_up(size_t val, size_t alignment) {
+    return (val + alignment - 1) & ~(alignment - 1);
+}
 
 GpuRoaringMeta get_meta(const roaring_bitmap_t* cpu_bitmap) {
     GpuRoaringMeta meta{};
@@ -65,206 +70,214 @@ GpuRoaringMeta get_meta(const roaring_bitmap_t* cpu_bitmap) {
     return meta;
 }
 
-// Internal: upload a CRoaring bitmap (possibly already complemented) to GPU.
-// The negated flag is set by the caller if this bitmap is a complement.
+// ============================================================================
+// Shared packing logic — used by both upload_impl() and UploadPool::upload()
+// ============================================================================
+
+struct PackedLayout {
+    size_t keys_off, types_off, offsets_off, cards_off, kidx_off;
+    size_t bmp_off, arr_off, run_off;
+    size_t total_bytes;
+    uint32_t n, n_bitmap, n_array, n_run;
+    uint32_t key_index_len;
+    uint16_t max_key;
+    size_t total_bitmap_words, total_array_elems, total_run_pairs;
+    uint32_t universe_size;
+    bool promote_all;
+};
+
+static PackedLayout compute_layout(const roaring_bitmap_t* cpu_bitmap,
+                                   uint32_t explicit_universe_size,
+                                   uint32_t bitmap_threshold) {
+    const roaring_array_t& ra = cpu_bitmap->high_low_container;
+    PackedLayout L{};
+    L.n = static_cast<uint32_t>(ra.size);
+
+    L.universe_size = explicit_universe_size;
+    if (L.universe_size == 0) {
+        uint16_t mk = ra.keys[ra.size - 1];
+        L.universe_size = (static_cast<uint32_t>(mk) + 1) << 16;
+    }
+
+    uint32_t eff = bitmap_threshold;
+    if (eff == PROMOTE_AUTO) eff = resolve_auto_threshold(L.universe_size);
+    L.promote_all = (eff < PROMOTE_NONE);
+
+    // Guard: skip promotion when it would eliminate compression.
+    // Only applies to PROMOTE_AUTO — an explicit PROMOTE_ALL is respected.
+    // If n_containers × 8 KB >= half the flat bitset, the promoted Roaring
+    // uses as much memory as the bitset with none of the query benefit.
+    // Benchmark (1B universe, uniform/power_law): 15 K containers × 8 KB =
+    // 125 MB = same as bitset, 28-47× slower upload, identical query speed.
+    if (L.promote_all && bitmap_threshold == PROMOTE_AUTO) {
+        size_t promoted_bytes = static_cast<size_t>(L.n) * 1024 * sizeof(uint64_t);
+        size_t bitset_bytes   = (static_cast<size_t>(L.universe_size) + 7) / 8;
+        if (promoted_bytes * 2 >= bitset_bytes) {
+            L.promote_all = false;
+        }
+    }
+
+    for (uint32_t i = 0; i < L.n; ++i) {
+        uint8_t tc = ra.typecodes[i];
+        if (tc == CROARING_BITSET) {
+            ++L.n_bitmap; L.total_bitmap_words += 1024;
+        } else if (tc == CROARING_ARRAY) {
+            if (L.promote_all) { L.total_bitmap_words += 1024; }
+            else { ++L.n_array; L.total_array_elems +=
+                static_cast<const array_container_t*>(ra.containers[i])->cardinality; }
+        } else if (tc == CROARING_RUN) {
+            if (L.promote_all) { L.total_bitmap_words += 1024; }
+            else { ++L.n_run; L.total_run_pairs +=
+                static_cast<const run_container_t*>(ra.containers[i])->n_runs; }
+        }
+    }
+    if (L.promote_all) { L.n_bitmap = L.n; L.n_array = 0; L.n_run = 0; }
+
+    L.max_key = ra.keys[ra.size - 1];
+    L.key_index_len = static_cast<uint32_t>(L.max_key) + 1;
+
+    constexpr size_t A = 8;
+    size_t off = 0;
+    L.keys_off    = off; off = align_up(off + L.n * sizeof(uint16_t), A);
+    L.types_off   = off; off = align_up(off + L.n * sizeof(ContainerType), A);
+    L.offsets_off = off; off = align_up(off + L.n * sizeof(uint32_t), A);
+    L.cards_off   = off; off = align_up(off + L.n * sizeof(uint16_t), A);
+    L.kidx_off    = off; off = align_up(off + L.key_index_len * sizeof(uint16_t), A);
+    L.bmp_off     = off; off += L.total_bitmap_words * sizeof(uint64_t);
+    L.arr_off     = off; off = align_up(off + L.total_array_elems * sizeof(uint16_t), A);
+    L.run_off     = off; off += L.total_run_pairs * 2 * sizeof(uint16_t);
+    L.total_bytes = align_up(off, A);
+    if (L.total_bytes == 0) L.total_bytes = A;
+    return L;
+}
+
+// Pack CRoaring data into h_buf according to layout L.
+static void pack_into_buffer(char* h_buf, const PackedLayout& L,
+                             const roaring_bitmap_t* cpu_bitmap) {
+    const roaring_array_t& ra = cpu_bitmap->high_low_container;
+
+    auto* h_keys  = reinterpret_cast<uint16_t*>(h_buf + L.keys_off);
+    auto* h_types = reinterpret_cast<ContainerType*>(h_buf + L.types_off);
+    auto* h_offs  = reinterpret_cast<uint32_t*>(h_buf + L.offsets_off);
+    auto* h_cards = reinterpret_cast<uint16_t*>(h_buf + L.cards_off);
+    auto* h_kidx  = reinterpret_cast<uint16_t*>(h_buf + L.kidx_off);
+    auto* h_bmp   = reinterpret_cast<uint64_t*>(h_buf + L.bmp_off);
+    auto* h_arr   = reinterpret_cast<uint16_t*>(h_buf + L.arr_off);
+    auto* h_run   = reinterpret_cast<uint16_t*>(h_buf + L.run_off);
+
+    if (L.promote_all && L.total_bitmap_words > 0)
+        std::memset(h_bmp, 0, L.total_bitmap_words * sizeof(uint64_t));
+    std::memset(h_kidx, 0xFF, L.key_index_len * sizeof(uint16_t));
+
+    size_t bmp_cursor = 0, arr_cursor = 0, run_cursor = 0;
+    for (uint32_t i = 0; i < L.n; ++i) {
+        h_keys[i] = ra.keys[i];
+        h_kidx[ra.keys[i]] = static_cast<uint16_t>(i);
+        uint8_t tc = ra.typecodes[i];
+
+        if (L.promote_all) {
+            h_types[i] = ContainerType::BITMAP;
+            h_offs[i]  = static_cast<uint32_t>(bmp_cursor * sizeof(uint64_t));
+            uint64_t* dst = h_bmp + bmp_cursor;
+            if (tc == CROARING_BITSET) {
+                const auto* bc = static_cast<const bitset_container_t*>(ra.containers[i]);
+                h_cards[i] = static_cast<uint16_t>(bc->cardinality > 65535 ? 0 : bc->cardinality);
+                std::memcpy(dst, bc->words, 1024 * sizeof(uint64_t));
+            } else if (tc == CROARING_ARRAY) {
+                const auto* ac = static_cast<const array_container_t*>(ra.containers[i]);
+                h_cards[i] = static_cast<uint16_t>(ac->cardinality);
+                for (int32_t j = 0; j < ac->cardinality; ++j) {
+                    uint16_t val = ac->array[j]; dst[val/64] |= 1ULL << (val%64); }
+            } else if (tc == CROARING_RUN) {
+                const auto* rc = static_cast<const run_container_t*>(ra.containers[i]);
+                h_cards[i] = static_cast<uint16_t>(rc->n_runs);
+                for (int32_t r = 0; r < rc->n_runs; ++r) {
+                    uint16_t start = rc->runs[r].value; uint16_t len = rc->runs[r].length;
+                    for (uint32_t v = start; v <= static_cast<uint32_t>(start)+len; ++v)
+                        dst[v/64] |= 1ULL << (v%64); }
+            }
+            bmp_cursor += 1024;
+        } else {
+            if (tc == CROARING_BITSET) {
+                h_types[i] = ContainerType::BITMAP;
+                h_offs[i]  = static_cast<uint32_t>(bmp_cursor * sizeof(uint64_t));
+                const auto* bc = static_cast<const bitset_container_t*>(ra.containers[i]);
+                h_cards[i] = static_cast<uint16_t>(bc->cardinality > 65535 ? 0 : bc->cardinality);
+                std::memcpy(h_bmp + bmp_cursor, bc->words, 1024 * sizeof(uint64_t));
+                bmp_cursor += 1024;
+            } else if (tc == CROARING_ARRAY) {
+                h_types[i] = ContainerType::ARRAY;
+                h_offs[i]  = static_cast<uint32_t>(arr_cursor * sizeof(uint16_t));
+                const auto* ac = static_cast<const array_container_t*>(ra.containers[i]);
+                h_cards[i] = static_cast<uint16_t>(ac->cardinality);
+                std::memcpy(h_arr + arr_cursor, ac->array, ac->cardinality * sizeof(uint16_t));
+                arr_cursor += ac->cardinality;
+            } else if (tc == CROARING_RUN) {
+                h_types[i] = ContainerType::RUN;
+                h_offs[i]  = static_cast<uint32_t>(run_cursor * 2 * sizeof(uint16_t));
+                const auto* rc = static_cast<const run_container_t*>(ra.containers[i]);
+                h_cards[i] = static_cast<uint16_t>(rc->n_runs);
+                std::memcpy(h_run + run_cursor*2, rc->runs, rc->n_runs * sizeof(rle16_t));
+                run_cursor += rc->n_runs;
+            }
+        }
+    }
+}
+
+// Build a GpuRoaring pointing into d_buf at the offsets described by L.
+static GpuRoaring build_result(char* d_buf, const PackedLayout& L,
+                               const roaring_bitmap_t* cpu_bitmap,
+                               void* alloc_base) {
+    GpuRoaring result{};
+    result._alloc_base         = alloc_base;
+    result.n_containers        = L.n;
+    result.n_bitmap_containers = L.n_bitmap;
+    result.n_array_containers  = L.n_array;
+    result.n_run_containers    = L.n_run;
+    result.universe_size       = L.universe_size;
+    result.total_cardinality   = roaring_bitmap_get_cardinality(cpu_bitmap);
+    result.keys          = reinterpret_cast<uint16_t*>(d_buf + L.keys_off);
+    result.types         = reinterpret_cast<ContainerType*>(d_buf + L.types_off);
+    result.offsets       = reinterpret_cast<uint32_t*>(d_buf + L.offsets_off);
+    result.cardinalities = reinterpret_cast<uint16_t*>(d_buf + L.cards_off);
+    result.max_key       = L.max_key;
+    result.key_index     = reinterpret_cast<uint16_t*>(d_buf + L.kidx_off);
+    if (L.total_bitmap_words > 0)
+        result.bitmap_data = reinterpret_cast<uint64_t*>(d_buf + L.bmp_off);
+    if (L.total_array_elems > 0)
+        result.array_data = reinterpret_cast<uint16_t*>(d_buf + L.arr_off);
+    if (L.total_run_pairs > 0)
+        result.run_data = reinterpret_cast<uint16_t*>(d_buf + L.run_off);
+    return result;
+}
+
+// ============================================================================
+// upload_impl: allocating path (cudaMallocHost + cudaMalloc per call)
+// ============================================================================
 static GpuRoaring upload_impl(const roaring_bitmap_t* cpu_bitmap,
                                 uint32_t explicit_universe_size,
                                 cudaStream_t stream,
                                 uint32_t bitmap_threshold) {
     const roaring_array_t& ra = cpu_bitmap->high_low_container;
-    const uint32_t n = static_cast<uint32_t>(ra.size);
-
-    if (n == 0) {
+    if (ra.size == 0) {
         GpuRoaring result{};
         result.universe_size = explicit_universe_size;
         return result;
     }
 
-    // Phase 1: Scan containers and build host-side SoA buffers
-    std::vector<uint16_t>      h_keys(n);
-    std::vector<ContainerType> h_types(n);
-    std::vector<uint32_t>      h_offsets(n);
-    std::vector<uint16_t>      h_cardinalities(n);
+    auto L = compute_layout(cpu_bitmap, explicit_universe_size, bitmap_threshold);
 
-    size_t total_bitmap_words = 0;
-    size_t total_array_elems  = 0;
-    size_t total_run_pairs    = 0;
-    uint32_t n_bitmap = 0, n_array = 0, n_run = 0;
+    char* h_buf = nullptr;
+    CUDA_CHECK(cudaMallocHost(&h_buf, L.total_bytes));
+    pack_into_buffer(h_buf, L, cpu_bitmap);
 
-    for (uint32_t i = 0; i < n; ++i) {
-        uint8_t tc = ra.typecodes[i];
-        if (tc == CROARING_BITSET) {
-            total_bitmap_words += 1024;
-            ++n_bitmap;
-        } else if (tc == CROARING_ARRAY) {
-            const auto* ac =
-                static_cast<const array_container_t*>(ra.containers[i]);
-            total_array_elems += ac->cardinality;
-            ++n_array;
-        } else if (tc == CROARING_RUN) {
-            const auto* rc =
-                static_cast<const run_container_t*>(ra.containers[i]);
-            total_run_pairs += rc->n_runs;
-            ++n_run;
-        }
-    }
-
-    // Allocate host staging buffers (pinned for async transfer)
-    uint64_t* h_bitmap_pool = nullptr;
-    uint16_t* h_array_pool  = nullptr;
-    uint16_t* h_run_pool    = nullptr;
-
-    if (total_bitmap_words > 0) {
-        CUDA_CHECK(cudaMallocHost(&h_bitmap_pool,
-                                  total_bitmap_words * sizeof(uint64_t)));
-    }
-    if (total_array_elems > 0) {
-        CUDA_CHECK(cudaMallocHost(&h_array_pool,
-                                  total_array_elems * sizeof(uint16_t)));
-    }
-    if (total_run_pairs > 0) {
-        CUDA_CHECK(cudaMallocHost(&h_run_pool,
-                                  total_run_pairs * 2 * sizeof(uint16_t)));
-    }
-
-    // Phase 2: Fill host buffers
-    size_t bitmap_offset = 0;
-    size_t array_offset  = 0;
-    size_t run_offset    = 0;
-
-    for (uint32_t i = 0; i < n; ++i) {
-        h_keys[i] = ra.keys[i];
-        uint8_t tc = ra.typecodes[i];
-
-        if (tc == CROARING_BITSET) {
-            h_types[i] = ContainerType::BITMAP;
-            h_offsets[i] = static_cast<uint32_t>(bitmap_offset * sizeof(uint64_t));
-            const auto* bc =
-                static_cast<const bitset_container_t*>(ra.containers[i]);
-            h_cardinalities[i] = static_cast<uint16_t>(
-                bc->cardinality > 65535 ? 0 : bc->cardinality);
-            std::memcpy(h_bitmap_pool + bitmap_offset, bc->words,
-                        1024 * sizeof(uint64_t));
-            bitmap_offset += 1024;
-        } else if (tc == CROARING_ARRAY) {
-            h_types[i] = ContainerType::ARRAY;
-            h_offsets[i] = static_cast<uint32_t>(array_offset * sizeof(uint16_t));
-            const auto* ac =
-                static_cast<const array_container_t*>(ra.containers[i]);
-            h_cardinalities[i] = static_cast<uint16_t>(ac->cardinality);
-            std::memcpy(h_array_pool + array_offset, ac->array,
-                        ac->cardinality * sizeof(uint16_t));
-            array_offset += ac->cardinality;
-        } else if (tc == CROARING_RUN) {
-            h_types[i] = ContainerType::RUN;
-            h_offsets[i] = static_cast<uint32_t>(run_offset * 2 * sizeof(uint16_t));
-            const auto* rc =
-                static_cast<const run_container_t*>(ra.containers[i]);
-            h_cardinalities[i] = static_cast<uint16_t>(rc->n_runs);
-            std::memcpy(h_run_pool + run_offset * 2, rc->runs,
-                        rc->n_runs * sizeof(rle16_t));
-            run_offset += rc->n_runs;
-        }
-    }
-
-    // Phase 3: Allocate device memory and transfer
-    GpuRoaring result{};
-    result.n_containers        = n;
-    result.n_bitmap_containers = n_bitmap;
-    result.n_array_containers  = n_array;
-    result.n_run_containers    = n_run;
-
-    if (explicit_universe_size > 0) {
-        result.universe_size = explicit_universe_size;
-    } else if (n > 0) {
-        uint16_t max_key = ra.keys[ra.size - 1];
-        result.universe_size = (static_cast<uint32_t>(max_key) + 1) << 16;
-    }
-    result.total_cardinality = roaring_bitmap_get_cardinality(cpu_bitmap);
-
-    CUDA_CHECK(cudaMalloc(&result.keys, n * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&result.types, n * sizeof(ContainerType)));
-    CUDA_CHECK(cudaMalloc(&result.offsets, n * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&result.cardinalities, n * sizeof(uint16_t)));
-
-    if (total_bitmap_words > 0) {
-        CUDA_CHECK(cudaMalloc(&result.bitmap_data,
-                              total_bitmap_words * sizeof(uint64_t)));
-    }
-    if (total_array_elems > 0) {
-        CUDA_CHECK(cudaMalloc(&result.array_data,
-                              total_array_elems * sizeof(uint16_t)));
-    }
-    if (total_run_pairs > 0) {
-        CUDA_CHECK(cudaMalloc(&result.run_data,
-                              total_run_pairs * 2 * sizeof(uint16_t)));
-    }
-
-    CUDA_CHECK(cudaMemcpyAsync(result.keys, h_keys.data(),
-                               n * sizeof(uint16_t),
+    char* d_buf = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&d_buf, L.total_bytes, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_buf, h_buf, L.total_bytes,
                                cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(result.types, h_types.data(),
-                               n * sizeof(ContainerType),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(result.offsets, h_offsets.data(),
-                               n * sizeof(uint32_t),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(result.cardinalities, h_cardinalities.data(),
-                               n * sizeof(uint16_t),
-                               cudaMemcpyHostToDevice, stream));
+    cudaFreeHost(h_buf);
 
-    if (total_bitmap_words > 0) {
-        CUDA_CHECK(cudaMemcpyAsync(result.bitmap_data, h_bitmap_pool,
-                                   total_bitmap_words * sizeof(uint64_t),
-                                   cudaMemcpyHostToDevice, stream));
-    }
-    if (total_array_elems > 0) {
-        CUDA_CHECK(cudaMemcpyAsync(result.array_data, h_array_pool,
-                                   total_array_elems * sizeof(uint16_t),
-                                   cudaMemcpyHostToDevice, stream));
-    }
-    if (total_run_pairs > 0) {
-        CUDA_CHECK(cudaMemcpyAsync(result.run_data, h_run_pool,
-                                   total_run_pairs * 2 * sizeof(uint16_t),
-                                   cudaMemcpyHostToDevice, stream));
-    }
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    if (h_bitmap_pool) cudaFreeHost(h_bitmap_pool);
-    if (h_array_pool)  cudaFreeHost(h_array_pool);
-    if (h_run_pool)    cudaFreeHost(h_run_pool);
-
-    // Build direct-map key index
-    if (n > 0) {
-        result.max_key = h_keys[n - 1];
-        std::vector<uint16_t> h_key_index(result.max_key + 1, 0xFFFF);
-        for (uint32_t i = 0; i < n; ++i) {
-            h_key_index[h_keys[i]] = static_cast<uint16_t>(i);
-        }
-        CUDA_CHECK(cudaMalloc(&result.key_index,
-                              (result.max_key + 1) * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMemcpyAsync(result.key_index, h_key_index.data(),
-                                   (result.max_key + 1) * sizeof(uint16_t),
-                                   cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
-
-    // Resolve auto threshold based on GPU L2 cache size
-    uint32_t effective_threshold = bitmap_threshold;
-    if (bitmap_threshold == PROMOTE_AUTO) {
-        effective_threshold = resolve_auto_threshold(result.universe_size);
-    }
-
-    // Promote containers to bitmap if requested or auto-selected
-    if (effective_threshold < PROMOTE_NONE &&
-        (result.n_array_containers > 0 || result.n_run_containers > 0)) {
-        GpuRoaring promoted = promote_to_bitmap(result, stream);
-        gpu_roaring_free(result);
-        return promoted;
-    }
-
-    return result;
+    return build_result(d_buf, L, cpu_bitmap, d_buf);
 }
 
 // Original overload: infer universe from max key, no auto-complement
@@ -297,15 +310,118 @@ GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap,
 }
 
 void gpu_roaring_free(GpuRoaring& bitmap) {
-    if (bitmap.keys)          cudaFree(bitmap.keys);
-    if (bitmap.types)         cudaFree(bitmap.types);
-    if (bitmap.offsets)       cudaFree(bitmap.offsets);
-    if (bitmap.cardinalities) cudaFree(bitmap.cardinalities);
-    if (bitmap.bitmap_data)   cudaFree(bitmap.bitmap_data);
-    if (bitmap.array_data)    cudaFree(bitmap.array_data);
-    if (bitmap.run_data)      cudaFree(bitmap.run_data);
-    if (bitmap.key_index)     cudaFree(bitmap.key_index);
+    if (bitmap._alloc_base) {
+        // Packed allocation: all device pointers are offsets into one block
+        cudaFree(bitmap._alloc_base);
+    } else {
+        // Individual allocations (legacy path, upload_from_ids, set_ops, etc.)
+        if (bitmap.keys)          cudaFree(bitmap.keys);
+        if (bitmap.types)         cudaFree(bitmap.types);
+        if (bitmap.offsets)       cudaFree(bitmap.offsets);
+        if (bitmap.cardinalities) cudaFree(bitmap.cardinalities);
+        if (bitmap.bitmap_data)   cudaFree(bitmap.bitmap_data);
+        if (bitmap.array_data)    cudaFree(bitmap.array_data);
+        if (bitmap.run_data)      cudaFree(bitmap.run_data);
+        if (bitmap.key_index)     cudaFree(bitmap.key_index);
+    }
     bitmap = GpuRoaring{};
+}
+
+void gpu_roaring_free_async(GpuRoaring& bitmap, cudaStream_t stream) {
+    if (bitmap._alloc_base) {
+        CUDA_CHECK(cudaFreeAsync(bitmap._alloc_base, stream));
+    } else {
+        if (bitmap.keys)          CUDA_CHECK(cudaFreeAsync(bitmap.keys, stream));
+        if (bitmap.types)         CUDA_CHECK(cudaFreeAsync(bitmap.types, stream));
+        if (bitmap.offsets)       CUDA_CHECK(cudaFreeAsync(bitmap.offsets, stream));
+        if (bitmap.cardinalities) CUDA_CHECK(cudaFreeAsync(bitmap.cardinalities, stream));
+        if (bitmap.bitmap_data)   CUDA_CHECK(cudaFreeAsync(bitmap.bitmap_data, stream));
+        if (bitmap.array_data)    CUDA_CHECK(cudaFreeAsync(bitmap.array_data, stream));
+        if (bitmap.run_data)      CUDA_CHECK(cudaFreeAsync(bitmap.run_data, stream));
+        if (bitmap.key_index)     CUDA_CHECK(cudaFreeAsync(bitmap.key_index, stream));
+    }
+    bitmap = GpuRoaring{};
+}
+
+// ============================================================================
+// UploadPool — zero-allocation upload path
+// ============================================================================
+
+UploadPool::UploadPool(size_t capacity_bytes, cudaStream_t /*stream*/)
+  : capacity_(capacity_bytes)
+{
+    CUDA_CHECK(cudaMallocHost(&h_pinned_, capacity_bytes));
+    CUDA_CHECK(cudaMalloc(&d_buf_, capacity_bytes));
+}
+
+UploadPool::~UploadPool()
+{
+    if (h_pinned_) cudaFreeHost(h_pinned_);
+    if (d_buf_)    cudaFree(d_buf_);
+}
+
+UploadPool::UploadPool(UploadPool&& o) noexcept
+  : h_pinned_(o.h_pinned_), d_buf_(o.d_buf_),
+    capacity_(o.capacity_), last_bytes_(o.last_bytes_)
+{
+    o.h_pinned_ = nullptr; o.d_buf_ = nullptr;
+    o.capacity_ = 0; o.last_bytes_ = 0;
+}
+
+UploadPool& UploadPool::operator=(UploadPool&& o) noexcept
+{
+    if (this != &o) {
+        if (h_pinned_) cudaFreeHost(h_pinned_);
+        if (d_buf_)    cudaFree(d_buf_);
+        h_pinned_ = o.h_pinned_; d_buf_ = o.d_buf_;
+        capacity_ = o.capacity_; last_bytes_ = o.last_bytes_;
+        o.h_pinned_ = nullptr; o.d_buf_ = nullptr;
+        o.capacity_ = 0; o.last_bytes_ = 0;
+    }
+    return *this;
+}
+
+GpuRoaring UploadPool::upload(const roaring_bitmap_t* cpu_bitmap,
+                              uint32_t universe_size,
+                              cudaStream_t stream,
+                              uint32_t bitmap_threshold)
+{
+    const roaring_array_t& ra = cpu_bitmap->high_low_container;
+    if (ra.size == 0) {
+        GpuRoaring result{};
+        result.universe_size = universe_size;
+        last_bytes_ = 0;
+        return result;
+    }
+
+    // Handle complement (density > 50%)
+    uint64_t card = roaring_bitmap_get_cardinality(cpu_bitmap);
+    if (universe_size > 0 && card > static_cast<uint64_t>(universe_size) / 2) {
+        roaring_bitmap_t* complement = roaring_bitmap_copy(cpu_bitmap);
+        roaring_bitmap_flip_inplace(complement, 0, static_cast<uint64_t>(universe_size));
+        GpuRoaring result = this->upload(complement, universe_size, stream, bitmap_threshold);
+        result.negated = true;
+        result.total_cardinality = card;
+        roaring_bitmap_free(complement);
+        return result;
+    }
+
+    auto L = compute_layout(cpu_bitmap, universe_size, bitmap_threshold);
+    last_bytes_ = L.total_bytes;
+
+    // Fall back to allocating path if too large for pool
+    if (L.total_bytes > capacity_) {
+        return upload_impl(cpu_bitmap, universe_size, stream, bitmap_threshold);
+    }
+
+    // Pack into pre-allocated pinned buffer, single memcpy to pre-allocated device buffer
+    pack_into_buffer(h_pinned_, L, cpu_bitmap);
+    CUDA_CHECK(cudaMemcpyAsync(d_buf_, h_pinned_, L.total_bytes,
+                               cudaMemcpyHostToDevice, stream));
+
+    // Build result — _alloc_base = nullptr so gpu_roaring_free() is a no-op
+    // (pool owns the memory)
+    return build_result(d_buf_, L, cpu_bitmap, nullptr);
 }
 
 }  // namespace cu_roaring

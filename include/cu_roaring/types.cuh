@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 namespace cu_roaring {
@@ -43,6 +44,11 @@ struct GpuRoaring {
     // Roaring compression symmetric around 50% (e.g., a 99% pass-rate
     // filter stores only the 1% rejects → 59x compression).
     bool      negated            = false;
+
+    // Internal: base of a single packed device allocation. When non-null,
+    // all device pointers above are offsets into this block, and
+    // gpu_roaring_free() frees only this pointer.
+    void*     _alloc_base        = nullptr;
 };
 
 struct GpuRoaringMeta {
