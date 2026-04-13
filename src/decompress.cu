@@ -69,8 +69,12 @@ __global__ void decompress_kernel(
             uint16_t start  = runs[r * 2];
             uint16_t length = runs[r * 2 + 1];
 
-            // Set bits [start, start + length] (inclusive) within this container
-            for (uint32_t v = start; v <= static_cast<uint32_t>(start) + length; ++v) {
+            // Set bits [start, start + length] (inclusive) within this container.
+            // Clamp end to 0xFFFF so a malformed run (start + length > 65535)
+            // can never leak bits into a neighbouring container.
+            uint32_t end = static_cast<uint32_t>(start) + length;
+            if (end > 0xFFFFu) end = 0xFFFFu;
+            for (uint32_t v = start; v <= end; ++v) {
                 uint32_t abs_bit = (static_cast<uint32_t>(key) << 16) | v;
                 uint32_t word_idx = abs_bit / 32u;
                 uint32_t bit_pos  = abs_bit % 32u;

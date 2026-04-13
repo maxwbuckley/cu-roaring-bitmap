@@ -352,7 +352,12 @@ __global__ void expand_to_bitmap_kernel(
         for (uint32_t r = threadIdx.x; r < w.cardinality; r += blockDim.x) {
             uint16_t start = runs[r * 2];
             uint16_t length = runs[r * 2 + 1];
-            for (uint32_t v = start; v <= static_cast<uint32_t>(start) + length; ++v) {
+            // Clamp end to 0xFFFF: writes must stay inside the 1024-word
+            // per-container bitmap (`out`), so a malformed run that claims
+            // start + length > 65535 must not escape this container.
+            uint32_t end = static_cast<uint32_t>(start) + length;
+            if (end > 0xFFFFu) end = 0xFFFFu;
+            for (uint32_t v = start; v <= end; ++v) {
                 uint32_t word_idx = v / 64u;
                 uint64_t bit_mask = 1ULL << (v % 64u);
                 atomicOr(reinterpret_cast<unsigned long long*>(&out[word_idx]),
@@ -1204,6 +1209,8 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
 __global__ void fused_multi_and_kernel(
     const uint64_t* const* bitmap_ptrs,  // [n_common_keys][n_inputs]
     uint64_t* output,                     // [n_common_keys * 1024]
+    uint16_t* out_cardinalities,          // [n_common_keys]
+    uint32_t* out_total,                  // [1], atomicAdd target, may be null
     uint32_t n_inputs,
     uint32_t n_common_keys,
     uint32_t negation_mask)
@@ -1214,6 +1221,7 @@ __global__ void fused_multi_and_kernel(
     const uint64_t* const* ptrs = bitmap_ptrs + key_idx * n_inputs;
     uint64_t* dst = output + static_cast<size_t>(key_idx) * 1024;
 
+    uint32_t local_pop = 0;
     for (uint32_t w = threadIdx.x; w < 1024u; w += blockDim.x) {
         uint64_t val = ~0ULL;  // identity for AND
         for (uint32_t i = 0; i < n_inputs; ++i) {
@@ -1222,6 +1230,32 @@ __global__ void fused_multi_and_kernel(
             val &= word;
         }
         dst[w] = val;
+        local_pop += __popcll(val);
+    }
+
+    // Block-wide reduction of local_pop → single value at thread 0.
+    // 256 threads / 32 lanes = 8 warps.
+    for (int off = 16; off > 0; off >>= 1) {
+        local_pop += __shfl_xor_sync(0xffffffffu, local_pop, off);
+    }
+    __shared__ uint32_t warp_sums[8];
+    uint32_t lane = threadIdx.x & 31u;
+    uint32_t warp = threadIdx.x >> 5;
+    if (lane == 0) warp_sums[warp] = local_pop;
+    __syncthreads();
+    if (warp == 0) {
+        uint32_t v = (lane < 8) ? warp_sums[lane] : 0u;
+        for (int off = 4; off > 0; off >>= 1) {
+            v += __shfl_xor_sync(0xffffffffu, v, off);
+        }
+        if (lane == 0) {
+            // A full container (65536 bits) can't be stored as uint16_t;
+            // clamp to 0xFFFF. In practice the intersection of N inputs
+            // is rarely fully dense, so this is defensive.
+            uint32_t clamped = v > 65535u ? 65535u : v;
+            out_cardinalities[key_idx] = static_cast<uint16_t>(clamped);
+            if (out_total) atomicAdd(out_total, v);
+        }
     }
 }
 
@@ -1347,20 +1381,27 @@ static GpuRoaring fused_multi_and_allbitmap(const GpuRoaring* bitmaps,
                                h_ptrs.size() * sizeof(const uint64_t*),
                                cudaMemcpyHostToDevice, stream));
 
-    // 5. Allocate output and launch fused kernel
+    // 5. Allocate output and launch fused kernel.
+    //    The kernel writes bitmap data AND populates cardinalities +
+    //    a single total_cardinality counter via atomicAdd, so we avoid
+    //    a second popcount pass.
     CUDA_CHECK(cudaMallocAsync(&result.bitmap_data,
                           static_cast<size_t>(n_common) * 1024 * sizeof(uint64_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.cardinalities, n_common * sizeof(uint16_t), stream));
+
+    uint32_t* d_total = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&d_total, sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(d_total, 0, sizeof(uint32_t), stream));
 
     fused_multi_and_kernel<<<n_common, 256, 0, stream>>>(
-        d_ptrs, result.bitmap_data, count, n_common, neg_mask);
+        d_ptrs, result.bitmap_data, result.cardinalities, d_total,
+        count, n_common, neg_mask);
 
     CUDA_CHECK(cudaFreeAsync(d_ptrs, stream));
     if (d_sentinel) CUDA_CHECK(cudaFreeAsync(d_sentinel, stream));
 
-    // 5. Build metadata
-    std::vector<uint16_t> h_cards(n_common);
-    // Cardinality needs to be computed from the output — skip for now,
-    // set to 0 (unknown). The bitmap data is correct regardless.
+    // 6. Build remaining metadata (types, offsets, keys, key_index).
+    //    Cardinalities are already written by the fused kernel above.
     std::vector<ContainerType> h_types(n_common, ContainerType::BITMAP);
     std::vector<uint32_t> h_offsets(n_common);
     for (uint32_t i = 0; i < n_common; ++i) {
@@ -1370,7 +1411,6 @@ static GpuRoaring fused_multi_and_allbitmap(const GpuRoaring* bitmaps,
     CUDA_CHECK(cudaMallocAsync(&result.keys, n_common * sizeof(uint16_t), stream));
     CUDA_CHECK(cudaMallocAsync(&result.types, n_common * sizeof(ContainerType), stream));
     CUDA_CHECK(cudaMallocAsync(&result.offsets, n_common * sizeof(uint32_t), stream));
-    CUDA_CHECK(cudaMallocAsync(&result.cardinalities, n_common * sizeof(uint16_t), stream));
 
     CUDA_CHECK(cudaMemcpyAsync(result.keys, common_keys.data(),
                                n_common * sizeof(uint16_t),
@@ -1381,9 +1421,11 @@ static GpuRoaring fused_multi_and_allbitmap(const GpuRoaring* bitmaps,
     CUDA_CHECK(cudaMemcpyAsync(result.offsets, h_offsets.data(),
                                n_common * sizeof(uint32_t),
                                cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(result.cardinalities, h_cards.data(),
-                               n_common * sizeof(uint16_t),
-                               cudaMemcpyHostToDevice, stream));
+
+    // Copy the fused-kernel total back into the result struct.
+    uint32_t h_total = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&h_total, d_total, sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
 
     // Build key_index
     result.max_key = common_keys.back();
@@ -1397,7 +1439,9 @@ static GpuRoaring fused_multi_and_allbitmap(const GpuRoaring* bitmaps,
                                (result.max_key + 1) * sizeof(uint16_t),
                                cudaMemcpyHostToDevice, stream));
 
+    CUDA_CHECK(cudaFreeAsync(d_total, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    result.total_cardinality = h_total;
     return result;
 }
 

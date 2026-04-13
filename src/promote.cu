@@ -142,8 +142,11 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
             for (uint32_t r = 0; r < h_cards[i]; ++r) {
                 uint16_t start = h_run_data[src_idx + r * 2];
                 uint16_t len   = h_run_data[src_idx + r * 2 + 1];
-                for (uint32_t v = start;
-                     v <= static_cast<uint32_t>(start) + len; ++v) {
+                // Clamp end to 0xFFFF so a malformed run can't overrun
+                // this container's 1024-word bitmap buffer.
+                uint32_t end = static_cast<uint32_t>(start) + len;
+                if (end > 0xFFFFu) end = 0xFFFFu;
+                for (uint32_t v = start; v <= end; ++v) {
                     dst[v / 64] |= 1ULL << (v % 64);
                 }
             }
