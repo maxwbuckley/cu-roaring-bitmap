@@ -1,159 +1,110 @@
 #include "cu_roaring/detail/promote.cuh"
 #include "cu_roaring/detail/utils.cuh"
 
-#include <cstring>
-#include <vector>
-
 namespace cu_roaring {
+
+// ============================================================================
+// Device-side promotion kernels
+// ============================================================================
+//
+// One block per source container. Each block reads its own metadata
+// (type, offset, cardinality) directly from device memory, then either copies
+// (BITMAP), scatters (ARRAY), or expands runs (RUN) into the destination
+// bitmap pool at slot `cid * 1024`. This replaces the old D2H → CPU rebuild
+// → H2D round-trip, which at 100M+ scale could move many megabytes of data
+// across PCIe for a purely structural transform.
+
+__global__ void promote_to_bitmap_kernel(
+    const ContainerType* src_types,
+    const uint32_t* src_offsets,
+    const uint16_t* src_cards,
+    const uint64_t* src_bitmap_pool,
+    const uint16_t* src_array_pool,
+    const uint16_t* src_run_pool,
+    uint64_t* dst_bitmap_pool,
+    ContainerType* dst_types,
+    uint32_t* dst_offsets,
+    uint32_t n)
+{
+    uint32_t cid = blockIdx.x;
+    if (cid >= n) return;
+
+    uint64_t* dst = dst_bitmap_pool + static_cast<size_t>(cid) * 1024;
+    ContainerType type = src_types[cid];
+
+    if (type == ContainerType::BITMAP) {
+        // Straight copy of 1024 words.
+        const uint64_t* src =
+            src_bitmap_pool + (src_offsets[cid] / sizeof(uint64_t));
+        for (uint32_t w = threadIdx.x; w < 1024u; w += blockDim.x) {
+            dst[w] = src[w];
+        }
+    } else {
+        // ARRAY or RUN: zero the destination first, then scatter/expand.
+        for (uint32_t w = threadIdx.x; w < 1024u; w += blockDim.x) {
+            dst[w] = 0ULL;
+        }
+        __syncthreads();
+
+        uint16_t card = src_cards[cid];
+
+        if (type == ContainerType::ARRAY) {
+            const uint16_t* arr =
+                src_array_pool + (src_offsets[cid] / sizeof(uint16_t));
+            for (uint32_t i = threadIdx.x; i < card; i += blockDim.x) {
+                uint16_t val = arr[i];
+                uint32_t word_idx = val / 64u;
+                uint64_t bit_mask = 1ULL << (val % 64u);
+                atomicOr(reinterpret_cast<unsigned long long*>(&dst[word_idx]),
+                         static_cast<unsigned long long>(bit_mask));
+            }
+        } else {  // RUN
+            const uint16_t* runs =
+                src_run_pool + (src_offsets[cid] / sizeof(uint16_t));
+            for (uint32_t r = threadIdx.x; r < card; r += blockDim.x) {
+                uint16_t start = runs[r * 2];
+                uint16_t length = runs[r * 2 + 1];
+                uint32_t end = static_cast<uint32_t>(start) + length;
+                if (end > 0xFFFFu) end = 0xFFFFu;
+                for (uint32_t v = start; v <= end; ++v) {
+                    uint32_t word_idx = v / 64u;
+                    uint64_t bit_mask = 1ULL << (v % 64u);
+                    atomicOr(
+                        reinterpret_cast<unsigned long long*>(&dst[word_idx]),
+                        static_cast<unsigned long long>(bit_mask));
+                }
+            }
+        }
+    }
+
+    // Emit the output metadata for this container (one thread per block).
+    if (threadIdx.x == 0) {
+        dst_types[cid]   = ContainerType::BITMAP;
+        dst_offsets[cid] = static_cast<uint32_t>(
+            static_cast<size_t>(cid) * 1024 * sizeof(uint64_t));
+    }
+}
+
+// Build key_index[k] = i where keys[i] == k; cells with no matching
+// container are already set to 0xFFFF by the preceding cudaMemsetAsync(0xFF).
+__global__ void build_key_index_kernel(const uint16_t* keys,
+                                       uint32_t n,
+                                       uint16_t* key_index)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    key_index[keys[i]] = static_cast<uint16_t>(i);
+}
+
+// ============================================================================
+// promote_to_bitmap — fully device-resident
+// ============================================================================
 
 GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
 {
     const uint32_t n = bm.n_containers;
     if (n == 0) return GpuRoaring{};
 
-    // If already all-bitmap, just copy the structure (shallow — shares data)
-    if (bm.n_array_containers == 0 && bm.n_run_containers == 0) {
-        // Need a deep copy since caller may free the original
-        GpuRoaring result{};
-        result.n_containers        = n;
-        result.n_bitmap_containers = n;
-        result.n_array_containers  = 0;
-        result.n_run_containers    = 0;
-        result.universe_size       = bm.universe_size;
-        result.total_cardinality   = bm.total_cardinality;
-        result.negated             = bm.negated;
-
-        CUDA_CHECK(cudaMalloc(&result.keys, n * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc(&result.types, n * sizeof(ContainerType)));
-        CUDA_CHECK(cudaMalloc(&result.offsets, n * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&result.cardinalities, n * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc(&result.bitmap_data, n * 1024 * sizeof(uint64_t)));
-
-        CUDA_CHECK(cudaMemcpyAsync(result.keys, bm.keys,
-                                   n * sizeof(uint16_t),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(result.types, bm.types,
-                                   n * sizeof(ContainerType),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(result.offsets, bm.offsets,
-                                   n * sizeof(uint32_t),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(result.cardinalities, bm.cardinalities,
-                                   n * sizeof(uint16_t),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(result.bitmap_data, bm.bitmap_data,
-                                   n * 1024 * sizeof(uint64_t),
-                                   cudaMemcpyDeviceToDevice, stream));
-        // Copy key_index
-        if (bm.key_index) {
-            result.max_key = bm.max_key;
-            size_t idx_bytes = (static_cast<size_t>(bm.max_key) + 1) * sizeof(uint16_t);
-            CUDA_CHECK(cudaMalloc(&result.key_index, idx_bytes));
-            CUDA_CHECK(cudaMemcpyAsync(result.key_index, bm.key_index,
-                                       idx_bytes, cudaMemcpyDeviceToDevice, stream));
-        }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        return result;
-    }
-
-    // Download metadata from device
-    std::vector<uint16_t> h_keys(n);
-    std::vector<ContainerType> h_types(n);
-    std::vector<uint32_t> h_offsets(n);
-    std::vector<uint16_t> h_cards(n);
-
-    CUDA_CHECK(cudaMemcpyAsync(h_keys.data(), bm.keys,
-                               n * sizeof(uint16_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(h_types.data(), bm.types,
-                               n * sizeof(ContainerType),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(h_offsets.data(), bm.offsets,
-                               n * sizeof(uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(h_cards.data(), bm.cardinalities,
-                               n * sizeof(uint16_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // Download data pools
-    std::vector<uint64_t> h_bitmap_data;
-    if (bm.n_bitmap_containers > 0 && bm.bitmap_data) {
-        h_bitmap_data.resize(
-            static_cast<size_t>(bm.n_bitmap_containers) * 1024);
-        CUDA_CHECK(cudaMemcpyAsync(
-            h_bitmap_data.data(), bm.bitmap_data,
-            h_bitmap_data.size() * sizeof(uint64_t),
-            cudaMemcpyDeviceToHost, stream));
-    }
-
-    // Compute total array elements for download
-    uint32_t total_array_elems = 0;
-    uint32_t total_run_pairs   = 0;
-    for (uint32_t i = 0; i < n; ++i) {
-        if (h_types[i] == ContainerType::ARRAY)
-            total_array_elems += h_cards[i];
-        else if (h_types[i] == ContainerType::RUN)
-            total_run_pairs += h_cards[i];
-    }
-
-    std::vector<uint16_t> h_array_data;
-    if (total_array_elems > 0 && bm.array_data) {
-        h_array_data.resize(total_array_elems);
-        CUDA_CHECK(cudaMemcpyAsync(
-            h_array_data.data(), bm.array_data,
-            total_array_elems * sizeof(uint16_t),
-            cudaMemcpyDeviceToHost, stream));
-    }
-
-    std::vector<uint16_t> h_run_data;
-    if (total_run_pairs > 0 && bm.run_data) {
-        h_run_data.resize(static_cast<size_t>(total_run_pairs) * 2);
-        CUDA_CHECK(cudaMemcpyAsync(
-            h_run_data.data(), bm.run_data,
-            h_run_data.size() * sizeof(uint16_t),
-            cudaMemcpyDeviceToHost, stream));
-    }
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // Build all-bitmap pool: every container becomes 1024 uint64_t words
-    std::vector<uint64_t> all_bitmap(static_cast<size_t>(n) * 1024, 0);
-    std::vector<uint32_t> new_offsets(n);
-    std::vector<ContainerType> new_types(n, ContainerType::BITMAP);
-
-    for (uint32_t i = 0; i < n; ++i) {
-        uint64_t* dst = all_bitmap.data() + static_cast<size_t>(i) * 1024;
-        new_offsets[i] = static_cast<uint32_t>(
-            static_cast<size_t>(i) * 1024 * sizeof(uint64_t));
-
-        if (h_types[i] == ContainerType::BITMAP) {
-            uint32_t src_idx = h_offsets[i] / sizeof(uint64_t);
-            std::memcpy(dst, h_bitmap_data.data() + src_idx,
-                        1024 * sizeof(uint64_t));
-        } else if (h_types[i] == ContainerType::ARRAY) {
-            uint32_t src_idx = h_offsets[i] / sizeof(uint16_t);
-            for (uint32_t j = 0; j < h_cards[i]; ++j) {
-                uint16_t val = h_array_data[src_idx + j];
-                dst[val / 64] |= 1ULL << (val % 64);
-            }
-        } else if (h_types[i] == ContainerType::RUN) {
-            uint32_t src_idx = h_offsets[i] / sizeof(uint16_t);
-            for (uint32_t r = 0; r < h_cards[i]; ++r) {
-                uint16_t start = h_run_data[src_idx + r * 2];
-                uint16_t len   = h_run_data[src_idx + r * 2 + 1];
-                // Clamp end to 0xFFFF so a malformed run can't overrun
-                // this container's 1024-word bitmap buffer.
-                uint32_t end = static_cast<uint32_t>(start) + len;
-                if (end > 0xFFFFu) end = 0xFFFFu;
-                for (uint32_t v = start; v <= end; ++v) {
-                    dst[v / 64] |= 1ULL << (v % 64);
-                }
-            }
-        }
-    }
-
-    // Upload the new all-bitmap structure
     GpuRoaring result{};
     result.n_containers        = n;
     result.n_bitmap_containers = n;
@@ -163,41 +114,65 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
     result.total_cardinality   = bm.total_cardinality;
     result.negated             = bm.negated;
 
-    CUDA_CHECK(cudaMalloc(&result.keys, n * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&result.types, n * sizeof(ContainerType)));
-    CUDA_CHECK(cudaMalloc(&result.offsets, n * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&result.cardinalities, n * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&result.bitmap_data,
-                          static_cast<size_t>(n) * 1024 * sizeof(uint64_t)));
+    const size_t bitmap_pool_bytes =
+        static_cast<size_t>(n) * 1024 * sizeof(uint64_t);
 
-    CUDA_CHECK(cudaMemcpyAsync(result.keys, h_keys.data(),
-                               n * sizeof(uint16_t),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(result.types, new_types.data(),
-                               n * sizeof(ContainerType),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(result.offsets, new_offsets.data(),
-                               n * sizeof(uint32_t),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(result.cardinalities, h_cards.data(),
-                               n * sizeof(uint16_t),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(result.bitmap_data, all_bitmap.data(),
-                               static_cast<size_t>(n) * 1024 * sizeof(uint64_t),
-                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMallocAsync(&result.keys,          n * sizeof(uint16_t),       stream));
+    CUDA_CHECK(cudaMallocAsync(&result.types,         n * sizeof(ContainerType),  stream));
+    CUDA_CHECK(cudaMallocAsync(&result.offsets,       n * sizeof(uint32_t),       stream));
+    CUDA_CHECK(cudaMallocAsync(&result.cardinalities, n * sizeof(uint16_t),       stream));
+    CUDA_CHECK(cudaMallocAsync(&result.bitmap_data,   bitmap_pool_bytes,          stream));
 
-    // Build key_index (we have h_keys on host already)
+    // keys and cardinalities are unchanged by promotion — D2D copy.
+    CUDA_CHECK(cudaMemcpyAsync(result.keys, bm.keys,
+                               n * sizeof(uint16_t),
+                               cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(result.cardinalities, bm.cardinalities,
+                               n * sizeof(uint16_t),
+                               cudaMemcpyDeviceToDevice, stream));
+
+    if (bm.n_array_containers == 0 && bm.n_run_containers == 0) {
+        // Already all-bitmap: the only work is a D2D copy of the bitmap pool
+        // and filling types/offsets with the trivial sequence. Use the
+        // promotion kernel anyway — its BITMAP branch is a plain copy, and
+        // it writes the contiguous types/offsets for us.
+    }
+
+    // Launch one block per container. The kernel self-dispatches on
+    // source container type.
     if (n > 0) {
-        result.max_key = h_keys[n - 1];
-        std::vector<uint16_t> h_key_index(result.max_key + 1, 0xFFFF);
-        for (uint32_t i = 0; i < n; ++i) {
-            h_key_index[h_keys[i]] = static_cast<uint16_t>(i);
+        promote_to_bitmap_kernel<<<n, 256, 0, stream>>>(
+            bm.types,
+            bm.offsets,
+            bm.cardinalities,
+            bm.bitmap_data,
+            bm.array_data,
+            bm.run_data,
+            result.bitmap_data,
+            result.types,
+            result.offsets,
+            n);
+    }
+
+    // Build key_index on device. The width is determined by universe_size,
+    // not by reading max_key back to the host.
+    if (bm.universe_size > 0) {
+        // max_key for a universe of size U is (U - 1) >> 16. Clamp to uint16.
+        uint32_t max_key32 =
+            (bm.universe_size == 0) ? 0u : ((bm.universe_size - 1u) >> 16);
+        if (max_key32 > 0xFFFFu) max_key32 = 0xFFFFu;
+        result.max_key = static_cast<uint16_t>(max_key32);
+        size_t idx_bytes =
+            (static_cast<size_t>(result.max_key) + 1u) * sizeof(uint16_t);
+
+        CUDA_CHECK(cudaMallocAsync(&result.key_index, idx_bytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(result.key_index, 0xFF, idx_bytes, stream));
+        uint32_t block = 256;
+        uint32_t grid  = (n + block - 1) / block;
+        if (grid > 0) {
+            build_key_index_kernel<<<grid, block, 0, stream>>>(
+                result.keys, n, result.key_index);
         }
-        CUDA_CHECK(cudaMalloc(&result.key_index,
-                              (result.max_key + 1) * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMemcpyAsync(result.key_index, h_key_index.data(),
-                                   (result.max_key + 1) * sizeof(uint16_t),
-                                   cudaMemcpyHostToDevice, stream));
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -222,10 +197,6 @@ uint32_t resolve_auto_threshold(uint32_t universe_size, int device_id)
     // containers are fast enough and the memory savings (2*card bytes vs
     // 8 KB per container) are worthwhile — a 1M/0.1% bitmap uses 2 KB
     // compressed vs 128 KB if promoted.
-    //
-    // The threshold of 64 containers (~4M universe) is conservative:
-    //   <= 64 containers: 6-step key search, array overhead tolerable
-    //   > 64 containers:  7+ step key search, array overhead dominates
     //
     // Users who want minimum memory at any scale: pass PROMOTE_NONE.
     // Users who want maximum speed at any scale: pass PROMOTE_ALL.

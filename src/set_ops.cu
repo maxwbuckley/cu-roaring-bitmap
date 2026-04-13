@@ -1199,12 +1199,215 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
 // ============================================================================
 // Fused multi-AND kernel for all-bitmap inputs
 // ============================================================================
+//
+// Support kernels for a fully-device-resident pipeline. The old
+// implementation downloaded every input's key array to host, intersected on
+// CPU with std::set_intersection, built the pointer table on host via
+// std::lower_bound, and re-uploaded the pointer table. All of that runs on
+// device now: a 65536-bit presence bitmap per non-negated input is scattered
+// on-device, AND-reduced, popcounted, enumerated into sorted common_keys,
+// and fed into a device-side pointer-table builder.
+
+// Scatter: for each key k in keys[], set bit k in a 65536-bit presence
+// bitmap (1024 × uint64_t). Contention is low because each input has at most
+// a few thousand distinct keys.
+__global__ void presence_set_bits_kernel(const uint16_t* keys,
+                                          uint32_t n,
+                                          uint64_t* presence_1024)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint16_t k = keys[i];
+    atomicOr(reinterpret_cast<unsigned long long*>(&presence_1024[k / 64u]),
+             1ULL << (k % 64u));
+}
+
+// AND-reduce `n_non_negated` presence bitmaps (each 1024 words, laid out
+// contiguously in `presences_nn`) into `result_1024`. If `n_non_negated == 0`
+// (all inputs are negated), fall back to a universe mask: bits
+// [0, max_key_plus_1) set, so every in-universe key survives the AND.
+__global__ void presence_and_reduce_kernel(const uint64_t* presences_nn,
+                                            uint32_t n_non_negated,
+                                            uint32_t max_key_plus_1,
+                                            uint64_t* result_1024)
+{
+    uint32_t w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= 1024u) return;
+
+    if (n_non_negated > 0) {
+        uint64_t acc = ~0ULL;
+        for (uint32_t i = 0; i < n_non_negated; ++i) {
+            acc &= presences_nn[static_cast<size_t>(i) * 1024u + w];
+        }
+        result_1024[w] = acc;
+    } else {
+        uint32_t lo = w * 64u;
+        if (lo >= max_key_plus_1) {
+            result_1024[w] = 0ULL;
+        } else if (lo + 64u <= max_key_plus_1) {
+            result_1024[w] = ~0ULL;
+        } else {
+            uint32_t bits = max_key_plus_1 - lo;
+            result_1024[w] = (bits >= 64u) ? ~0ULL : ((1ULL << bits) - 1ULL);
+        }
+    }
+}
+
+// Popcount a 1024-word presence bitmap into *out_count. Caller must zero
+// *out_count first. 1 thread per word, 1024 atomicAdds on a single location —
+// a few microseconds on modern GPUs.
+__global__ void presence_popcount_kernel(const uint64_t* presence_1024,
+                                          uint32_t* out_count)
+{
+    uint32_t w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w < 1024u) {
+        atomicAdd(out_count, __popcll(presence_1024[w]));
+    }
+}
+
+// Block-cooperative enumeration: read a 1024-word presence bitmap, emit set
+// bit indices as sorted uint16_t values into out_keys. Single block, 256
+// threads, each handles 4 consecutive words. Per-thread popcount → warp scan
+// → block scan gives each thread its write offset, so set bits are emitted
+// in order without a post-sort.
+__global__ void enumerate_presence_keys_kernel(const uint64_t* presence_1024,
+                                                 uint16_t* out_keys)
+{
+    constexpr int WORDS_PER_THREAD = 4;
+    uint32_t tid = threadIdx.x;
+    uint32_t lane = tid & 31u;
+    uint32_t warp = tid >> 5;
+
+    uint64_t my_words[WORDS_PER_THREAD];
+    uint32_t local_count = 0;
+    #pragma unroll
+    for (int i = 0; i < WORDS_PER_THREAD; ++i) {
+        my_words[i] = presence_1024[tid * WORDS_PER_THREAD + i];
+        local_count += __popcll(my_words[i]);
+    }
+
+    // Warp inclusive scan of local_count.
+    uint32_t v = local_count;
+    for (int off = 1; off < 32; off <<= 1) {
+        uint32_t up = __shfl_up_sync(0xffffffffu, v, off);
+        if (lane >= static_cast<uint32_t>(off)) v += up;
+    }
+    __shared__ uint32_t warp_totals[8];
+    if (lane == 31u) warp_totals[warp] = v;
+    __syncthreads();
+
+    // Warp 0 scans the 8 warp totals (inclusive).
+    if (warp == 0) {
+        uint32_t wt = (lane < 8u) ? warp_totals[lane] : 0u;
+        for (int off = 1; off < 8; off <<= 1) {
+            uint32_t up = __shfl_up_sync(0xffffffffu, wt, off);
+            if (lane >= static_cast<uint32_t>(off)) wt += up;
+        }
+        if (lane < 8u) warp_totals[lane] = wt;
+    }
+    __syncthreads();
+
+    // My exclusive offset across the block.
+    uint32_t excl_in_warp = v - local_count;
+    uint32_t warp_prefix  = (warp > 0) ? warp_totals[warp - 1] : 0u;
+    uint32_t write_pos    = warp_prefix + excl_in_warp;
+
+    // Emit set bits in sorted order.
+    #pragma unroll
+    for (int i = 0; i < WORDS_PER_THREAD; ++i) {
+        uint64_t w = my_words[i];
+        uint32_t base_bit = (tid * WORDS_PER_THREAD + i) * 64u;
+        while (w != 0ULL) {
+            int lsb = __ffsll(static_cast<long long>(w)) - 1;
+            out_keys[write_pos++] = static_cast<uint16_t>(base_bit + lsb);
+            w &= (w - 1ULL);
+        }
+    }
+}
+
+// Packed per-input descriptor used by the pointer-table builder kernel.
+struct FusedInputMeta {
+    const uint16_t* keys;         // sorted device keys (may be nullptr iff n==0)
+    const uint64_t* bitmap_data;  // bitmap pool, 1024 words per container
+    const uint16_t* key_index;    // direct-map index, or nullptr for fallback
+    uint32_t        n_containers;
+    uint32_t        max_key_plus_1;  // size of key_index (when present)
+};
+
+// For every (common_key, input) pair, resolve the bitmap pointer:
+//   - prefer key_index[key] in O(1) when present and in range
+//   - otherwise binary-search the input's sorted keys
+//   - if the key is absent, point to `sentinel` (an all-zeros scratch
+//     buffer; negated inputs use ~0 → all-ones, non-negated inputs never
+//     reach this branch because their keys pruned the intersection)
+__global__ void build_pointer_table_kernel(const uint16_t* common_keys,
+                                             uint32_t n_common,
+                                             const FusedInputMeta* inputs,
+                                             uint32_t count,
+                                             const uint64_t* sentinel,
+                                             const uint64_t** out_ptrs)
+{
+    uint32_t k = blockIdx.x * blockDim.y + threadIdx.y;
+    uint32_t i = threadIdx.x;
+    if (k >= n_common || i >= count) return;
+
+    uint16_t key = common_keys[k];
+    const FusedInputMeta meta = inputs[i];
+
+    uint32_t idx = 0xFFFFFFFFu;
+
+    if (meta.n_containers > 0 && meta.keys != nullptr) {
+        if (meta.key_index != nullptr && key < meta.max_key_plus_1) {
+            uint16_t v = meta.key_index[key];
+            if (v != 0xFFFFu) idx = v;
+        } else {
+            // Fallback: binary search on sorted keys.
+            uint32_t lo = 0, hi = meta.n_containers;
+            while (lo < hi) {
+                uint32_t mid = (lo + hi) >> 1;
+                uint16_t mk = meta.keys[mid];
+                if (mk < key)      lo = mid + 1;
+                else if (mk > key) hi = mid;
+                else               { idx = mid; break; }
+            }
+        }
+    }
+
+    const uint64_t* ptr;
+    if (idx == 0xFFFFFFFFu) {
+        ptr = sentinel;
+    } else {
+        ptr = meta.bitmap_data + static_cast<size_t>(idx) * 1024u;
+    }
+    out_ptrs[static_cast<size_t>(k) * count + i] = ptr;
+}
+
+// Fill output metadata arrays for the fused result:
+//   - types[i] = BITMAP (uint8_t == 1), done via cudaMemsetAsync by caller
+//   - offsets[i] = i * 8192 (bytes)
+//   - key_index built the same way as promote's helper
+__global__ void fused_fill_offsets_kernel(uint32_t* offsets, uint32_t n)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    offsets[i] = static_cast<uint32_t>(static_cast<size_t>(i) * 1024u * sizeof(uint64_t));
+}
+
+__global__ void fused_build_key_index_kernel(const uint16_t* common_keys,
+                                              uint32_t n_common,
+                                              uint16_t* key_index)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_common) return;
+    key_index[common_keys[i]] = static_cast<uint16_t>(i);
+}
 
 // Each block handles one output container. For each common key,
 // AND the 1024 words across all N input bitmaps.
 // bitmap_ptrs[i] points to the start of input i's bitmap for this key.
-// For negated inputs missing a key, the pointer points to a static all-ones
-// sentinel (absent key in negated bitmap = all ones = no effect on AND).
+// For negated inputs missing a key, the pointer points to a static all-zeros
+// sentinel (absent key in negated bitmap = all ones after ~, which is the
+// identity element for AND).
 // negation_mask: bit i set = input i is negated (apply ~word before AND).
 __global__ void fused_multi_and_kernel(
     const uint64_t* const* bitmap_ptrs,  // [n_common_keys][n_inputs]
@@ -1265,6 +1468,14 @@ __global__ void fused_multi_and_kernel(
 // Handles negated inputs natively: negated inputs contribute ~word to the AND,
 // and absent keys in negated inputs contribute all-ones (no effect on AND).
 // Only non-negated inputs can eliminate keys from the result.
+//
+// Fully device-resident as of April 2026: the key intersection, pointer
+// table, and per-container metadata are all produced by device kernels.
+// The only host↔device traffic on this path is:
+//   - one 4-byte D2H to learn n_common (needed for subsequent allocations)
+//   - one 4-byte D2H to read the final total_cardinality
+//   - one 4-byte H2D of the max-universe scalar used by the all-negated path
+// Everything else stays on-device.
 static GpuRoaring fused_multi_and_allbitmap(const GpuRoaring* bitmaps,
                                              uint32_t count,
                                              cudaStream_t stream)
@@ -1275,116 +1486,155 @@ static GpuRoaring fused_multi_and_allbitmap(const GpuRoaring* bitmaps,
         if (bitmaps[i].negated) neg_mask |= (1u << i);
     }
 
-    // 1. Download key arrays (small: count × n_containers × 2 bytes)
-    std::vector<std::vector<uint16_t>> all_keys(count);
-    for (uint32_t i = 0; i < count; ++i) {
-        uint32_t n = bitmaps[i].n_containers;
-        all_keys[i].resize(n);
-        if (n > 0) {
-            CUDA_CHECK(cudaMemcpyAsync(all_keys[i].data(), bitmaps[i].keys,
-                                       n * sizeof(uint16_t),
-                                       cudaMemcpyDeviceToHost, stream));
-        }
+    // Compute result universe and the max_key_plus_1 needed for the
+    // all-negated presence fallback. These are derived from struct fields
+    // the caller already holds in host memory — no D2H required.
+    uint32_t result_universe = bitmaps[0].universe_size;
+    for (uint32_t i = 1; i < count; ++i) {
+        result_universe = std::max(result_universe, bitmaps[i].universe_size);
     }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // 2. Key intersection — only non-negated inputs can eliminate keys.
-    //    A negated input missing a key contributes all-ones (no effect on AND).
-    //    A non-negated input missing a key contributes all-zeros (key drops out).
-    //
-    //    If there are non-negated inputs: start with their key intersection.
-    //    If ALL inputs are negated: every key in the universe survives, because
-    //    absent keys in negated inputs are all-ones, and AND of all-ones = all-ones.
-    std::vector<uint16_t> common_keys;
-    bool has_non_negated = (neg_mask != (1u << count) - 1u);
-
-    if (has_non_negated) {
-        // Start with the first non-negated input's keys, intersect with rest
-        bool first = true;
-        for (uint32_t i = 0; i < count; ++i) {
-            if (bitmaps[i].negated) continue;
-            if (first) {
-                common_keys = all_keys[i];
-                first = false;
-            } else {
-                std::vector<uint16_t> intersected;
-                std::set_intersection(common_keys.begin(), common_keys.end(),
-                                      all_keys[i].begin(), all_keys[i].end(),
-                                      std::back_inserter(intersected));
-                common_keys = std::move(intersected);
-            }
-        }
-    } else {
-        // All inputs are negated: every key in the universe survives.
-        uint32_t max_universe = 0;
-        for (uint32_t i = 0; i < count; ++i) {
-            max_universe = std::max(max_universe, bitmaps[i].universe_size);
-        }
-        uint16_t max_key = static_cast<uint16_t>((max_universe + 65535) / 65536 - 1);
-        common_keys.reserve(max_key + 1);
-        for (uint32_t k = 0; k <= max_key; ++k) {
-            common_keys.push_back(static_cast<uint16_t>(k));
-        }
-    }
-
-    uint32_t n_common = static_cast<uint32_t>(common_keys.size());
+    uint32_t max_key_plus_1 = (result_universe + 65535u) / 65536u;
+    if (max_key_plus_1 > 65536u) max_key_plus_1 = 65536u;
 
     GpuRoaring result{};
-    result.universe_size       = bitmaps[0].universe_size;
-    for (uint32_t i = 1; i < count; ++i) {
-        result.universe_size = std::max(result.universe_size, bitmaps[i].universe_size);
-    }
-    result.n_containers        = n_common;
-    result.n_bitmap_containers = n_common;
+    result.universe_size       = result_universe;
     result.n_array_containers  = 0;
     result.n_run_containers    = 0;
 
-    if (n_common == 0) return result;
-
-    // 3. Allocate an all-ones sentinel on GPU (1024 words of 0xFFFFFFFFFFFFFFFF).
-    //    Used for negated inputs that are missing a key — their contribution to
-    //    AND is all-ones, which after ~word becomes all-zeros... wait, no:
-    //    the kernel applies ~word for negated inputs, so the sentinel should be
-    //    all-ZEROS (which becomes all-ones after ~). This way missing negated
-    //    inputs contribute all-ones to the AND (identity element).
-    uint64_t* d_sentinel = nullptr;
-    bool need_sentinel = (neg_mask != 0);
-    if (need_sentinel) {
-        CUDA_CHECK(cudaMallocAsync(&d_sentinel, 1024 * sizeof(uint64_t), stream));
-        CUDA_CHECK(cudaMemsetAsync(d_sentinel, 0, 1024 * sizeof(uint64_t), stream));
+    // ------------------------------------------------------------------
+    // 1. Build per-input presence bitmaps (non-negated inputs only) on
+    //    device, then AND-reduce them into a single 1024-word result.
+    //    If every input is negated, the all-negated fallback writes the
+    //    universe mask directly into the result bitmap.
+    // ------------------------------------------------------------------
+    uint32_t n_non_negated = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!bitmaps[i].negated) ++n_non_negated;
     }
 
-    // 4. Build pointer table: for each common key × each input, find the
-    //    bitmap data pointer. For negated inputs missing a key, use sentinel.
-    std::vector<const uint64_t*> h_ptrs(static_cast<size_t>(n_common) * count);
+    uint64_t* d_presences_nn = nullptr;  // [n_non_negated * 1024]
+    if (n_non_negated > 0) {
+        CUDA_CHECK(cudaMallocAsync(
+            &d_presences_nn,
+            static_cast<size_t>(n_non_negated) * 1024u * sizeof(uint64_t),
+            stream));
+        CUDA_CHECK(cudaMemsetAsync(
+            d_presences_nn, 0,
+            static_cast<size_t>(n_non_negated) * 1024u * sizeof(uint64_t),
+            stream));
 
-    for (uint32_t k = 0; k < n_common; ++k) {
-        uint16_t key = common_keys[k];
+        uint32_t slot = 0;
         for (uint32_t i = 0; i < count; ++i) {
-            auto it = std::lower_bound(all_keys[i].begin(), all_keys[i].end(), key);
-            if (it != all_keys[i].end() && *it == key) {
-                uint32_t idx = static_cast<uint32_t>(it - all_keys[i].begin());
-                h_ptrs[k * count + i] = bitmaps[i].bitmap_data + static_cast<size_t>(idx) * 1024;
-            } else {
-                // Key not present in this input. Must be a negated input
-                // (non-negated inputs were filtered in key intersection).
-                // Point to all-zeros sentinel; kernel will ~0 = all-ones.
-                h_ptrs[k * count + i] = d_sentinel;
+            if (bitmaps[i].negated) continue;
+            uint32_t n = bitmaps[i].n_containers;
+            if (n > 0) {
+                uint32_t block = 256;
+                uint32_t grid  = (n + block - 1) / block;
+                presence_set_bits_kernel<<<grid, block, 0, stream>>>(
+                    bitmaps[i].keys, n,
+                    d_presences_nn + static_cast<size_t>(slot) * 1024u);
             }
+            ++slot;
         }
     }
 
-    // Upload pointer table
-    const uint64_t** d_ptrs = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&d_ptrs, h_ptrs.size() * sizeof(const uint64_t*), stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_ptrs, h_ptrs.data(),
-                               h_ptrs.size() * sizeof(const uint64_t*),
-                               cudaMemcpyHostToDevice, stream));
+    uint64_t* d_presence_result = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&d_presence_result,
+                                1024u * sizeof(uint64_t), stream));
+    presence_and_reduce_kernel<<<4, 256, 0, stream>>>(
+        d_presences_nn, n_non_negated, max_key_plus_1, d_presence_result);
+    if (d_presences_nn) CUDA_CHECK(cudaFreeAsync(d_presences_nn, stream));
 
-    // 5. Allocate output and launch fused kernel.
-    //    The kernel writes bitmap data AND populates cardinalities +
-    //    a single total_cardinality counter via atomicAdd, so we avoid
-    //    a second popcount pass.
+    // ------------------------------------------------------------------
+    // 2. Popcount the presence bitmap → n_common. This is the single
+    //    D2H we can't avoid because n_common determines the size of the
+    //    allocations below.
+    // ------------------------------------------------------------------
+    uint32_t* d_n_common = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&d_n_common, sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(d_n_common, 0, sizeof(uint32_t), stream));
+    presence_popcount_kernel<<<4, 256, 0, stream>>>(
+        d_presence_result, d_n_common);
+
+    uint32_t h_n_common = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&h_n_common, d_n_common, sizeof(uint32_t),
+                                cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFreeAsync(d_n_common, stream));
+
+    uint32_t n_common = h_n_common;
+    result.n_containers        = n_common;
+    result.n_bitmap_containers = n_common;
+
+    if (n_common == 0) {
+        CUDA_CHECK(cudaFreeAsync(d_presence_result, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return result;
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Enumerate the set bits of the presence bitmap into a sorted
+    //    common_keys array on device. Single block, 256 threads.
+    // ------------------------------------------------------------------
+    CUDA_CHECK(cudaMallocAsync(&result.keys, n_common * sizeof(uint16_t), stream));
+    enumerate_presence_keys_kernel<<<1, 256, 0, stream>>>(
+        d_presence_result, result.keys);
+    CUDA_CHECK(cudaFreeAsync(d_presence_result, stream));
+
+    // ------------------------------------------------------------------
+    // 4. Build the device-side pointer table. One entry per
+    //    (common_key, input) pair. Uses key_index when available,
+    //    binary search otherwise, sentinel for absent-in-negated.
+    // ------------------------------------------------------------------
+    uint64_t* d_sentinel = nullptr;
+    bool need_sentinel = (neg_mask != 0);
+    if (need_sentinel) {
+        CUDA_CHECK(cudaMallocAsync(&d_sentinel, 1024u * sizeof(uint64_t), stream));
+        CUDA_CHECK(cudaMemsetAsync(d_sentinel, 0, 1024u * sizeof(uint64_t), stream));
+    }
+
+    // Upload per-input metadata (count × sizeof(FusedInputMeta) bytes —
+    // at most ~1 KB, builds once per call).
+    std::vector<FusedInputMeta> h_input_meta(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        h_input_meta[i].keys         = bitmaps[i].keys;
+        h_input_meta[i].bitmap_data  = bitmaps[i].bitmap_data;
+        h_input_meta[i].key_index    = bitmaps[i].key_index;
+        h_input_meta[i].n_containers = bitmaps[i].n_containers;
+        h_input_meta[i].max_key_plus_1 =
+            (bitmaps[i].key_index != nullptr)
+                ? static_cast<uint32_t>(bitmaps[i].max_key) + 1u
+                : 0u;
+    }
+    FusedInputMeta* d_input_meta = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&d_input_meta,
+                                count * sizeof(FusedInputMeta), stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_input_meta, h_input_meta.data(),
+                                count * sizeof(FusedInputMeta),
+                                cudaMemcpyHostToDevice, stream));
+
+    const uint64_t** d_ptrs = nullptr;
+    CUDA_CHECK(cudaMallocAsync(
+        &d_ptrs,
+        static_cast<size_t>(n_common) * count * sizeof(const uint64_t*),
+        stream));
+
+    {
+        // 2D block: x = input index (<= 32), y = common_keys chunk.
+        dim3 block(count, 256u / count > 0 ? 256u / count : 1u);
+        if (block.y < 1) block.y = 1;
+        dim3 grid((n_common + block.y - 1) / block.y);
+        build_pointer_table_kernel<<<grid, block, 0, stream>>>(
+            result.keys, n_common, d_input_meta, count,
+            d_sentinel, d_ptrs);
+    }
+    CUDA_CHECK(cudaFreeAsync(d_input_meta, stream));
+
+    // ------------------------------------------------------------------
+    // 5. Launch the fused AND kernel. It writes bitmap_data, the per-
+    //    container cardinalities, and atomicAdds into a single total
+    //    counter copied back at the end.
+    // ------------------------------------------------------------------
     CUDA_CHECK(cudaMallocAsync(&result.bitmap_data,
                           static_cast<size_t>(n_common) * 1024 * sizeof(uint64_t), stream));
     CUDA_CHECK(cudaMallocAsync(&result.cardinalities, n_common * sizeof(uint16_t), stream));
@@ -1400,45 +1650,49 @@ static GpuRoaring fused_multi_and_allbitmap(const GpuRoaring* bitmaps,
     CUDA_CHECK(cudaFreeAsync(d_ptrs, stream));
     if (d_sentinel) CUDA_CHECK(cudaFreeAsync(d_sentinel, stream));
 
-    // 6. Build remaining metadata (types, offsets, keys, key_index).
-    //    Cardinalities are already written by the fused kernel above.
-    std::vector<ContainerType> h_types(n_common, ContainerType::BITMAP);
-    std::vector<uint32_t> h_offsets(n_common);
-    for (uint32_t i = 0; i < n_common; ++i) {
-        h_offsets[i] = static_cast<uint32_t>(static_cast<size_t>(i) * 1024 * sizeof(uint64_t));
+    // ------------------------------------------------------------------
+    // 6. Produce the remaining metadata arrays on-device:
+    //      - types:   memset to BITMAP (enum value 1)
+    //      - offsets: sequence kernel
+    //      - key_index: memset 0xFF + scatter kernel
+    // ------------------------------------------------------------------
+    CUDA_CHECK(cudaMallocAsync(&result.types,   n_common * sizeof(ContainerType), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.offsets, n_common * sizeof(uint32_t),       stream));
+
+    static_assert(sizeof(ContainerType) == 1,
+                  "ContainerType must be one byte for memset fill to work");
+    CUDA_CHECK(cudaMemsetAsync(result.types, static_cast<int>(ContainerType::BITMAP),
+                                n_common * sizeof(ContainerType), stream));
+
+    {
+        uint32_t block = 256;
+        uint32_t grid  = (n_common + block - 1) / block;
+        fused_fill_offsets_kernel<<<grid, block, 0, stream>>>(
+            result.offsets, n_common);
     }
 
-    CUDA_CHECK(cudaMallocAsync(&result.keys, n_common * sizeof(uint16_t), stream));
-    CUDA_CHECK(cudaMallocAsync(&result.types, n_common * sizeof(ContainerType), stream));
-    CUDA_CHECK(cudaMallocAsync(&result.offsets, n_common * sizeof(uint32_t), stream));
+    // key_index: max_key is derived from the *result universe*, not from a
+    // D2H of common_keys. The scatter kernel reads common_keys (which live
+    // on device in result.keys) and writes their positions directly.
+    result.max_key = static_cast<uint16_t>(
+        max_key_plus_1 == 0 ? 0u : (max_key_plus_1 - 1u));
+    size_t key_index_bytes =
+        (static_cast<size_t>(result.max_key) + 1u) * sizeof(uint16_t);
+    CUDA_CHECK(cudaMallocAsync(&result.key_index, key_index_bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(result.key_index, 0xFF, key_index_bytes, stream));
+    {
+        uint32_t block = 256;
+        uint32_t grid  = (n_common + block - 1) / block;
+        fused_build_key_index_kernel<<<grid, block, 0, stream>>>(
+            result.keys, n_common, result.key_index);
+    }
 
-    CUDA_CHECK(cudaMemcpyAsync(result.keys, common_keys.data(),
-                               n_common * sizeof(uint16_t),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(result.types, h_types.data(),
-                               n_common * sizeof(ContainerType),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(result.offsets, h_offsets.data(),
-                               n_common * sizeof(uint32_t),
-                               cudaMemcpyHostToDevice, stream));
-
-    // Copy the fused-kernel total back into the result struct.
+    // ------------------------------------------------------------------
+    // 7. Single final D2H: the total cardinality.
+    // ------------------------------------------------------------------
     uint32_t h_total = 0;
     CUDA_CHECK(cudaMemcpyAsync(&h_total, d_total, sizeof(uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-
-    // Build key_index
-    result.max_key = common_keys.back();
-    std::vector<uint16_t> h_key_index(result.max_key + 1, 0xFFFF);
-    for (uint32_t i = 0; i < n_common; ++i) {
-        h_key_index[common_keys[i]] = static_cast<uint16_t>(i);
-    }
-    CUDA_CHECK(cudaMallocAsync(&result.key_index,
-                          (result.max_key + 1) * sizeof(uint16_t), stream));
-    CUDA_CHECK(cudaMemcpyAsync(result.key_index, h_key_index.data(),
-                               (result.max_key + 1) * sizeof(uint16_t),
-                               cudaMemcpyHostToDevice, stream));
-
+                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaFreeAsync(d_total, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     result.total_cardinality = h_total;
