@@ -73,7 +73,7 @@ The current approach in cuVS uses a flat bitset (`cuvs::core::bitset`). This has
 | **Memory** | A flat bitset for 1B vectors = 125 MB. With 100 filter attributes, that's 12.5 GB of GPU memory just for filter storage |
 | **Cache thrashing** | At 1B scale, the 125 MB bitset exceeds L2 cache (RTX 5090: 96 MB). Random candidate checks cause cache misses |
 
-Roaring bitmaps solve both: sparse filters compress 6-59x, and the compressed representation accesses less total memory per query.
+Roaring bitmaps solve both: sparse filters compress substantially (up to 59x at 1B/0.1%: 2.1 MB vs 125 MB), and the compressed representation accesses less total memory per query.
 
 ---
 
@@ -158,7 +158,7 @@ All results with `PROMOTE_AUTO` + direct-map key index (O(1) key lookup). Random
 - **21 configs** are tied (within 5%)
 - **24 configs** bitset is faster (1.06-1.3x) — clustered access, 100M random
 
-**Key insight**: Roaring matches bitset speed for realistic (random/strided) access patterns at every scale, while providing 6-59x memory compression for sparse filters. The clustered access pattern favors bitset due to cache-line prefetching, but CAGRA's graph traversal access pattern is closer to random/strided than clustered.
+**Key insight**: Roaring matches bitset speed for realistic (random/strided) access patterns at every scale, while providing up to 59x memory compression for sparse filters (1B/0.1%: 2.1 MB vs 125 MB). The clustered access pattern favors bitset due to cache-line prefetching, but CAGRA's graph traversal access pattern is closer to random/strided than clustered.
 
 The value proposition is **memory compression at query speed parity**, not raw query speed superiority.
 
@@ -241,10 +241,14 @@ At search engine scale (100M IDs), filter construction takes **99 ms** — fast 
 
 ### Auto Promotion Strategy (PROMOTE_AUTO, default)
 
+`resolve_auto_threshold()` queries `cudaDevAttrL2CacheSize` for the target device and compares it to the flat bitset size implied by `universe_size`:
+
 | Condition | Auto Decision | Why |
 |-----------|--------------|-----|
-| Universe <= ~4M (<=64 containers) | `PROMOTE_NONE` — keep arrays | Structure fits in L1/L2; array queries are fast |
-| Universe > ~4M (>64 containers) | `PROMOTE_ALL` — all bitmap | Key search (7+ steps) + array search (12 steps) = 4-10x overhead; promote eliminates it |
+| `flat_bytes * 2 <= L2 size` | `PROMOTE_KEEP_DEFAULT` — keep arrays | Bitset stays cache-resident under any access pattern; array compression is a free win |
+| `flat_bytes * 2 > L2 size` | `PROMOTE_ALL` — all bitmap | Bitset thrashes L2; promoted Roaring keeps one 8 KB container hot per query, removing 4-10x of binary-search overhead |
+
+The boundary is device-dependent. On an RTX 5090 (96 MB L2) the tipping point is at universe_size ≈ 384M; on an A100 (40 MB L2) it is ≈ 160M.
 
 ---
 

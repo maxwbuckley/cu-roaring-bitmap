@@ -80,8 +80,9 @@ via warp-parallel beam traversal, achieving 33--77x higher throughput than
 CPU HNSW at equivalent recall.  CAGRA's filter interface accepts any callable
 `(query_idx, sample_idx) -> bool`, evaluated inside the search kernel.
 Cu-roaring-bitmap implements this interface, replacing CAGRA's default flat
-bitset filter with a compressed Roaring bitmap that reduces memory by 6--59x
-while matching or exceeding flat bitset query throughput.
+bitset filter with a compressed Roaring bitmap that reduces memory by up to
+59x for sparse filters (1B/0.1%: 2.1 MB vs 125 MB) while matching or exceeding
+flat bitset query throughput.
 
 VecFlow [Mo et al., SIGMOD 2025] is a GPU-native filtered search system that
 adopts a label-centric IVF design: data points are partitioned by shared labels

@@ -13,7 +13,7 @@ namespace cu_roaring {
 // Upload a CRoaring bitmap to GPU.
 //
 // bitmap_threshold controls array-to-bitmap promotion:
-//   PROMOTE_NONE (4096) — keep CRoaring's native container choices (default)
+//   PROMOTE_KEEP_DEFAULT (4096) — keep CRoaring's native container choices (default)
 //   PROMOTE_ALL  (0)    — promote all containers to bitmap for fastest queries
 //   Any value N         — promote containers with cardinality > N to bitmap
 GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap,

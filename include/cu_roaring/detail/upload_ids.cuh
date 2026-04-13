@@ -13,7 +13,7 @@ namespace cu_roaring {
 //
 // bitmap_threshold controls array-to-bitmap promotion:
 //   PROMOTE_AUTO (default) — query GPU L2 cache size, pick optimal strategy
-//   PROMOTE_NONE (4096)    — containers with <= 4096 elements use array format
+//   PROMOTE_KEEP_DEFAULT (4096)    — containers with <= 4096 elements use array format
 //   PROMOTE_ALL  (0)       — all containers use bitmap format
 //   Any value N            — containers with cardinality > N use bitmap format
 GpuRoaring upload_from_ids(const uint32_t* ids,

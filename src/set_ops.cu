@@ -1161,8 +1161,12 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
     result.n_bitmap_containers = out_n_bitmap;
     result.array_data = d_out_array;
     result.n_array_containers = out_n_array;
+    result.array_pool_bytes =
+        static_cast<uint32_t>(total_array_elems * sizeof(uint16_t));
     result.run_data = d_out_run;
     result.n_run_containers = out_n_run;
+    result.run_pool_bytes =
+        static_cast<uint32_t>(total_run_pairs * 2 * sizeof(uint16_t));
 
     if (result.n_containers > 0) {
         CUDA_CHECK(cudaMallocAsync(&result.keys,

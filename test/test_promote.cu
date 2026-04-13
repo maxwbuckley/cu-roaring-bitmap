@@ -192,10 +192,10 @@ TEST_F(PromoteTest, UploadFromIdsWithThreshold) {
 
     uint32_t universe = 5 * 65536;
 
-    // Explicit PROMOTE_NONE: array containers
+    // Explicit PROMOTE_KEEP_DEFAULT: array containers
     auto arr = cu_roaring::upload_from_sorted_ids(
         ids.data(), static_cast<uint32_t>(ids.size()), universe, 0,
-        cu_roaring::PROMOTE_NONE);
+        cu_roaring::PROMOTE_KEEP_DEFAULT);
     EXPECT_EQ(arr.n_containers, 5u);
     EXPECT_EQ(arr.n_array_containers, 5u);
     EXPECT_EQ(arr.n_bitmap_containers, 0u);
@@ -234,10 +234,10 @@ TEST_F(PromoteTest, UploadFromIdsCustomThreshold) {
     EXPECT_EQ(bmp.n_bitmap_containers, 3u);
     EXPECT_EQ(bmp.n_array_containers, 0u);
 
-    // Threshold 4096 (PROMOTE_NONE): card=200 <= 4096, so all stay array
+    // Threshold 4096 (PROMOTE_KEEP_DEFAULT): card=200 <= 4096, so all stay array
     auto arr = cu_roaring::upload_from_sorted_ids(
         ids.data(), static_cast<uint32_t>(ids.size()), universe, 0,
-        cu_roaring::PROMOTE_NONE);
+        cu_roaring::PROMOTE_KEEP_DEFAULT);
     EXPECT_EQ(arr.n_array_containers, 3u);
     EXPECT_EQ(arr.n_bitmap_containers, 0u);
 
@@ -255,9 +255,9 @@ TEST_F(PromoteTest, UploadFromIdsCustomThreshold) {
 // ============================================================================
 
 TEST_F(PromoteTest, ResolveAutoThresholdSmallUniverse) {
-    // Small universe: flat bitset easily fits in L2 → PROMOTE_NONE
+    // Small universe: flat bitset easily fits in L2 → PROMOTE_KEEP_DEFAULT
     uint32_t threshold = cu_roaring::resolve_auto_threshold(1000000);  // 125 KB
-    EXPECT_EQ(threshold, cu_roaring::PROMOTE_NONE);
+    EXPECT_EQ(threshold, cu_roaring::PROMOTE_KEEP_DEFAULT);
 }
 
 TEST_F(PromoteTest, ResolveAutoThresholdLargeUniverse) {
@@ -267,20 +267,65 @@ TEST_F(PromoteTest, ResolveAutoThresholdLargeUniverse) {
 }
 
 TEST_F(PromoteTest, PromoteAutoSmallUniverse) {
-    // Small universe: auto should keep arrays (bitset fits in L2)
+    // Small universe: the flat bitset easily fits in L2, so auto must
+    // preserve the compact array representation. This test guards against
+    // regressions where promote_auto silently escalates to promote_all.
     std::vector<uint32_t> ids;
     for (uint32_t i = 0; i < 500; ++i)
         ids.push_back(i * 100);
 
     auto bm = cu_roaring::upload_from_sorted_ids(
         ids.data(), static_cast<uint32_t>(ids.size()), 100000);
-    // At 100K universe (12.5 KB bitset), auto keeps PROMOTE_NONE
-    // Containers have 500 elements each → array containers
-    EXPECT_GT(bm.n_array_containers, 0u);
+    ASSERT_GT(bm.n_array_containers, 0u);
+    const uint32_t original_arrays = bm.n_array_containers;
+    const uint32_t original_bitmaps = bm.n_bitmap_containers;
 
     auto promoted = cu_roaring::promote_auto(bm);
-    // Auto should NOT promote (small universe fits in L2)
-    // But promote_auto always returns a valid copy, verify correctness
+
+    // Auto must NOT promote — the container distribution is preserved.
+    EXPECT_EQ(promoted.n_array_containers, original_arrays);
+    EXPECT_EQ(promoted.n_bitmap_containers, original_bitmaps);
+    EXPECT_EQ(promoted.n_containers, bm.n_containers);
+
+    // And the two must be independently owned device memory — this is
+    // a deep copy, not an aliasing shallow copy.
+    EXPECT_NE(promoted.keys,          bm.keys);
+    EXPECT_NE(promoted.types,         bm.types);
+    EXPECT_NE(promoted.offsets,       bm.offsets);
+    EXPECT_NE(promoted.cardinalities, bm.cardinalities);
+    if (bm.array_data) EXPECT_NE(promoted.array_data, bm.array_data);
+
+    // Content identical.
+    auto bs1 = to_host_bitset(bm);
+    auto bs2 = to_host_bitset(promoted);
+    EXPECT_EQ(bs1, bs2);
+
+    cu_roaring::gpu_roaring_free(promoted);
+    cu_roaring::gpu_roaring_free(bm);
+}
+
+TEST_F(PromoteTest, PromoteAutoLargeUniverseStandalone) {
+    // Large universe passed to promote_auto directly (not via upload's
+    // threshold parameter): must actually promote. Guards the
+    // standalone-API path which previously was broken symmetrically
+    // — it always promoted regardless of threshold.
+    std::vector<uint32_t> ids;
+    for (uint32_t i = 0; i < 500; ++i)
+        ids.push_back(i * 100);
+
+    // Upload WITHOUT auto promotion so we have a mixed-type input
+    // that promote_auto then has to promote for real.
+    auto bm = cu_roaring::upload_from_sorted_ids(
+        ids.data(), static_cast<uint32_t>(ids.size()),
+        1u << 30,                            // ~1B universe
+        0, cu_roaring::PROMOTE_KEEP_DEFAULT);
+    ASSERT_GT(bm.n_array_containers, 0u);
+
+    auto promoted = cu_roaring::promote_auto(bm);
+    EXPECT_EQ(promoted.n_array_containers, 0u);
+    EXPECT_EQ(promoted.n_run_containers, 0u);
+    EXPECT_EQ(promoted.n_bitmap_containers, promoted.n_containers);
+
     auto bs1 = to_host_bitset(bm);
     auto bs2 = to_host_bitset(promoted);
     EXPECT_EQ(bs1, bs2);
@@ -312,7 +357,7 @@ TEST_F(PromoteTest, UploadDefaultIsAuto) {
     // that small universes produce arrays and large universes produce bitmaps.
     std::vector<uint32_t> ids = {0, 100, 200};
 
-    // Small universe: default auto → PROMOTE_NONE → arrays
+    // Small universe: default auto → PROMOTE_KEEP_DEFAULT → arrays
     auto small = cu_roaring::upload_from_sorted_ids(ids.data(), 3, 10000);
     EXPECT_EQ(small.n_array_containers, 1u);
     EXPECT_EQ(small.n_bitmap_containers, 0u);
@@ -346,7 +391,7 @@ TEST_F(PromoteTest, UploadFromIdsUnsorted) {
 
     auto bm = cu_roaring::upload_from_ids(
         ids.data(), static_cast<uint32_t>(ids.size()), 200000, 0,
-        cu_roaring::PROMOTE_NONE);
+        cu_roaring::PROMOTE_KEEP_DEFAULT);
 
     // Should have deduplicated: 8 input → 6 unique
     EXPECT_EQ(bm.total_cardinality, 6u);
@@ -375,7 +420,7 @@ TEST_F(PromoteTest, UploadFromIdsAllDuplicates) {
 
     auto bm = cu_roaring::upload_from_ids(
         ids.data(), static_cast<uint32_t>(ids.size()), 100, 0,
-        cu_roaring::PROMOTE_NONE);
+        cu_roaring::PROMOTE_KEEP_DEFAULT);
 
     EXPECT_EQ(bm.total_cardinality, 1u);
     EXPECT_EQ(bm.n_containers, 1u);
@@ -391,7 +436,7 @@ TEST_F(PromoteTest, UploadFromIdsReversed) {
 
     auto bm = cu_roaring::upload_from_ids(
         ids.data(), static_cast<uint32_t>(ids.size()), 1000, 0,
-        cu_roaring::PROMOTE_NONE);
+        cu_roaring::PROMOTE_KEEP_DEFAULT);
 
     EXPECT_EQ(bm.total_cardinality, 1000u);
 

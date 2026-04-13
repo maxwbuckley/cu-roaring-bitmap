@@ -898,7 +898,7 @@ The library's current approach is optimal: **use Roaring for storage and
 memory management; promote all containers to bitmap for the 2-read query
 path; enable warp cooperation in CAGRA integration.** This achieves:
 
-- 6--59x memory savings for sparse filters
+- Up to 59x memory savings for sparse filters (measured: 1B/0.1% → 2.1 MB vs 125 MB)
 - Throughput parity with bitset in all tested configurations
 - 1.3--1.7x throughput advantage at 1B scale with warp cooperation
 

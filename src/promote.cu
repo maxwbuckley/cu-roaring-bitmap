@@ -4,15 +4,26 @@
 namespace cu_roaring {
 
 // ============================================================================
-// Device-side promotion kernels
+// Device-side promotion kernel
 // ============================================================================
 //
 // One block per source container. Each block reads its own metadata
-// (type, offset, cardinality) directly from device memory, then either copies
-// (BITMAP), scatters (ARRAY), or expands runs (RUN) into the destination
-// bitmap pool at slot `cid * 1024`. This replaces the old D2H → CPU rebuild
-// → H2D round-trip, which at 100M+ scale could move many megabytes of data
-// across PCIe for a purely structural transform.
+// (type, offset, cardinality) from device memory, self-dispatches on the
+// container type, and writes the 1024-word output bitmap:
+//
+//   BITMAP  — plain global->global copy, no shared memory.
+//   ARRAY   — staged in 8 KB of shared memory via atomicOr (smem atomics
+//             cost a handful of cycles vs hundreds for global atomics),
+//             then copied to global.
+//   RUN     — word-level expansion in shared memory. For each run, the
+//             owning thread emits at most (tail_word - head_word + 1)
+//             64-bit writes. A run of length L becomes ceil((L+1)/64)
+//             atomic word-writes instead of (L+1) bit-writes: for typical
+//             runs that is 64x fewer atomics.
+//
+// The kernel also writes this container's types[] and offsets[] entries
+// inline from thread 0 — the output metadata is uniform (every entry is
+// BITMAP at offset cid * 8192), so there is no need for a separate pass.
 
 __global__ void promote_to_bitmap_kernel(
     const ContainerType* src_types,
@@ -26,74 +37,202 @@ __global__ void promote_to_bitmap_kernel(
     uint32_t* dst_offsets,
     uint32_t n)
 {
-    uint32_t cid = blockIdx.x;
+    __shared__ uint64_t smem[1024];
+
+    const uint32_t cid = blockIdx.x;
     if (cid >= n) return;
 
     uint64_t* dst = dst_bitmap_pool + static_cast<size_t>(cid) * 1024;
-    ContainerType type = src_types[cid];
+    const ContainerType type = src_types[cid];
 
     if (type == ContainerType::BITMAP) {
-        // Straight copy of 1024 words.
+        // Plain copy: the only work is moving 8 KB from one global pool to
+        // another. Skip shared memory entirely.
         const uint64_t* src =
             src_bitmap_pool + (src_offsets[cid] / sizeof(uint64_t));
         for (uint32_t w = threadIdx.x; w < 1024u; w += blockDim.x) {
             dst[w] = src[w];
         }
     } else {
-        // ARRAY or RUN: zero the destination first, then scatter/expand.
+        // ARRAY or RUN: zero the shared buffer, scatter/expand into it,
+        // then write the whole buffer out to global in one pass.
         for (uint32_t w = threadIdx.x; w < 1024u; w += blockDim.x) {
-            dst[w] = 0ULL;
+            smem[w] = 0ULL;
         }
         __syncthreads();
 
-        uint16_t card = src_cards[cid];
+        const uint16_t card = src_cards[cid];
 
         if (type == ContainerType::ARRAY) {
             const uint16_t* arr =
                 src_array_pool + (src_offsets[cid] / sizeof(uint16_t));
             for (uint32_t i = threadIdx.x; i < card; i += blockDim.x) {
-                uint16_t val = arr[i];
-                uint32_t word_idx = val / 64u;
-                uint64_t bit_mask = 1ULL << (val % 64u);
-                atomicOr(reinterpret_cast<unsigned long long*>(&dst[word_idx]),
-                         static_cast<unsigned long long>(bit_mask));
+                const uint16_t val = arr[i];
+                const uint32_t word_idx = val / 64u;
+                const uint64_t bit_mask = 1ULL << (val % 64u);
+                atomicOr(
+                    reinterpret_cast<unsigned long long*>(&smem[word_idx]),
+                    static_cast<unsigned long long>(bit_mask));
             }
         } else {  // RUN
             const uint16_t* runs =
                 src_run_pool + (src_offsets[cid] / sizeof(uint16_t));
+            // One thread per run; each thread emits whole 64-bit words
+            // rather than iterating value-by-value.
             for (uint32_t r = threadIdx.x; r < card; r += blockDim.x) {
-                uint16_t start = runs[r * 2];
-                uint16_t length = runs[r * 2 + 1];
-                uint32_t end = static_cast<uint32_t>(start) + length;
+                const uint32_t start  = runs[r * 2];
+                const uint32_t length = runs[r * 2 + 1];
+                uint32_t end = start + length;
                 if (end > 0xFFFFu) end = 0xFFFFu;
-                for (uint32_t v = start; v <= end; ++v) {
-                    uint32_t word_idx = v / 64u;
-                    uint64_t bit_mask = 1ULL << (v % 64u);
+
+                const uint32_t head_word = start / 64u;
+                const uint32_t tail_word = end   / 64u;
+                const uint32_t head_bit  = start % 64u;
+                const uint32_t tail_bit  = end   % 64u;
+
+                if (head_word == tail_word) {
+                    // Whole run fits inside one 64-bit word.
+                    const uint32_t nbits = tail_bit - head_bit + 1u;
+                    const uint64_t mask  = (nbits == 64u)
+                        ? ~0ULL
+                        : (((1ULL << nbits) - 1ULL) << head_bit);
                     atomicOr(
-                        reinterpret_cast<unsigned long long*>(&dst[word_idx]),
-                        static_cast<unsigned long long>(bit_mask));
+                        reinterpret_cast<unsigned long long*>(&smem[head_word]),
+                        static_cast<unsigned long long>(mask));
+                } else {
+                    // Head partial word: bits [head_bit .. 63].
+                    const uint64_t head_mask = ~0ULL << head_bit;
+                    atomicOr(
+                        reinterpret_cast<unsigned long long*>(&smem[head_word]),
+                        static_cast<unsigned long long>(head_mask));
+                    // Middle full words.
+                    for (uint32_t w = head_word + 1u; w < tail_word; ++w) {
+                        atomicOr(
+                            reinterpret_cast<unsigned long long*>(&smem[w]),
+                            static_cast<unsigned long long>(~0ULL));
+                    }
+                    // Tail partial word: bits [0 .. tail_bit].
+                    const uint64_t tail_mask = (tail_bit == 63u)
+                        ? ~0ULL
+                        : ((1ULL << (tail_bit + 1u)) - 1ULL);
+                    atomicOr(
+                        reinterpret_cast<unsigned long long*>(&smem[tail_word]),
+                        static_cast<unsigned long long>(tail_mask));
                 }
             }
         }
+
+        __syncthreads();
+        // Flush shared buffer to the destination bitmap pool.
+        for (uint32_t w = threadIdx.x; w < 1024u; w += blockDim.x) {
+            dst[w] = smem[w];
+        }
     }
 
-    // Emit the output metadata for this container (one thread per block).
+    // Emit this container's output metadata (one thread per block).
     if (threadIdx.x == 0) {
         dst_types[cid]   = ContainerType::BITMAP;
         dst_offsets[cid] = static_cast<uint32_t>(
-            static_cast<size_t>(cid) * 1024 * sizeof(uint64_t));
+            static_cast<size_t>(cid) * 1024u * sizeof(uint64_t));
     }
 }
 
-// Build key_index[k] = i where keys[i] == k; cells with no matching
-// container are already set to 0xFFFF by the preceding cudaMemsetAsync(0xFF).
+// Write offsets[i] = i * stride. Used by the already-all-bitmap fast path
+// to fill the output offsets array without launching the promotion kernel.
+__global__ void fill_sequential_offsets_kernel(uint32_t* out,
+                                               uint32_t n,
+                                               uint32_t stride)
+{
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = i * stride;
+}
+
+// Scatter keys[i] -> key_index[keys[i]] = i. Cells with no matching
+// container remain at the 0xFFFF sentinel (set by the caller's memset).
+//
+// Defensive: the kernel refuses to write when keys[i] > max_key. This
+// catches miscalibrated `universe_size` before it corrupts the allocation
+// that follows key_index in the memory pool.
 __global__ void build_key_index_kernel(const uint16_t* keys,
                                        uint32_t n,
-                                       uint16_t* key_index)
+                                       uint16_t* key_index,
+                                       uint32_t max_key)
 {
-    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    key_index[keys[i]] = static_cast<uint16_t>(i);
+    const uint16_t k = keys[i];
+    if (static_cast<uint32_t>(k) > max_key) return;
+    key_index[k] = static_cast<uint16_t>(i);
+}
+
+// ============================================================================
+// Deep copy helper (stream-ordered, no host sync)
+// ============================================================================
+
+GpuRoaring gpu_roaring_deep_copy(const GpuRoaring& bm, cudaStream_t stream)
+{
+    GpuRoaring r{};
+    r.n_containers         = bm.n_containers;
+    r.n_bitmap_containers  = bm.n_bitmap_containers;
+    r.n_array_containers   = bm.n_array_containers;
+    r.n_run_containers     = bm.n_run_containers;
+    r.universe_size        = bm.universe_size;
+    r.total_cardinality    = bm.total_cardinality;
+    r.negated              = bm.negated;
+    r.max_key              = bm.max_key;
+    r.array_pool_bytes     = bm.array_pool_bytes;
+    r.run_pool_bytes       = bm.run_pool_bytes;
+
+    const uint32_t n = bm.n_containers;
+    if (n == 0) return r;
+
+    CUDA_CHECK(cudaMallocAsync(&r.keys,          n * sizeof(uint16_t),      stream));
+    CUDA_CHECK(cudaMallocAsync(&r.types,         n * sizeof(ContainerType), stream));
+    CUDA_CHECK(cudaMallocAsync(&r.offsets,       n * sizeof(uint32_t),      stream));
+    CUDA_CHECK(cudaMallocAsync(&r.cardinalities, n * sizeof(uint16_t),      stream));
+
+    CUDA_CHECK(cudaMemcpyAsync(r.keys,          bm.keys,
+                               n * sizeof(uint16_t),
+                               cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(r.types,         bm.types,
+                               n * sizeof(ContainerType),
+                               cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(r.offsets,       bm.offsets,
+                               n * sizeof(uint32_t),
+                               cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(r.cardinalities, bm.cardinalities,
+                               n * sizeof(uint16_t),
+                               cudaMemcpyDeviceToDevice, stream));
+
+    if (bm.bitmap_data != nullptr && bm.n_bitmap_containers > 0) {
+        const size_t bytes =
+            static_cast<size_t>(bm.n_bitmap_containers) * 1024 * sizeof(uint64_t);
+        CUDA_CHECK(cudaMallocAsync(&r.bitmap_data, bytes, stream));
+        CUDA_CHECK(cudaMemcpyAsync(r.bitmap_data, bm.bitmap_data, bytes,
+                                   cudaMemcpyDeviceToDevice, stream));
+    }
+    if (bm.array_data != nullptr && bm.array_pool_bytes > 0) {
+        CUDA_CHECK(cudaMallocAsync(&r.array_data, bm.array_pool_bytes, stream));
+        CUDA_CHECK(cudaMemcpyAsync(r.array_data, bm.array_data,
+                                   bm.array_pool_bytes,
+                                   cudaMemcpyDeviceToDevice, stream));
+    }
+    if (bm.run_data != nullptr && bm.run_pool_bytes > 0) {
+        CUDA_CHECK(cudaMallocAsync(&r.run_data, bm.run_pool_bytes, stream));
+        CUDA_CHECK(cudaMemcpyAsync(r.run_data, bm.run_data,
+                                   bm.run_pool_bytes,
+                                   cudaMemcpyDeviceToDevice, stream));
+    }
+
+    if (bm.key_index != nullptr && bm.universe_size > 0) {
+        const size_t idx_bytes =
+            (static_cast<size_t>(bm.max_key) + 1u) * sizeof(uint16_t);
+        CUDA_CHECK(cudaMallocAsync(&r.key_index, idx_bytes, stream));
+        CUDA_CHECK(cudaMemcpyAsync(r.key_index, bm.key_index, idx_bytes,
+                                   cudaMemcpyDeviceToDevice, stream));
+    }
+    return r;
 }
 
 // ============================================================================
@@ -110,6 +249,8 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
     result.n_bitmap_containers = n;
     result.n_array_containers  = 0;
     result.n_run_containers    = 0;
+    result.array_pool_bytes    = 0;
+    result.run_pool_bytes      = 0;
     result.universe_size       = bm.universe_size;
     result.total_cardinality   = bm.total_cardinality;
     result.negated             = bm.negated;
@@ -117,11 +258,11 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
     const size_t bitmap_pool_bytes =
         static_cast<size_t>(n) * 1024 * sizeof(uint64_t);
 
-    CUDA_CHECK(cudaMallocAsync(&result.keys,          n * sizeof(uint16_t),       stream));
-    CUDA_CHECK(cudaMallocAsync(&result.types,         n * sizeof(ContainerType),  stream));
-    CUDA_CHECK(cudaMallocAsync(&result.offsets,       n * sizeof(uint32_t),       stream));
-    CUDA_CHECK(cudaMallocAsync(&result.cardinalities, n * sizeof(uint16_t),       stream));
-    CUDA_CHECK(cudaMallocAsync(&result.bitmap_data,   bitmap_pool_bytes,          stream));
+    CUDA_CHECK(cudaMallocAsync(&result.keys,          n * sizeof(uint16_t),      stream));
+    CUDA_CHECK(cudaMallocAsync(&result.types,         n * sizeof(ContainerType), stream));
+    CUDA_CHECK(cudaMallocAsync(&result.offsets,       n * sizeof(uint32_t),      stream));
+    CUDA_CHECK(cudaMallocAsync(&result.cardinalities, n * sizeof(uint16_t),      stream));
+    CUDA_CHECK(cudaMallocAsync(&result.bitmap_data,   bitmap_pool_bytes,         stream));
 
     // keys and cardinalities are unchanged by promotion — D2D copy.
     CUDA_CHECK(cudaMemcpyAsync(result.keys, bm.keys,
@@ -132,15 +273,25 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
                                cudaMemcpyDeviceToDevice, stream));
 
     if (bm.n_array_containers == 0 && bm.n_run_containers == 0) {
-        // Already all-bitmap: the only work is a D2D copy of the bitmap pool
-        // and filling types/offsets with the trivial sequence. Use the
-        // promotion kernel anyway — its BITMAP branch is a plain copy, and
-        // it writes the contiguous types/offsets for us.
-    }
-
-    // Launch one block per container. The kernel self-dispatches on
-    // source container type.
-    if (n > 0) {
+        // Fast path: input is already all-bitmap. A single D2D copy of
+        // the whole pool replaces n block launches that would each run
+        // the promotion kernel's BITMAP branch (plain copy). Types and
+        // offsets are uniform sequences, so memset + a tiny kernel is
+        // enough to populate them.
+        CUDA_CHECK(cudaMemcpyAsync(result.bitmap_data, bm.bitmap_data,
+                                   bitmap_pool_bytes,
+                                   cudaMemcpyDeviceToDevice, stream));
+        // ContainerType is a 1-byte enum with BITMAP == 1; memset to
+        // 0x01 yields an array of BITMAP tags.
+        CUDA_CHECK(cudaMemsetAsync(result.types, 0x01,
+                                   n * sizeof(ContainerType), stream));
+        const uint32_t block = 256;
+        const uint32_t grid  = (n + block - 1) / block;
+        fill_sequential_offsets_kernel<<<grid, block, 0, stream>>>(
+            result.offsets, n,
+            static_cast<uint32_t>(1024u * sizeof(uint64_t)));
+    } else {
+        // Mixed input: one block per container, kernel self-dispatches.
         promote_to_bitmap_kernel<<<n, 256, 0, stream>>>(
             bm.types,
             bm.offsets,
@@ -154,28 +305,25 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
             n);
     }
 
-    // Build key_index on device. The width is determined by universe_size,
-    // not by reading max_key back to the host.
+    // Build key_index on device. The table width is determined by
+    // universe_size, not by reading max_key back to the host.
     if (bm.universe_size > 0) {
-        // max_key for a universe of size U is (U - 1) >> 16. Clamp to uint16.
-        uint32_t max_key32 =
-            (bm.universe_size == 0) ? 0u : ((bm.universe_size - 1u) >> 16);
+        uint32_t max_key32 = (bm.universe_size - 1u) >> 16;
         if (max_key32 > 0xFFFFu) max_key32 = 0xFFFFu;
         result.max_key = static_cast<uint16_t>(max_key32);
-        size_t idx_bytes =
+        const size_t idx_bytes =
             (static_cast<size_t>(result.max_key) + 1u) * sizeof(uint16_t);
 
         CUDA_CHECK(cudaMallocAsync(&result.key_index, idx_bytes, stream));
         CUDA_CHECK(cudaMemsetAsync(result.key_index, 0xFF, idx_bytes, stream));
-        uint32_t block = 256;
-        uint32_t grid  = (n + block - 1) / block;
-        if (grid > 0) {
-            build_key_index_kernel<<<grid, block, 0, stream>>>(
-                result.keys, n, result.key_index);
-        }
+        const uint32_t block = 256;
+        const uint32_t grid  = (n + block - 1) / block;
+        build_key_index_kernel<<<grid, block, 0, stream>>>(
+            result.keys, n, result.key_index, max_key32);
     }
 
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // No host sync — caller syncs `stream` when it actually needs host
+    // visibility. Everything above is stream-ordered.
     return result;
 }
 
@@ -185,42 +333,55 @@ GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream)
 
 uint32_t resolve_auto_threshold(uint32_t universe_size, int device_id)
 {
-    (void)device_id;
+    if (universe_size == 0) return PROMOTE_KEEP_DEFAULT;
 
-    // Promote all containers to bitmap whenever the universe has more than
-    // ~64 potential containers (universe > ~4M). At this scale the key
-    // binary search (7+ steps) combined with array container binary search
-    // (up to 12 steps) makes array queries 4-10x slower than bitmap queries
-    // (which replace the inner search with a single word read).
-    //
-    // Below ~4M universe (<=64 containers, <=6 key search steps), array
-    // containers are fast enough and the memory savings (2*card bytes vs
-    // 8 KB per container) are worthwhile — a 1M/0.1% bitmap uses 2 KB
-    // compressed vs 128 KB if promoted.
-    //
-    // Users who want minimum memory at any scale: pass PROMOTE_NONE.
-    // Users who want maximum speed at any scale: pass PROMOTE_ALL.
-    constexpr uint32_t CONTAINER_THRESHOLD = 64;
-    uint32_t n_possible_containers = (universe_size + 65535) / 65536;
+    // Query the real L2 cache size for the target device. Fall back to a
+    // conservative 4 MB estimate if the query fails (e.g. pre-CUDA 11 or
+    // an unusual device). 4 MB is smaller than any modern data-center or
+    // consumer GPU's L2, so the fallback errs on the side of "promote
+    // sooner", which matches the previous hardcoded constant-threshold
+    // behaviour.
+    int dev = device_id;
+    if (dev < 0) {
+        if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+    }
+    int l2_bytes_i = 0;
+    if (cudaDeviceGetAttribute(&l2_bytes_i, cudaDevAttrL2CacheSize, dev)
+            != cudaSuccess) {
+        l2_bytes_i = 4 * 1024 * 1024;
+    }
+    const size_t l2_bytes = static_cast<size_t>(l2_bytes_i);
 
-    if (n_possible_containers > CONTAINER_THRESHOLD) {
+    // Flat bitset size for this universe. Using `(U + 7) / 8` matches the
+    // layout produced by decompress_to_bitset().
+    const size_t flat_bytes = (static_cast<size_t>(universe_size) + 7u) / 8u;
+
+    // Promote when the flat bitset would consume more than half of L2.
+    // Keeping at least half the cache for query working set (candidate IDs
+    // being tested) avoids evicting the bitset on every query while still
+    // honouring the "does it fit?" intent.
+    if (flat_bytes * 2u > l2_bytes) {
         return PROMOTE_ALL;
     }
-    return PROMOTE_NONE;
+    return PROMOTE_KEEP_DEFAULT;
 }
 
 GpuRoaring promote_auto(const GpuRoaring& bm, cudaStream_t stream, int device_id)
 {
-    uint32_t threshold = resolve_auto_threshold(bm.universe_size, device_id);
+    const uint32_t threshold =
+        resolve_auto_threshold(bm.universe_size, device_id);
 
-    if (threshold == PROMOTE_ALL &&
-        (bm.n_array_containers > 0 || bm.n_run_containers > 0)) {
+    const bool has_non_bitmap =
+        (bm.n_array_containers > 0) || (bm.n_run_containers > 0);
+
+    if (threshold == PROMOTE_ALL && has_non_bitmap) {
         return promote_to_bitmap(bm, stream);
     }
 
-    // No promotion needed — return a deep copy so the caller has
-    // consistent ownership semantics (always gets a new GpuRoaring).
-    return promote_to_bitmap(bm, stream);  // handles the all-bitmap copy path
+    // No promotion needed — either the flat bitset still fits in L2, or
+    // the input is already all-bitmap. Return a deep copy so the caller's
+    // ownership model is consistent (always gets a new owned GpuRoaring).
+    return gpu_roaring_deep_copy(bm, stream);
 }
 
 }  // namespace cu_roaring

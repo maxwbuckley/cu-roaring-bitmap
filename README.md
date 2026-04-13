@@ -8,7 +8,7 @@ Filtered vector search at scale requires checking billions of candidate IDs agai
 
 cu-roaring-bitmap brings Roaring bitmaps to the GPU:
 
-- **6-59x memory compression** vs flat bitsets (depending on set density)
+- **Up to 59x memory compression** vs flat bitsets for sparse filters (1B universe at 0.1% density: 2.1 MB vs 125 MB — see `README.md#memory-vs-speed`)
 - **66x faster filter upload** at 100M IDs via GPU-native sort/partition pipeline
 - **17x faster filter construction** than CPU CRoaring for multi-predicate queries at 1B scale
 - **Direct kernel integration** — `contains()` and `warp_contains()` callable from any CUDA kernel
@@ -46,7 +46,7 @@ roaring_bitmap_add_range(cpu_bm, 0, 500000);
 cu_roaring::GpuRoaring gpu_bm = cu_roaring::upload(cpu_bm, stream);
 
 // Manual overrides if you know your workload:
-auto compressed = cu_roaring::upload(cpu_bm, stream, cu_roaring::PROMOTE_NONE);  // min memory
+auto compressed = cu_roaring::upload(cpu_bm, stream, cu_roaring::PROMOTE_KEEP_DEFAULT);  // min memory
 auto fast       = cu_roaring::upload(cpu_bm, stream, cu_roaring::PROMOTE_ALL);   // max query speed
 
 roaring_bitmap_free(cpu_bm);  // CPU copy no longer needed
@@ -135,17 +135,20 @@ __global__ void my_kernel_warp(cu_roaring::GpuRoaringView view, ...) {
 
 ### Container promotion (automatic and manual)
 
-Array containers require a binary search inside the container, which is 3-8x slower than bitmap containers at scale. The library automatically handles this via **`PROMOTE_AUTO`** (the default), which queries the GPU's L2 cache size:
+Array containers require a binary search inside the container, which is 3-8x slower than bitmap containers at scale. The library automatically handles this via **`PROMOTE_AUTO`** (the default), which queries the GPU's L2 cache size via `cudaDeviceGetAttribute(cudaDevAttrL2CacheSize)` and decides:
 
-- **Small universe** (<=~4M, <=64 containers): keeps compressed arrays — structure fits in cache, queries are fast
-- **Larger universe** (>~4M, >64 containers): promotes all containers to bitmap — eliminates the 4-10x array binary search overhead
+- **Flat bitset for this universe fits in half the L2**: keeps compressed arrays — the bitset is small enough that any access pattern stays cache-resident, so arrays give the memory win without a query-speed penalty.
+- **Flat bitset would overflow half the L2**: promotes all containers to bitmap — random candidate checks against an L2-oversized bitset thrash cache; the promoted Roaring accesses one 8 KB bitmap container per query and keeps that slice hot.
+
+The boundary is therefore device-dependent (RTX 5090: 96 MB L2, A100: 40 MB L2, H100: 50 MB L2) rather than a fixed container count.
 
 ```cpp
 #include <cu_roaring/detail/promote.cuh>
 
-// Check what the auto policy chose for your data:
+// Check what the auto policy chose for your data on the current device:
 uint32_t threshold = cu_roaring::resolve_auto_threshold(universe_size);
-// Returns PROMOTE_ALL (0) at 10M+ scale, PROMOTE_NONE (4096) at 1M scale
+// Returns PROMOTE_ALL (0) when the flat bitset would overflow half the L2,
+// PROMOTE_KEEP_DEFAULT (4096) otherwise.
 
 // Post-upload cache-aware promotion:
 auto optimized = cu_roaring::promote_auto(gpu_bm, stream);
@@ -167,6 +170,7 @@ This makes compression **symmetric around 50%**: a 99% pass-rate filter stores o
 |-----------|-------------------|-----------------|---------------|
 | 1% | 59x | 59x | 1% |
 | 10% | 6.2x | 6.2x | 10% |
+| 30% | 3.3x | 3.3x | 30% |
 | 50% | ~1x | ~1x | 50% |
 | 70% | ~1x | **3.3x** | 30% |
 | 90% | ~1x | **6.2x** | 10% |
@@ -442,7 +446,7 @@ Roaring bitmap: id → key search (11 reads) →
 
 1. **Default (PROMOTE_AUTO)**: Just call `upload()` — the library queries your GPU's L2 cache size and picks the optimal strategy. At 1B scale it promotes to all-bitmap (faster queries); at 1M it keeps compressed arrays (saves memory). No tuning required.
 
-2. **Cold filters** (stored in GPU memory, used for set operations): Use `PROMOTE_NONE` explicitly. The 59x memory savings lets you store far more concurrent filters in GPU memory. Promote only the final combined result before search.
+2. **Cold filters** (stored in GPU memory, used for set operations): Use `PROMOTE_KEEP_DEFAULT` explicitly. The 59x memory savings lets you store far more concurrent filters in GPU memory. Promote only the final combined result before search.
 
 3. **Memory is the real value proposition** at scale. With 100 filter attributes at 1B scale: flat bitsets require 12.5 GB, Roaring requires ~0.7 GB for sparse attributes.
 
@@ -530,7 +534,7 @@ cu-roaring-bitmap/
 | | cu-roaring-bitmap | Flat Bitset | VecFlow (label-centric IVF) |
 |---|---|---|---|
 | **Filter type** | Any boolean predicate | Any boolean predicate | Pre-indexed labels only |
-| **Memory** | 6-59x compressed | Baseline | 3.5-10.8x overhead |
+| **Memory** | Up to 59x compressed (sparse) | Baseline | 3.5-10.8x overhead |
 | **Set ops on GPU** | AND/OR/ANDNOT/XOR | Bitwise only | N/A (built into index) |
 | **Kernel integration** | `contains()` / `warp_contains()` | Bit test | N/A (custom kernels) |
 | **Ad-hoc queries** | Yes | Yes | No (requires re-indexing) |

@@ -101,7 +101,7 @@ static PackedLayout compute_layout(const roaring_bitmap_t* cpu_bitmap,
 
     uint32_t eff = bitmap_threshold;
     if (eff == PROMOTE_AUTO) eff = resolve_auto_threshold(L.universe_size);
-    L.promote_all = (eff < PROMOTE_NONE);
+    L.promote_all = (eff < PROMOTE_KEEP_DEFAULT);
 
     // Guard: skip promotion when it would eliminate compression.
     // Only applies to PROMOTE_AUTO — an explicit PROMOTE_ALL is respected.
@@ -244,10 +244,16 @@ static GpuRoaring build_result(char* d_buf, const PackedLayout& L,
     result.key_index     = reinterpret_cast<uint16_t*>(d_buf + L.kidx_off);
     if (L.total_bitmap_words > 0)
         result.bitmap_data = reinterpret_cast<uint64_t*>(d_buf + L.bmp_off);
-    if (L.total_array_elems > 0)
+    if (L.total_array_elems > 0) {
         result.array_data = reinterpret_cast<uint16_t*>(d_buf + L.arr_off);
-    if (L.total_run_pairs > 0)
+        result.array_pool_bytes =
+            static_cast<uint32_t>(L.total_array_elems * sizeof(uint16_t));
+    }
+    if (L.total_run_pairs > 0) {
         result.run_data = reinterpret_cast<uint16_t*>(d_buf + L.run_off);
+        result.run_pool_bytes =
+            static_cast<uint32_t>(L.total_run_pairs * 2 * sizeof(uint16_t));
+    }
     return result;
 }
 

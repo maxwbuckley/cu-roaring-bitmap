@@ -534,11 +534,12 @@ static GpuRoaring cpu_upload(const uint32_t* raw_ids,
                                    cudaMemcpyHostToDevice, stream));
     }
     if (!h_array_pool.empty()) {
-        CUDA_CHECK(cudaMallocAsync(&result.array_data,
-                              h_array_pool.size() * sizeof(uint16_t), stream));
+        const size_t bytes = h_array_pool.size() * sizeof(uint16_t);
+        CUDA_CHECK(cudaMallocAsync(&result.array_data, bytes, stream));
         CUDA_CHECK(cudaMemcpyAsync(result.array_data, h_array_pool.data(),
-                                   h_array_pool.size() * sizeof(uint16_t),
+                                   bytes,
                                    cudaMemcpyHostToDevice, stream));
+        result.array_pool_bytes = static_cast<uint32_t>(bytes);
     }
 
     // Build direct-map key index

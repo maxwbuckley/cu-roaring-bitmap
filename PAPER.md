@@ -32,7 +32,7 @@ We present cu-roaring-bitmap, a GPU-native Roaring bitmap library designed for f
 
 6. **Stream-ordered allocation throughout** using `cudaMallocAsync` + `cudaFreeAsync` with a tuned CUDA memory pool. This eliminates the ~19 implicit device-wide synchronizations previously triggered per `set_operation` call by temporary-buffer `cudaFree`s, yielding 1.9–3.3x end-to-end speedups on hot paths with no external RMM dependency.
 
-7. **Integration with NVIDIA cuVS (CAGRA)** demonstrating 1.31x search speedup at 50% selectivity with near-identical result quality, and 6-59x memory reduction for sparse filters.
+7. **Integration with NVIDIA cuVS (CAGRA)** demonstrating 1.31x search speedup at 50% selectivity with near-identical result quality, and up to 59x memory reduction for sparse filters (measured: 2.1 MB vs 125 MB flat bitset at 1B universe, 0.1% density).
 
 ## 2. Background
 

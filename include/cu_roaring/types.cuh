@@ -28,9 +28,11 @@ struct GpuRoaring {
 
     uint16_t* array_data         = nullptr; // [total_array_elements]
     uint32_t  n_array_containers  = 0;
+    uint32_t  array_pool_bytes    = 0;      // total bytes in array_data pool
 
     uint16_t* run_data           = nullptr; // [total_run_pairs * 2] packed (start, length)
     uint32_t  n_run_containers    = 0;
+    uint32_t  run_pool_bytes     = 0;       // total bytes in run_data pool
 
     // Direct-map key index: key_index[high16] = container index, or 0xFFFF.
     // Replaces O(log n) binary search with O(1) table lookup.

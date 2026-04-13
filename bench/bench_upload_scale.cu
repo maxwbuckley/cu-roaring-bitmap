@@ -110,13 +110,13 @@ int main()
       std::sort(sorted.begin(), sorted.end());
       sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
 
-      // Upload the pre-sorted data (PROMOTE_NONE skips GPU sort since
+      // Upload the pre-sorted data (PROMOTE_KEEP_DEFAULT skips GPU sort since
       // we pass already-sorted data; but upload_from_ids will sort again
       // internally — it doesn't know the input is sorted. That's fine,
       // std::sort on sorted data is O(n) with good implementations.)
       auto bm = cu_roaring::upload_from_ids(
           sorted.data(), static_cast<uint32_t>(sorted.size()), cfg.universe,
-          0, cu_roaring::PROMOTE_NONE);
+          0, cu_roaring::PROMOTE_KEEP_DEFAULT);
       cudaDeviceSynchronize();
 
       auto t1 = std::chrono::high_resolution_clock::now();
