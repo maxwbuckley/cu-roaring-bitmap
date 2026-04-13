@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-compare_results.py -- Compare cu-roaring-filter against ACORN and VecFlow baselines.
+compare_results.py -- Compare cu-roaring-bitmap against ACORN and VecFlow baselines.
 
 Loads benchmark results from our system and the baselines, then produces:
   1. QPS vs Recall comparison tables (markdown, for the paper)
@@ -355,7 +355,7 @@ def generate_architecture_comparison(systems: dict) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare cu-roaring-filter against ACORN and VecFlow baselines",
+        description="Compare cu-roaring-bitmap against ACORN and VecFlow baselines",
     )
     parser.add_argument(
         "--results-dir", default="results/baselines",
@@ -466,7 +466,7 @@ def main():
     md_sections = []
 
     # Title
-    md_sections.append("# cu-roaring-filter vs Baselines: YFCC-10M Evaluation")
+    md_sections.append("# cu-roaring-bitmap vs Baselines: YFCC-10M Evaluation")
     md_sections.append("")
     md_sections.append("Dataset: YFCC-10M (10M vectors, 192-dim uint8, 200K tags)")
     if system_info:
@@ -553,7 +553,7 @@ def main():
     md_sections.append("   - VecFlow may have higher raw QPS on common labels (pre-indexed)")
     md_sections.append("   - Our advantage: flexibility, memory efficiency, predicate composability")
     md_sections.append("")
-    md_sections.append("3. **Unique strengths of cu-roaring-filter**:")
+    md_sections.append("3. **Unique strengths of cu-roaring-bitmap**:")
     md_sections.append("   - Predicate-agnostic: any boolean filter, no index rebuild")
     md_sections.append("   - Compressed: Roaring bitmaps use 2-60x less memory than bitsets")
     md_sections.append("   - Composable: fused multi-AND in a single kernel")

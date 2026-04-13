@@ -2,7 +2,7 @@
 """
 run_baselines.py -- Evaluate ACORN and VecFlow on YFCC-10M filtered track.
 
-Runs each baseline system with the same queries and filters as our cu-roaring-filter
+Runs each baseline system with the same queries and filters as our cu-roaring-bitmap
 benchmarks, measuring QPS vs recall at various selectivities.
 
 Usage:

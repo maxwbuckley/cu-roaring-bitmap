@@ -11,7 +11,7 @@ FetchContent_MakeAvailable(googletest)
 
 function(add_cu_roaring_test name)
     add_executable(${name} ${name}.cu)
-    target_link_libraries(${name} PRIVATE cu_roaring_filter GTest::gtest_main)
+    target_link_libraries(${name} PRIVATE cu_roaring_bitmap GTest::gtest_main)
     set_target_properties(${name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     cu_roaring_target_strict_warnings(${name})
     add_test(NAME ${name} COMMAND ${name})

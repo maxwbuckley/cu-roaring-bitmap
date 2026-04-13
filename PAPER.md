@@ -2,7 +2,7 @@
 
 ## Abstract
 
-We present cu-roaring-filter, a GPU-native implementation of Roaring bitmaps optimized for filtered approximate nearest neighbor (ANN) search. Filtered ANN search requires checking billions of candidate vectors against validity predicates during graph traversal — a memory-bound operation where flat bitsets waste GPU memory and thrash caches at scale. Our system brings Roaring bitmaps to the GPU with a series of architecture-aware optimizations: a 2-read query path using direct-map key indices, cache-aware container promotion that adapts to the GPU's L2 cache size, warp-cooperative queries that amortize metadata lookups across SIMT lanes, and a fully device-resident upload pipeline that eliminates host round-trips. On an NVIDIA RTX 5090, cu-roaring-filter achieves query speed parity with flat bitsets while providing 6-59x memory compression for sparse filters. At 1B vectors, warp-cooperative queries are 1.7x faster than flat bitsets due to superior cache utilization. Multi-predicate filter construction (8-way AND at 1B scale) runs in 5.9 ms — 39x faster than CPU CRoaring and 3.5x faster than a naive pairwise GPU approach. Integration with NVIDIA cuVS's CAGRA graph search delivers 1.31x search speedup at 50% filter selectivity with 98.2% result agreement.
+We present cu-roaring-bitmap, a GPU-native implementation of Roaring bitmaps optimized for filtered approximate nearest neighbor (ANN) search. Filtered ANN search requires checking billions of candidate vectors against validity predicates during graph traversal — a memory-bound operation where flat bitsets waste GPU memory and thrash caches at scale. Our system brings Roaring bitmaps to the GPU with a series of architecture-aware optimizations: a 2-read query path using direct-map key indices, cache-aware container promotion that adapts to the GPU's L2 cache size, warp-cooperative queries that amortize metadata lookups across SIMT lanes, and a fully device-resident upload pipeline that eliminates host round-trips. On an NVIDIA RTX 5090, cu-roaring-bitmap achieves query speed parity with flat bitsets while providing 6-59x memory compression for sparse filters. At 1B vectors, warp-cooperative queries are 1.7x faster than flat bitsets due to superior cache utilization. Multi-predicate filter construction (8-way AND at 1B scale) runs in 5.9 ms — 39x faster than CPU CRoaring and 3.5x faster than a naive pairwise GPU approach. Integration with NVIDIA cuVS's CAGRA graph search delivers 1.31x search speedup at 50% filter selectivity with 98.2% result agreement.
 
 ## 1. Introduction
 
@@ -18,7 +18,7 @@ Roaring bitmaps [1] are a compressed bitmap format widely used in databases and 
 
 However, porting Roaring bitmaps to GPU is non-trivial. The data structure relies on binary search for key lookup and container-type dispatch — both sources of warp divergence and memory access irregularity on SIMT architectures. Prior work on compressed bitmaps on GPU is limited, and no existing system integrates compressed bitmaps directly into GPU graph search kernels.
 
-We present cu-roaring-filter, a GPU-native Roaring bitmap library designed for filtered ANN search. Our contributions are:
+We present cu-roaring-bitmap, a GPU-native Roaring bitmap library designed for filtered ANN search. Our contributions are:
 
 1. **A GPU memory layout and query path** for Roaring bitmaps that achieves 2 global memory reads per membership test (vs 1 for flat bitsets), with automatic hardware-aware optimization that selects the best container format based on the GPU's cache hierarchy.
 
@@ -52,7 +52,7 @@ Roaring bitmaps present challenges on all three fronts: the binary search over t
 
 ### 2.3 CAGRA Graph Search
 
-CAGRA [2] is a GPU-accelerated graph-based ANN algorithm in NVIDIA cuVS. It builds a k-NN graph over the dataset and searches it by traversing edges from random entry points, maintaining a priority queue of closest candidates. During traversal, each candidate is checked against a filter function — this is the operation cu-roaring-filter optimizes.
+CAGRA [2] is a GPU-accelerated graph-based ANN algorithm in NVIDIA cuVS. It builds a k-NN graph over the dataset and searches it by traversing edges from random entry points, maintaining a priority queue of closest candidates. During traversal, each candidate is checked against a filter function — this is the operation cu-roaring-bitmap optimizes.
 
 CAGRA's filter interface is a template parameter: any callable that maps (query_idx, sample_idx) → bool can be used. The filter is evaluated inside the search kernel by every thread in the traversal warp.
 
@@ -239,11 +239,11 @@ The progression from 17 reads to 2 reads per query was not planned — it emerge
 
 **Filtered ANN**: VecFlow [7] builds per-label sub-indices for pre-filtering but requires pre-indexed labels and doesn't support ad-hoc predicate combinations. FilteredDiskANN [8] uses label-partitioned graphs on CPU.
 
-To our knowledge, cu-roaring-filter is the first system to bring compressed bitmap data structures to GPU for vector search filtering.
+To our knowledge, cu-roaring-bitmap is the first system to bring compressed bitmap data structures to GPU for vector search filtering.
 
 ## 7. Conclusion
 
-Cu-roaring-filter demonstrates that Roaring bitmaps can be effectively adapted to GPU architecture for filtered ANN search. Through hardware-aware container promotion, direct-map key indices, warp-cooperative queries, and device-resident construction, we achieve query speed parity with flat bitsets while providing 6-59x memory compression. At 1B scale, the system beats flat bitsets on both speed (1.7x for point queries, 46x for multi-predicate construction) and memory (2.1 MB vs 125 MB for sparse filters).
+Cu-roaring-bitmap demonstrates that Roaring bitmaps can be effectively adapted to GPU architecture for filtered ANN search. Through hardware-aware container promotion, direct-map key indices, warp-cooperative queries, and device-resident construction, we achieve query speed parity with flat bitsets while providing 6-59x memory compression. At 1B scale, the system beats flat bitsets on both speed (1.7x for point queries, 46x for multi-predicate construction) and memory (2.1 MB vs 125 MB for sparse filters).
 
 The key insight is that faithful reproduction of a CPU data structure on GPU is suboptimal — the right approach is to adapt the format to GPU hardware (all-bitmap promotion, O(1) key index, 2-read fast path) while preserving the logical semantics (compressed set membership with boolean operations). The result is a system where the user writes three lines of code and the library transparently selects the optimal strategy for their GPU.
 

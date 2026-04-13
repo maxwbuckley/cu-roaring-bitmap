@@ -3,7 +3,7 @@
 ## Session Summary (March 22-23, 2026)
 
 ### What We Built
-- **cu-roaring-filter library**: GPU Roaring bitmaps with 2-read query path, direct-map key index, cache-aware PROMOTE_AUTO, fused multi-AND, GPU-native upload pipeline
+- **cu-roaring-bitmap library**: GPU Roaring bitmaps with 2-read query path, direct-map key index, cache-aware PROMOTE_AUTO, fused multi-AND, GPU-native upload pipeline
 - **10 benchmark suites** (B1-B10) across synthetic and real-world data
 - **cuVS/CAGRA integration** with one-line filter constructor
 - **PAPER.md** draft with systems contribution framing
@@ -27,7 +27,7 @@
   - `query.public.100K.u8bin` (19 MB) — 100K query vectors
   - `query.metadata.public.100K.spmat` (1.9 MB) — query tag requirements
   - `GT.public.ibin` (7.7 MB) — ground truth (100K × 10 neighbors)
-- **Exported data**: `cu-roaring-filter/bench/yfcc_data/` (316 MB)
+- **Exported data**: `cu-roaring-bitmap/bench/yfcc_data/` (316 MB)
   - 7,910 per-tag ID lists, query metadata, ground truth
 
 ---
@@ -38,7 +38,7 @@
 - **Status**: B10 benchmark runs on exported tag data (upload, AND, point queries)
 - **Still needed**: Full CAGRA search on YFCC vectors with roaring filter vs bitset filter
 - **Blocker**: cuVS standalone benchmark build has ABI mismatch (`std::experimental::extents`). Options:
-  - (a) Full `./build.sh libcuvs` rebuild (~45 min) to pick up latest cu-roaring-filter headers
+  - (a) Full `./build.sh libcuvs` rebuild (~45 min) to pick up latest cu-roaring-bitmap headers
   - (b) Fix the `ivf_pq.hpp` header issue in the standalone build
 - **Data location**: `big-ann-benchmarks/data/yfcc100M/`
 - **Export script**: `bench/yfcc_export.py`
@@ -148,8 +148,8 @@
 
 ### What Was Done
 1. **cuVS ABI investigation** — root cause identified: libcuvs.so uses Kokkos `std::experimental::mdspan`, conda libs use `cuda::std::mdspan`, system CUDA 12.4 uses `cuda::__4::mr::resource_ref` vs conda's `cuda::mr::__4::basic_resource_ref`. All three are incompatible.
-2. **Working build configuration** — conda `cuvs` env headers + local libcuvs.so + shared cu-roaring-filter lib. See memory file `project_cuvs_abi.md` for full build commands.
-3. **CUB ODR crash fixed** — cu-roaring-filter must be built as SHARED library (`-DBUILD_SHARED_LIBS=ON`) to isolate CUB device symbols from conda's CUB.
+2. **Working build configuration** — conda `cuvs` env headers + local libcuvs.so + shared cu-roaring-bitmap lib. See memory file `project_cuvs_abi.md` for full build commands.
+3. **CUB ODR crash fixed** — cu-roaring-bitmap must be built as SHARED library (`-DBUILD_SHARED_LIBS=ON`) to isolate CUB device symbols from conda's CUB.
 4. **Comprehensive benchmark** (`bench_cagra_roaring_comprehensive.cu`) — 15 search configs (1M + 10M, 0.1%-99% selectivity) + 3 multi-AND configs on RTX 5090.
 5. **Report generated** — `cuvs/cpp/bench/prims/core/ROARING_BENCHMARK_REPORT.md`
 6. **cuVS RAII wrapper updated** — `roaring.hpp` (key_index, negated, total_cardinality fields), `roaring.cu` (builds key_index in from_sorted_ids)
@@ -166,13 +166,13 @@
 | Complement optimization | Works correctly at >50% selectivity |
 
 ### What the Benchmark Does NOT Show (needs rebuilt libcuvs)
-- **Direct roaring_filter kernel** — warp-cooperative 2-read path without decompression. Expected to show 10-30% search speedup (from cu-roaring-filter's own B6 benchmarks).
+- **Direct roaring_filter kernel** — warp-cooperative 2-read path without decompression. Expected to show 10-30% search speedup (from cu-roaring-bitmap's own B6 benchmarks).
 - **Billion-scale compression** — 1B/0.1% → 59x compression (2.1MB vs 125MB). Current benchmark maxes at 10M.
 - **Multi-AND on compressed data** — at billion scale, roaring AND avoids full O(N/8) scans.
 
 ### Key Technical Discoveries
 - **RTTI mismatch** — `dynamic_cast<roaring_filter&>` fails when benchmark and libcuvs are compiled with different headers, causing silent fallback to bitset_filter (reads wrong memory → recall=0). Workaround: decompress to bitset.
-- **CUB ODR violation** — static linking cu-roaring-filter.a mixes CUB device symbols from two CCCL versions. Fix: shared library.
+- **CUB ODR violation** — static linking cu-roaring-bitmap.a mixes CUB device symbols from two CCCL versions. Fix: shared library.
 - **RMM header migration** — new RMM moves `rmm/mr/device/*.hpp` to `rmm/mr/*.hpp`, breaking cuVS source.
 
 ---
@@ -202,7 +202,7 @@
 ## File Locations
 
 ```
-cu-roaring-filter/
+cu-roaring-bitmap/
 ├── PAPER.md                    — Draft paper
 ├── PAPER_TODOS.md              — This file
 ├── REPORT.md                   — Technical report

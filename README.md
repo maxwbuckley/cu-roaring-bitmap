@@ -1,4 +1,4 @@
-# cu-roaring-filter
+# cu-roaring-bitmap
 
 GPU-accelerated Roaring Bitmap library for NVIDIA CUDA. Enables compressed set membership queries, boolean set operations, and integration with GPU vector search kernels — all without decompressing to flat bitsets.
 
@@ -6,7 +6,7 @@ GPU-accelerated Roaring Bitmap library for NVIDIA CUDA. Enables compressed set m
 
 Filtered vector search at scale requires checking billions of candidate IDs against a set of valid IDs. Flat bitsets waste memory and bandwidth when the valid set is sparse. CPU Roaring bitmaps (CRoaring) compress well but live on the wrong side of the PCIe bus.
 
-cu-roaring-filter brings Roaring bitmaps to the GPU:
+cu-roaring-bitmap brings Roaring bitmaps to the GPU:
 
 - **6-59x memory compression** vs flat bitsets (depending on set density)
 - **66x faster filter upload** at 100M IDs via GPU-native sort/partition pipeline
@@ -17,8 +17,8 @@ cu-roaring-filter brings Roaring bitmaps to the GPU:
 ## Quick Start
 
 ```bash
-git clone --recursive https://github.com/maxwbuckley/cu-roaring-filter.git
-cd cu-roaring-filter
+git clone --recursive https://github.com/maxwbuckley/cu-roaring-bitmap.git
+cd cu-roaring-bitmap
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="89"
 make -j$(nproc)
@@ -262,7 +262,7 @@ cu_roaring::enumerate_ids(bitmap, output, stream);
 
 ## Integration with NVIDIA cuVS (CAGRA)
 
-cu-roaring-filter integrates natively with CAGRA's filtered search. The Roaring bitmap is queried directly during graph traversal — no decompression step.
+cu-roaring-bitmap integrates natively with CAGRA's filtered search. The Roaring bitmap is queried directly during graph traversal — no decompression step.
 
 ```cpp
 #include <cuvs/neighbors/cagra.hpp>
@@ -490,7 +490,7 @@ The warp variant reduces binary searches by up to 32x when neighboring threads q
 ## Project Structure
 
 ```
-cu-roaring-filter/
+cu-roaring-bitmap/
 ├── include/cu_roaring/
 │   ├── cu_roaring.cuh              umbrella header
 │   ├── types.cuh                   GpuRoaring, enums
@@ -524,7 +524,7 @@ cu-roaring-filter/
 
 ## Comparison with Other Approaches
 
-| | cu-roaring-filter | Flat Bitset | VecFlow (label-centric IVF) |
+| | cu-roaring-bitmap | Flat Bitset | VecFlow (label-centric IVF) |
 |---|---|---|---|
 | **Filter type** | Any boolean predicate | Any boolean predicate | Pre-indexed labels only |
 | **Memory** | 6-59x compressed | Baseline | 3.5-10.8x overhead |

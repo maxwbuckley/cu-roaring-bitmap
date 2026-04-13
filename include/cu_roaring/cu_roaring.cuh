@@ -1,6 +1,6 @@
 #pragma once
 
-// Public umbrella header for cu_roaring_filter
+// Public umbrella header for cu_roaring_bitmap
 #include "cu_roaring/types.cuh"
 #include "cu_roaring/detail/utils.cuh"
 #include "cu_roaring/detail/promote.cuh"

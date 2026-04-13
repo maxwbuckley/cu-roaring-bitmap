@@ -3,7 +3,7 @@
 # setup_baselines.sh -- Clone, build, and configure ACORN and VecFlow baselines
 #
 # This script sets up two external baseline systems for comparison against
-# cu-roaring-filter in the YFCC-10M filtered ANN evaluation:
+# cu-roaring-bitmap in the YFCC-10M filtered ANN evaluation:
 #
 #   ACORN  (CPU, SIGMOD 2024) -- Predicate-agnostic HNSW with subgraph traversal
 #     Repo: https://github.com/stanford-futuredata/ACORN
@@ -180,7 +180,7 @@ if $DO_ACORN; then
 
     # ---- Document key ACORN API for reference ----
     cat > "$ACORN_DIR/EVALUATION_NOTES.md" << 'ACORN_NOTES'
-# ACORN Evaluation Notes for cu-roaring-filter Paper
+# ACORN Evaluation Notes for cu-roaring-bitmap Paper
 
 ## Key API (C++)
 
@@ -312,7 +312,7 @@ VECFLOW_INSTALL
 
     # ---- Document key VecFlow API for reference ----
     cat > "$VECFLOW_DIR/EVALUATION_NOTES.md" << 'VECFLOW_NOTES'
-# VecFlow Evaluation Notes for cu-roaring-filter Paper
+# VecFlow Evaluation Notes for cu-roaring-bitmap Paper
 
 ## Key API (Python)
 
@@ -346,7 +346,7 @@ neighbors, distances = vf.search(
 ## Important Notes for Fair Comparison
 
 1. VecFlow uses label-centric IVF: it pre-indexes by label at build time.
-   Our system (cu-roaring-filter) is predicate-agnostic (post-filtering).
+   Our system (cu-roaring-bitmap) is predicate-agnostic (post-filtering).
    This is a fundamental architectural difference to highlight in the paper.
 
 2. VecFlow requires float32 vectors. YFCC-10M is uint8. Must convert.

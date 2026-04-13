@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(cu_roaring_filter LANGUAGES CXX CUDA)
+project(cu_roaring_bitmap LANGUAGES CXX CUDA)
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
@@ -65,7 +65,7 @@ endfunction()
 # Main library
 # upload.cpp is compiled by g++ (not nvcc) because it touches CRoaring internals
 # which include GCC 13 intrinsics that nvcc 12.4 cannot parse.
-add_library(cu_roaring_filter
+add_library(cu_roaring_bitmap
     src/upload.cpp
     src/set_ops.cu
     src/decompress.cu
@@ -77,13 +77,13 @@ add_library(cu_roaring_filter
 # Header-only interface target for device-side API (roaring_view, warp_query)
 add_library(cu_roaring_device INTERFACE)
 target_include_directories(cu_roaring_device INTERFACE include/)
-target_include_directories(cu_roaring_filter PUBLIC include/)
-target_link_libraries(cu_roaring_filter PUBLIC roaring CUDA::cudart)
-set_target_properties(cu_roaring_filter PROPERTIES
+target_include_directories(cu_roaring_bitmap PUBLIC include/)
+target_link_libraries(cu_roaring_bitmap PUBLIC roaring CUDA::cudart)
+set_target_properties(cu_roaring_bitmap PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
-cu_roaring_target_strict_warnings(cu_roaring_filter)
+cu_roaring_target_strict_warnings(cu_roaring_bitmap)
 
 # Tests
 option(CU_ROARING_BUILD_TESTS "Build tests" ON)

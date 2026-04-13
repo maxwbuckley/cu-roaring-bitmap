@@ -3,7 +3,7 @@
 Filtered approximate nearest neighbor (ANN) search sits at the intersection of
 several research threads: compressed bitmap data structures, GPU-accelerated
 vector search, and predicate-aware index designs. We survey each area and
-position cu-roaring-filter relative to the landscape.
+position cu-roaring-bitmap relative to the landscape.
 
 ## 6.1 Compressed Bitmap Data Structures
 
@@ -32,7 +32,7 @@ Spark, Apache Druid, and Apache Kylin.  The CRoaring library [Lemire et al.,
 Software: Practice and Experience 2018] provides the reference C implementation
 and serves as the CPU baseline in our evaluation.
 
-All of these formats were designed for CPU execution.  Cu-roaring-filter is, to
+All of these formats were designed for CPU execution.  Cu-roaring-bitmap is, to
 our knowledge, the first implementation of Roaring bitmaps on GPU.  Our key
 insight is that faithful reproduction of CPU container selection heuristics is
 suboptimal on GPU: promoting all containers to bitmap format (Section 3.4)
@@ -57,7 +57,7 @@ over unenhanced GPU WAH implementations for range queries.  Like GPU-WAH, this
 work targets WAH-compressed bitmaps for analytical column scans, not the
 point-membership queries required by ANN graph traversal.
 
-Cu-roaring-filter differs from both lines of work in three respects.  First, we
+Cu-roaring-bitmap differs from both lines of work in three respects.  First, we
 implement Roaring bitmaps rather than WAH, gaining the format's inherent
 adaptivity.  Second, our query path is optimized for single-element membership
 tests (the operation performed millions of times per ANN search batch), not bulk
@@ -79,7 +79,7 @@ NVIDIA's cuVS library.  CAGRA constructs a pruned k-NN graph and searches it
 via warp-parallel beam traversal, achieving 33--77x higher throughput than
 CPU HNSW at equivalent recall.  CAGRA's filter interface accepts any callable
 `(query_idx, sample_idx) -> bool`, evaluated inside the search kernel.
-Cu-roaring-filter implements this interface, replacing CAGRA's default flat
+Cu-roaring-bitmap implements this interface, replacing CAGRA's default flat
 bitset filter with a compressed Roaring bitmap that reduces memory by 6--59x
 while matching or exceeding flat bitset query throughput.
 
@@ -90,10 +90,10 @@ high-specificity and low-specificity label groups.  VecFlow achieves 5 million
 QPS at 90% recall on an NVIDIA A100, outperforming CPU-based Filtered-DiskANN by
 up to 135x.  However, VecFlow requires labels to be known at index time and
 builds per-label structures, making it a pre-filtering approach.  In contrast,
-cu-roaring-filter is predicate-agnostic: any boolean predicate expressible as a
+cu-roaring-bitmap is predicate-agnostic: any boolean predicate expressible as a
 set of passing IDs can be uploaded at query time without rebuilding the index.
 This makes our approach complementary to VecFlow -- one could use VecFlow's
-label-centric indexing for high-frequency label predicates and cu-roaring-filter
+label-centric indexing for high-frequency label predicates and cu-roaring-bitmap
 for ad-hoc or compound predicates that were not anticipated at index time.
 
 ## 6.4 Filtered ANN: Label and Predicate-Aware Indices
@@ -116,8 +116,8 @@ the subgraph induced by any predicate remains navigable.  ACORN achieves
 2--1000x higher throughput than prior methods by traversing only the
 predicate-satisfying subgraph during search.  Weaviate adopted ACORN as its
 default filter strategy starting in v1.34 [Weaviate, 2024].  While ACORN is
-predicate-agnostic like cu-roaring-filter, it operates on CPU and modifies the
-graph structure.  Our work is orthogonal: cu-roaring-filter optimizes the filter
+predicate-agnostic like cu-roaring-bitmap, it operates on CPU and modifies the
+graph structure.  Our work is orthogonal: cu-roaring-bitmap optimizes the filter
 evaluation step on GPU without modifying the graph, and could in principle be
 combined with an ACORN-style GPU graph.
 
@@ -134,7 +134,7 @@ results.  Its "out-of-range search" strategy considers non-matching neighbors fo
 graph expansion while maintaining a separate result queue for matching vectors,
 achieving up to 9.8x higher throughput at 95% recall.  PathFinder's approach is
 complementary to ours: it optimizes which graph paths to explore, while
-cu-roaring-filter optimizes the per-candidate filter evaluation along any path.
+cu-roaring-bitmap optimizes the per-candidate filter evaluation along any path.
 
 SIEVE [Li et al., PVLDB 2025] builds a collection of HNSW indices tailored to
 an observed query workload.  A three-dimensional analytical model captures the
@@ -142,7 +142,7 @@ relationship among index size, search time, and recall, guiding the selection of
 which indices to build under a memory budget.  At query time, a router selects
 the index with the best expected latency-recall trade-off for each filter,
 achieving up to 8x speedup.  SIEVE assumes a known workload distribution and
-requires significant pre-computation, whereas cu-roaring-filter supports
+requires significant pre-computation, whereas cu-roaring-bitmap supports
 arbitrary ad-hoc predicates with no workload assumptions.
 
 **Range filtering.**  SeRF [Zuo et al., SIGMOD 2024] introduced the segment
@@ -156,7 +156,7 @@ hierarchical variant (HSIG) inspired by HNSW for logarithmic filtering
 complexity.  DIGRA [SIGMOD 2025] further adds dynamic update support via a
 multi-way tree structure with lazy weight-based updates, addressing the practical
 requirement of evolving datasets.  Range-filtered methods are orthogonal to
-cu-roaring-filter: they optimize for continuous attribute ranges, while we
+cu-roaring-bitmap: they optimize for continuous attribute ranges, while we
 optimize for arbitrary set-membership predicates.
 
 **Hybrid query systems.**  VBase [Zhang et al., OSDI 2023] unifies vector
@@ -165,7 +165,7 @@ monotonicity, which allows vector indices to be used within a standard query
 optimizer.  VBase integrates into PostgreSQL and supports HNSW, IVFFlat, and
 SPANN indices, achieving up to three orders of magnitude higher performance than
 prior vector database systems on complex queries.  VBase targets CPU-based
-analytical queries over moderate-scale data, whereas cu-roaring-filter targets
+analytical queries over moderate-scale data, whereas cu-roaring-bitmap targets
 high-throughput GPU filtering at billion scale.
 
 ## 6.5 Production Vector Search Systems
@@ -193,7 +193,7 @@ The selectivity thresholds are configurable per deployment.
 
 All three production systems use flat (uncompressed) bitmaps or bitsets for
 filter representation.  At billion-vector scale, this requires 125 MB per filter
-attribute, consuming a significant fraction of available memory.  Cu-roaring-filter
+attribute, consuming a significant fraction of available memory.  Cu-roaring-bitmap
 addresses this gap by providing compressed filter storage (2.1 MB for a 0.1%
 selectivity filter on 1B vectors) that integrates directly into the GPU search
 kernel without query performance degradation.
@@ -227,13 +227,13 @@ type, selectivity, and scale.
 These benchmarks focus exclusively on CPU methods.  None evaluates GPU-accelerated
 filtered search, and none measures the memory cost of filter representation --
 a critical concern at billion scale where filter storage can exceed the GPU's
-total memory.  Cu-roaring-filter fills both gaps: it is a GPU-native filter that
+total memory.  Cu-roaring-bitmap fills both gaps: it is a GPU-native filter that
 compresses representation while maintaining query throughput, evaluated on
 datasets up to 1B vectors.
 
-## 6.7 Positioning of Cu-Roaring-Filter
+## 6.7 Positioning of Cu-Roaring-Bitmap
 
-Table 1 summarizes how cu-roaring-filter relates to the closest prior work.
+Table 1 summarizes how cu-roaring-bitmap relates to the closest prior work.
 
 | System | Platform | Approach | Predicate-Agnostic | Compressed Filter | GPU-Native |
 |--------|----------|----------|--------------------|-------------------|------------|
@@ -244,15 +244,15 @@ Table 1 summarizes how cu-roaring-filter relates to the closest prior work.
 | Filtered-DiskANN | CPU | Label-partitioned graph | No | N/A | No |
 | VecFlow | GPU | Label-centric IVF | No | N/A | Yes |
 | SIEVE | CPU | Index collection | No (workload) | N/A | No |
-| **cu-roaring-filter** | **GPU** | **Post-filter** | **Yes** | **Yes (Roaring)** | **Yes** |
+| **cu-roaring-bitmap** | **GPU** | **Post-filter** | **Yes** | **Yes (Roaring)** | **Yes** |
 
-Cu-roaring-filter occupies a unique position: it is the only system that is
+Cu-roaring-bitmap occupies a unique position: it is the only system that is
 simultaneously (1) GPU-native, (2) predicate-agnostic (any set of passing IDs
 can be uploaded at query time), and (3) uses compressed filter representation.
 Predicate-aware methods (Filtered-DiskANN, UNG, VecFlow, SIEVE) achieve higher
 throughput for their supported predicate types by baking filter information into
 the index, but cannot handle ad-hoc or compound predicates without index
-rebuilding.  Cu-roaring-filter pays a modest cost for generality -- evaluating a
+rebuilding.  Cu-roaring-bitmap pays a modest cost for generality -- evaluating a
 filter bitmap at each candidate -- but compensates through GPU-optimized data
 layout (2-read query path, warp-cooperative queries) and gains substantial
 memory savings that enable scaling to billion-vector datasets with hundreds of

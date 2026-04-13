@@ -1,4 +1,4 @@
-# cu-roaring-filter: GPU Roaring Bitmaps for Filtered Vector Search
+# cu-roaring-bitmap: GPU Roaring Bitmaps for Filtered Vector Search
 
 **Target**: NVIDIA cuVS (CAGRA graph-based ANN search)
 **Hardware**: NVIDIA RTX 5090 (170 SMs, 32 GB, Blackwell architecture)
@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-cu-roaring-filter brings Roaring bitmap compressed set membership to NVIDIA GPUs, enabling memory-efficient filtered vector search at billion scale. At 1B vectors with 10% filter selectivity, `warp_contains()` is **1.6x faster than flat bitset** while using up to **59x less memory** for sparse filters. Inside NVIDIA cuVS's CAGRA graph search, roaring filters deliver **1.31x speedup** over the bitset baseline at 50% selectivity with 98.2% result agreement (both methods produce approximate results; the 1.8% difference is due to CAGRA's graph traversal taking slightly different paths, not missing valid neighbors).
+cu-roaring-bitmap brings Roaring bitmap compressed set membership to NVIDIA GPUs, enabling memory-efficient filtered vector search at billion scale. At 1B vectors with 10% filter selectivity, `warp_contains()` is **1.6x faster than flat bitset** while using up to **59x less memory** for sparse filters. Inside NVIDIA cuVS's CAGRA graph search, roaring filters deliver **1.31x speedup** over the bitset baseline at 50% selectivity with 98.2% result agreement (both methods produce approximate results; the 1.8% difference is due to CAGRA's graph traversal taking slightly different paths, not missing valid neighbors).
 
 Key results:
 - **Query speed**: 24 Gq/s (warp-cooperative, 1B/10%) vs 15 Gq/s for flat bitset
@@ -290,7 +290,7 @@ For "color=red AND price<50 AND in_stock" at 1B scale:
 
 ## 10. Comparison with Alternatives
 
-| | cu-roaring-filter | Flat Bitset (cuVS default) | VecFlow (label-centric IVF) |
+| | cu-roaring-bitmap | Flat Bitset (cuVS default) | VecFlow (label-centric IVF) |
 |---|---|---|---|
 | **Filter type** | Any boolean predicate | Any boolean predicate | Pre-indexed labels only |
 | **Memory (1B, 0.1%)** | **2.1 MB** | 125 MB | N/A |
@@ -341,7 +341,7 @@ Remaining for upstream PR:
 ### Running Benchmarks
 
 ```bash
-cd cu-roaring-filter/build
+cd cu-roaring-bitmap/build
 ./bench/bench_point_query           # B6: point query throughput
 ./bench/bench_optimized_query       # B7: optimization analysis
 ./bench/bench_comprehensive         # B1/B3/B4/B5: construction, memory, E2E
