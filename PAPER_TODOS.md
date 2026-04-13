@@ -209,21 +209,43 @@
 These were identified in a critical code review after the April rename. Severity tags indicate correctness bugs vs perf wins. The two `[FIXED]` items are addressed in the follow-up commit; the remainder are open.
 
 ### Correctness
-- **[FIXED] Run-container overflow** — `src/decompress.cu`, `src/promote.cu`, `src/set_ops.cu`. The loop `for (uint32_t v = start; v <= start + len; ++v)` wraps to 0 when `start + len ≥ 65536`, producing either infinite loops or silently wrong output for runs that touch the top of a container.
-- **[FIXED] Zeroed cardinalities in fused multi_and** — `src/set_ops.cu` (`fused_multi_and_allbitmap`). Output container cardinalities were left at 0 by the fused kernel, which breaks any downstream code that uses `total_cardinality` (promotion heuristics, `enumerate_ids`, decompression early-exits).
+- **[FIXED, UNVERIFIED] Run-container overflow** — commit `9c9185b`. `src/decompress.cu`, `src/promote.cu`, `src/set_ops.cu`. Clamped `end` to `0xFFFF` in all three run-expansion loops so malformed runs can't overrun the per-container bitmap. On closer reading this is a defensive fix, not the `uint32_t` wraparound the original audit described — the arithmetic was already in `uint32_t`. Needs RTX 5090 `ctest` to confirm no behaviour change on well-formed inputs.
+- **[FIXED, UNVERIFIED] Zeroed cardinalities in fused multi_and** — commit `9c9185b`. `fused_multi_and_kernel` now popcounts each output word inline, block-reduces via warp shuffles, writes per-container cardinalities and atomicAdds into a single `total_cardinality` counter. Needs a test that asserts `result.total_cardinality` after a real multi_and matches a decompress-and-popcount reference.
+
+### D2H / H2D elimination
+- **[IMPLEMENTED, UNVERIFIED] `promote_to_bitmap` fully device-resident** — commit `84e82ba`. `src/promote.cu` no longer downloads metadata or data pools. One-block-per-container `promote_to_bitmap_kernel` self-dispatches on source container type; `build_key_index_kernel` scatters the direct-map index; `keys` and `cardinalities` are D2D; `max_key` is derived from `universe_size`. **Validate**: `ctest -R promote`, `cuda-memcheck ./test/test_promote`, `bench_upload_scale` at 100M+ IDs.
+- **[IMPLEMENTED, UNVERIFIED] `fused_multi_and_allbitmap` fully device-resident** — commit `84e82ba`. Seven new kernels replace the old host-side key download + `std::set_intersection` + `std::lower_bound` pointer table. Only host↔device traffic left: ~256 B of `FusedInputMeta`, one 4-byte D2H for `n_common`, one 4-byte D2H for `total_cardinality`. See `HANDOFF_NVIDIA.md` for the full verification plan. **Highest-risk new code**: the hand-written warp-shuffle block scan in `enumerate_presence_keys_kernel` and the 2D launch config of `build_pointer_table_kernel`.
 
 ### GPU perf (open)
-- **atomicOr contention in scatter/decompress** — `src/decompress.cu` bitmap/run/array paths, `src/set_ops.cu::scatter_to_bitmaps_kernel`, `src/upload_ids.cu`. Threads serialize on the same 64-bit word. Stage into per-thread `uint64_t` accumulators with one atomic per thread, or partition the output word space across warps.
-- **`promote_to_bitmap` does full D2H → H2D round trip** — `src/promote.cu`. A pure structural transform shouldn't touch the host; port to an on-device kernel (one block per container, read source metadata, expand array/run into destination bitmap pool).
+- **atomicOr contention in scatter/decompress** — `src/decompress.cu` bitmap/run/array paths, `src/set_ops.cu::scatter_to_bitmaps_kernel`, `src/upload_ids.cu`. Threads serialize on the same 64-bit word. Stage into per-thread `uint64_t` accumulators with one atomic per thread, or partition the output word space across warps. **Now the highest-impact open item.**
+- **Pairwise `set_operation` container matching still on host** — `src/set_ops.cu::download_index` + classification loop. Hits only when inputs have mixed container types, which is uncommon once `promote_auto` runs, so medium impact. A proper on-device port is ~500 lines of new kernels plus careful work-item classification. Treat as a standalone branch.
 - **`array_array_and_kernel` serializes to thread 0** — `src/set_ops.cu`. The merge walks both arrays sequentially on a single thread after staging into shared memory; use a block-cooperative two-pointer merge, or fall back to CPU below ~256 elements per side.
 - **`bitmap_array_and_kernel` warp divergence** — `src/set_ops.cu`. Ballot + warp-prefix-sum + one atomic per warp would replace the current per-thread `atomicAdd`.
 
 ### Algorithmic (open)
-- **All-negated `multi_and` allocates a dense key space** — `src/set_ops.cu`. When every input is negated, the current path enumerates `[0, max_key]`. Use the union of present keys instead.
-- **CPU-side `std::lower_bound` per common key in fused `multi_and`** — `src/set_ops.cu`. O(n_common × count × log n) host work per call; cache the key→index map once per input.
+- **All-negated `multi_and` universe allocation** — now handled on-device via `presence_and_reduce_kernel`'s universe-mask path. Still allocates 8 KB of presence bitmap even for tiny universes; trim if benchmarked regression.
+- **CPU-side `std::lower_bound` per common key in fused `multi_and`** — **resolved** in commit `84e82ba`. The lookup now happens on device via `build_pointer_table_kernel` using `key_index` (O(1)) or a device binary search.
 
 ### Cleanup
 - **Drop outdated "Planned" rows in REPORT.md once new work is shipped** — keep §9 in sync with this backlog rather than duplicating status across both files.
+- **Backfill PAPER.md / REPORT.md with the D2H-elimination story** — after the commits below are validated on the RTX 5090, add a short note to PAPER.md §3 and REPORT.md Shipped table. Probably worth a full §3.10 "Device-resident pipeline" subsection once we have numbers.
+
+### Required verification on the RTX 5090
+
+All UNVERIFIED items above need these checks before they can be considered trustworthy. Full instructions live in `HANDOFF_NVIDIA.md`; summary:
+
+1. `cmake --build . -j` clean under `-Werror` (likely needs include / shadow-warning cleanup since the new code was written without a compiler).
+2. `ctest --output-on-failure` green — especially `multi_and`, `fused`, `promote`, `enumerate_ids` test groups.
+3. `cuda-memcheck` clean on at least `test_set_ops --gtest_filter='*multi_and*'` and `test_promote`.
+4. Drop three new regression tests sketched in `HANDOFF_NVIDIA.md` Stage 4 (transfer-budget assertion, all-negated universe mask, all-bitmap promote round-trip).
+5. Benchmark comparison vs previous JSONs:
+   - `bench_multi_and` — **expected win** at count ≥ 8 with large per-input container counts (old path spent tens of ms on CPU `set_intersection`; new path spends microseconds on device kernels).
+   - `bench_upload_scale` at 100M+ IDs — **expected win** via `promote_to_bitmap` being kernel-only.
+   - `bench_alloc_strategy`, `bench_set_ops`, `bench_comprehensive`, `bench_point_query`, `bench_enumerate_ids`, `bench_selectivity_sweep` — **no regression**.
+   - `bench_yfcc` if `yfcc_data/` is present — real-world sanity check.
+6. Save fresh JSONs under `results/raw/2026-04-13/`, update PAPER.md / REPORT.md tables with the new numbers.
+
+**Red flags**: `bench_multi_and` regressing at small counts (the new path has 7-8 kernel launches vs old 1-2 — launch overhead may dominate for `count × avg_containers < 1000`). Mitigation: fuse the presence kernels, or reinstate the CPU path as a small-count opt-in fallback. See `HANDOFF_NVIDIA.md` "Red flags" section.
 
 ---
 
