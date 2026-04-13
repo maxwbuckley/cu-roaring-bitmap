@@ -2,7 +2,7 @@
 
 ## Abstract
 
-We present cu-roaring-bitmap, a GPU-native implementation of Roaring bitmaps optimized for filtered approximate nearest neighbor (ANN) search. Filtered ANN search requires checking billions of candidate vectors against validity predicates during graph traversal — a memory-bound operation where flat bitsets waste GPU memory and thrash caches at scale. Our system brings Roaring bitmaps to the GPU with a series of architecture-aware optimizations: a 2-read query path using direct-map key indices, cache-aware container promotion that adapts to the GPU's L2 cache size, warp-cooperative queries that amortize metadata lookups across SIMT lanes, and a fully device-resident upload pipeline that eliminates host round-trips. On an NVIDIA RTX 5090, cu-roaring-bitmap achieves query speed parity with flat bitsets while providing 6-59x memory compression for sparse filters. At 1B vectors, warp-cooperative queries are 1.7x faster than flat bitsets due to superior cache utilization. Multi-predicate filter construction (8-way AND at 1B scale) runs in 5.9 ms — 39x faster than CPU CRoaring and 3.5x faster than a naive pairwise GPU approach. Integration with NVIDIA cuVS's CAGRA graph search delivers 1.31x search speedup at 50% filter selectivity with 98.2% result agreement.
+We present cu-roaring-bitmap, a GPU-native implementation of Roaring bitmaps optimized for filtered approximate nearest neighbor (ANN) search. Filtered ANN search requires checking billions of candidate vectors against validity predicates during graph traversal — a memory-bound operation where flat bitsets waste GPU memory and thrash caches at scale. Our system brings Roaring bitmaps to the GPU with a series of architecture-aware optimizations: a 2-read query path using direct-map key indices, cache-aware container promotion that adapts to the GPU's L2 cache size, warp-cooperative queries that amortize metadata lookups across SIMT lanes, a fully device-resident upload pipeline that eliminates host round-trips, a complement-bitmap representation that makes compression symmetric around 50% density, a fused negation-aware multi-predicate kernel, a direct-to-CSR `enumerate_ids` export path, and stream-ordered allocation that removes ~19 implicit device syncs per set operation. On an NVIDIA RTX 5090, cu-roaring-bitmap achieves query speed parity with flat bitsets while providing 6-59x memory compression for sparse *or* dense filters (via the complement path). At 1B vectors, warp-cooperative queries are 1.7x faster than flat bitsets due to superior cache utilization. Multi-predicate filter construction (8-way AND at 1B scale) runs in 5.9 ms — 39x faster than CPU CRoaring and 3.5x faster than a naive pairwise GPU approach. Integration with NVIDIA cuVS's CAGRA graph search delivers 1.31x search speedup at 50% filter selectivity with 98.2% result agreement.
 
 ## 1. Introduction
 
@@ -24,9 +24,15 @@ We present cu-roaring-bitmap, a GPU-native Roaring bitmap library designed for f
 
 2. **A fully device-resident construction pipeline** that sorts, deduplicates, partitions, and builds bitmap containers entirely on GPU using CUB primitives, achieving 66x speedup over CPU construction at 100M IDs.
 
-3. **A fused multi-predicate kernel** for N-way boolean AND that processes all predicates in a single pass, avoiding the allocation storms and synchronization overhead of pairwise approaches (3-6x speedup).
+3. **A fused, negation-aware multi-predicate kernel** for N-way boolean AND that processes all predicates in a single pass, applies DeMorgan transforms to handle negated inputs without materializing intermediate complements, and avoids the allocation storms and synchronization overhead of pairwise approaches (3-6x speedup).
 
-4. **Integration with NVIDIA cuVS (CAGRA)** demonstrating 1.31x search speedup at 50% selectivity with near-identical result quality, and 6-59x memory reduction for sparse filters.
+4. **A complement-bitmap representation** that makes Roaring compression symmetric around 50% density: a 99% pass-rate filter is stored as the 1% rejects, achieving the same 59x compression that sparse filters enjoy. Complement state is tracked on the bitmap, propagated through set operations via DeMorgan's laws, and inverted at query / decompression time, so the logical semantics are invisible to the caller.
+
+5. **A direct roaring-to-CSR export** (`enumerate_ids`) that emits sorted `int64_t` column indices in a single kernel launch, bypassing the flat-bitset intermediate used by prior brute-force filtered search pipelines — 4–4.5x faster than decompress+scan at 1B scale with sparse filters.
+
+6. **Stream-ordered allocation throughout** using `cudaMallocAsync` + `cudaFreeAsync` with a tuned CUDA memory pool. This eliminates the ~19 implicit device-wide synchronizations previously triggered per `set_operation` call by temporary-buffer `cudaFree`s, yielding 1.9–3.3x end-to-end speedups on hot paths with no external RMM dependency.
+
+7. **Integration with NVIDIA cuVS (CAGRA)** demonstrating 1.31x search speedup at 50% selectivity with near-identical result quality, and 6-59x memory reduction for sparse filters.
 
 ## 2. Background
 
@@ -124,7 +130,7 @@ Filter construction from a set of passing IDs follows a fully GPU-resident pipel
 
 Data never returns to the host after the initial transfer. At 100M IDs, this pipeline runs in 99 ms — 66x faster than CPU sort + upload (7.5 seconds).
 
-### 3.6 Fused Multi-Predicate AND
+### 3.6 Fused, Negation-Aware Multi-Predicate AND
 
 Multi-predicate filter construction (e.g., AND-ing N attribute bitmaps) uses a fused single-pass kernel when all inputs are all-bitmap format:
 
@@ -133,6 +139,35 @@ Multi-predicate filter construction (e.g., AND-ing N attribute bitmaps) uses a f
 3. Single kernel launch: for each common key, AND the 1024 bitmap words across all N inputs. One thread block per output container.
 
 This replaces the previous pairwise chain (N-1 separate `set_operation` calls, each with device-to-host downloads, CPU container matching, ~10 cudaMalloc calls, and stream synchronization).
+
+Each input is tagged with a `negated` flag (see §3.7). The fused kernel inverts the per-word contribution of any negated input directly inside the reduction (`word ^= ~0ull`), so negated operands never materialize a complement container. All 16 `{AND, OR, ANDNOT, XOR} × {negated, normal}²` combinations reduce, via DeMorgan, to a single AND/OR reduction over (optionally inverted) words plus a final complement on the output — no branching in the inner loop.
+
+### 3.7 Complement Bitmap Optimization
+
+Standard Roaring compression is asymmetric: a 1% density filter compresses 59x, but a 99% density filter gets ~1x because all of its containers are dense bitmaps. The complement optimization fixes this at the data-structure level.
+
+A `GpuRoaring` carries a single `negated` flag. When `upload_from_ids` (or `upload`) sees a density above 50%, it stores the *complement* of the input set — the rejected elements — and sets `negated = true`. The complement is computed on-device via a gap-expansion pipeline: CUB `ExclusiveSum` of a per-ID "present" mask yields gap offsets, and a scatter kernel writes the missing IDs. No host round-trip is required.
+
+At query time, `contains()` and `warp_contains()` XOR their result with `negated`, so callers observe the original set. Set operations propagate `negated` through DeMorgan's laws before dispatching to the container kernels — for example, `AND(~A, B)` rewrites to `ANDNOT(B, A)`, and `AND(~A, ~B)` rewrites to `~OR(A, B)`. All 16 combinations of signs and operators are handled in a single `resolve_negation` helper. `decompress_to_bitset` inverts the output when `negated == true`. The optimization is therefore transparent to users while delivering symmetric compression: a 99% pass-rate filter stores 1% density and achieves the same 59x compression.
+
+### 3.8 Direct CSR Export (`enumerate_ids`)
+
+Prior GPU brute-force filtered search pipelines materialize a flat bitset from the filter, then run a separate bitset-to-CSR kernel (popcount + prefix sum + bit extraction) to obtain column indices. Both steps scan the full N-bit universe regardless of how many bits are set.
+
+`enumerate_ids` emits sorted `int64_t` IDs directly from the compressed representation in a single kernel launch. Each non-empty container writes its elements at an offset determined by a device-side `ExclusiveSum` over cardinalities:
+
+- **Array containers** are a direct copy: stored `uint16_t` values are already sorted, so each element is widened to `int64_t` with the container's 16-bit key OR'd in. Work is O(cardinality).
+- **Bitmap containers** use a block-cooperative bit extraction: 256 threads process one container's 1024 `uint64_t` words (4 words per thread), a shared-memory prefix sum of per-thread popcounts determines each thread's write offset, and threads emit IDs in sorted order without a post-sort.
+- **Run containers** expand via a shared-memory prefix sum on run lengths.
+- **Absent containers** are skipped entirely.
+
+At 1B scale with 0.1–1% density, this is 4–4.5x faster than the decompress-then-scan baseline, which must touch the full 119 MB bitset regardless of selectivity. It also reduces the brute-force filtered search pipeline from seven kernel launches to four.
+
+### 3.9 Stream-Ordered Allocation and Memory Pool Tuning
+
+Profiling a single `set_operation` call on large inputs revealed that temporary buffer cleanup was the dominant cost: each `cudaFree` forced a device-wide synchronization, and a dense AND over 1526 containers issued roughly 19 such syncs per call. We migrated every internal allocation to `cudaMallocAsync` / `cudaFreeAsync` using the CUDA 12+ stream-ordered memory pool. The library additionally provides `gpu_roaring_free_async` for use inside hot loops — `multi_and` and `multi_or` use it internally when walking their pairwise reduction tree.
+
+Two configurations are possible. With the default pool (release threshold 0) freed memory may be returned to the OS; with `cudaMemPoolAttrReleaseThreshold = UINT64_MAX` the pool retains freed blocks for reuse, giving behavior equivalent to RMM's `pool_memory_resource` without the dependency. Section 4.7 shows that the tuned pool yields 1.9–3.3x speedups on `set_operation` and `upload_from_ids` at scale, with tail-latency variance dropping nearly 5x at 100M IDs.
 
 ## 4. Evaluation
 
@@ -191,7 +226,43 @@ Fused vs pairwise, Zipfian density distribution:
 
 Result agreement is measured as the fraction of k=10 results identical between the two filter implementations. Both produce approximate results (CAGRA is an ANN algorithm); the 2-4% difference reflects different graph traversal paths, not missing valid neighbors.
 
-### 4.6 Memory Savings at Scale
+### 4.6 Direct CSR Export (enumerate_ids)
+
+`enumerate_ids` vs the two-step baseline (`decompress_to_bitset` + bitset-to-CSR), measured on the same hardware:
+
+| Universe | Density | Cardinality | `enumerate_ids` | Baseline | Speedup |
+|----------|---------|-------------|-----------------|----------|---------|
+| 10M | 0.1% | 10K | 0.533 ms | 0.604 ms | 1.1x |
+| 100M | 1% | 1M | 0.549 ms | 0.590 ms | 1.1x |
+| **1B** | **0.1%** | **1M** | **0.692 ms** | **3.089 ms** | **4.5x** |
+| **1B** | **1%** | **10M** | **0.726 ms** | **3.103 ms** | **4.3x** |
+| 1B | 10% | 100M | 3.590 ms | 3.829 ms | 1.1x |
+
+At 1B scale the baseline must scan the full 119 MB bitset regardless of selectivity; `enumerate_ids` processes only non-empty containers and is write-bound only at high density.
+
+### 4.7 Stream-Ordered Allocation Impact
+
+Comparing two pool configurations: default (`release_threshold = 0`) vs tuned (`release_threshold = UINT64_MAX`). 50 iterations, 10 warmup.
+
+**`set_operation`**:
+
+| Condition | Containers | Default | Tuned | Speedup |
+|-----------|-----------|---------|-------|---------|
+| dense AND 100M | 1526 | 1477 µs | 448 µs | **3.30x** |
+| dense AND 1M | 16 | 478 µs | 331 µs | 1.44x |
+| mixed OR 10M | 153 | 1452 µs | 1377 µs | 1.05x |
+
+**`upload_from_ids`**:
+
+| Condition | IDs | Default | Tuned | Speedup |
+|-----------|-----|---------|-------|---------|
+| 1M 10% | 100K | 1309 µs | 466 µs | **2.81x** |
+| 10M 10% | 1M | 1699 µs | 613 µs | **2.77x** |
+| 100M 10% | 10M | 8675 µs | 3684 µs | **2.35x** |
+
+Beyond the mean speedup, tail-latency variance drops sharply: `upload_from_ids` at 100M goes from σ = 1058 µs to σ = 225 µs (4.7x tighter). Compared to the original synchronous `cudaMalloc` / `cudaFree` baseline the improvement is larger still, since every legacy `cudaFree` forced a device sync.
+
+### 4.8 Memory Savings at Scale
 
 For a 1B-vector dataset with 100 filterable attributes (Zipfian density distribution):
 
@@ -231,15 +302,19 @@ The progression from 17 reads to 2 reads per query was not planned — it emerge
 
 ## 6. Related Work
 
-**CPU Roaring Bitmaps**: CRoaring [1] is the reference implementation. EWAH [3] and Concise [4] are earlier compressed bitmap formats. All are CPU-only.
+A full treatment of related work — covering compressed bitmap indexes, GPU database column scans, filtered ANN systems, label-partitioned graph indexes, and hybrid analytical/search engines — is provided in `analysis/related_work.md`. We summarize the most directly comparable systems here.
 
-**GPU Bitmap Operations**: BitWeaving [5] explored GPU-accelerated bitmap operations for database column scans but used flat bitmaps. RAPIDS cuDF uses flat validity bitmasks for DataFrame filtering.
+**CPU compressed bitmaps.** CRoaring [1] is the reference Roaring implementation and powers bitmap indexes in Lucene, Druid, Pinot, ClickHouse, and many other analytical engines. EWAH [3] and Concise [4] are earlier word-aligned compressed formats. All target CPU cache hierarchies; none have been ported to GPU in a form usable inside a search kernel.
 
-**GPU-Accelerated ANN Search**: NVIDIA cuVS [2] provides CAGRA (graph-based), IVF-PQ, and IVF-Flat. Faiss [6] provides CPU and GPU ANN implementations. All use flat bitsets for filtering.
+**GPU bitmap operations.** BitWeaving [5] introduced GPU-parallel column scans using flat bitmaps packed vertically for SIMD efficiency. RAPIDS cuDF uses flat validity bitmasks for DataFrame filtering. Both assume dense bitsets and do not benefit from container-level compression.
 
-**Filtered ANN**: VecFlow [7] builds per-label sub-indices for pre-filtering but requires pre-indexed labels and doesn't support ad-hoc predicate combinations. FilteredDiskANN [8] uses label-partitioned graphs on CPU.
+**GPU-accelerated ANN search.** NVIDIA cuVS [2] provides CAGRA (graph-based), IVF-PQ, and IVF-Flat, all of which use flat `cuvs::core::bitset` filters at the search-kernel boundary. Faiss [6] provides CPU and GPU ANN implementations with bitset-based filtering. Our work is the first to replace the bitset filter interface with a compressed Roaring representation inside the search kernel itself.
 
-To our knowledge, cu-roaring-bitmap is the first system to bring compressed bitmap data structures to GPU for vector search filtering.
+**Filtered ANN.** VecFlow [7] builds per-label sub-indices for pre-filtering; it achieves very high throughput on in-distribution label predicates but requires label pre-indexing and cannot handle ad-hoc boolean combinations. FilteredDiskANN [8] uses label-partitioned graphs on CPU with similar trade-offs. NHQ [11] and related hybrid systems modify the graph structure to be filter-aware. Cu-roaring-bitmap is orthogonal: it is predicate-agnostic (any boolean predicate expressible as a bitmap) and optimizes the per-candidate filter evaluation along *any* search path rather than restructuring the index.
+
+**Complement storage.** The complement-bitmap idea has CPU precedent in bitmap indexing work [9, 10] but, to our knowledge, has not previously been pushed through GPU Roaring set operations via automatic DeMorgan propagation.
+
+To our knowledge, cu-roaring-bitmap is the first system to bring compressed bitmap data structures to GPU for vector search filtering, and the first to ship a GPU-native Roaring implementation with complement-aware set algebra, fused multi-predicate kernels, and direct CSR export.
 
 ## 7. Conclusion
 

@@ -2,7 +2,7 @@
 
 **Target**: NVIDIA cuVS (CAGRA graph-based ANN search)
 **Hardware**: NVIDIA RTX 5090 (170 SMs, 32 GB, Blackwell architecture)
-**Date**: March 2026
+**Date**: April 2026
 
 ---
 
@@ -35,7 +35,12 @@ Key results:
 | One-line cuVS filter | Done | `roaring_filter(gpu_bitmap)` — no make_view, no cardinality |
 | Strict `-Werror` on all targets | Done | 14 warning flags, zero suppressions |
 | Bloom filter | **Removed** | Benchmarked at 5-17% overhead across 48 configs, zero benefit |
-| 7 benchmark suites (B1-B7) | Done | 150+ configurations, JSON output, figure generation |
+| Complement bitmap optimization | Done | Symmetric compression around 50% — 99% pass rate → 59x compression via stored complement + DeMorgan on set ops |
+| `upload_from_bitset` / `upload_from_device_bitset` | Done | Zero-copy from host/device bitset; auto-complement when density > 50% |
+| `enumerate_ids()` / CSR export | Done | Sorted `int64_t` ID array directly from compressed bitmap; 4-4.5x vs decompress+scan at 1B sparse |
+| Fused negation-aware `multi_and` | Done | Handles `{AND,OR,ANDNOT,XOR} × {negated,normal}` via DeMorgan transforms |
+| Stream-ordered allocation (`cudaMallocAsync`) | Done | Pool-based temp buffers; 1.9–3.3x speedup on hot paths, eliminates ~19 device syncs/set_op |
+| 11 benchmark suites (B1-B11) | Done | 150+ configurations, JSON output, figure generation |
 | CAGRA integration (cuVS fork) | Done | Kernel instantiations for float/half/int8/uint8 |
 | REPORT.md + README.md | Done | Full documentation |
 
@@ -273,13 +278,17 @@ For "color=red AND price<50 AND in_stock" at 1B scale:
 | Direct-map key index | O(1) key lookup replaces O(log n) binary search. 30 KB at 1B | `roaring_view.cuh`, all upload paths |
 | 2-read all-bitmap fast path | Skips type/offset/card reads when all containers are bitmap. 2 reads vs bitset's 1 | `roaring_view.cuh`, `roaring_warp_query.cuh` |
 | Fused multi-AND kernel | 3-6x faster than pairwise chain for N-way AND on all-bitmap inputs | `set_ops.cu` |
+| Negation-aware fused multi_and | DeMorgan transforms covering all 16 sign×op combinations | `set_ops.cu` |
+| Complement bitmap optimization | Symmetric compression around 50% — 99% pass rate → 59x compression | `upload_ids.cu`, `set_ops.cu`, `decompress.cu` |
+| `upload_from_bitset` / `upload_from_device_bitset` | Fastest upload path (popcount + compact, no sort/dedupe) | `upload_ids.cu` |
+| `enumerate_ids()` / CSR export | 4-4.5x vs decompress+scan at 1B sparse; avoids bitset intermediate | `to_csr.cu` |
+| Stream-ordered allocation (`cudaMallocAsync`) | 1.9–3.3x on hot paths; eliminates ~19 device syncs per `set_operation` | `utils.cuh`, all src/* |
 | Strict `-Werror` (14 flags) | Zero warnings on all 11 targets | `CMakeLists.txt` |
 
 ### Planned (not started)
 
 | Optimization | Expected Impact | Effort | Notes |
 |---|---|---|---|
-| **cudaMallocAsync / memory pool** | Reduce allocation stalls | Medium | Replace synchronous cudaMalloc in pairwise set_ops with stream-ordered allocation |
 | **IVF-PQ/Flat support** | Expand beyond CAGRA | Medium | Add `FilterType::Roaring` to cuVS IVF runtime dispatch union |
 | **Python bindings** | Developer reach | Medium | Expose `roaring_filter` through `pylibcuvs` for Python RAG pipelines |
 | **Shared memory key cache** | Better locality in CAGRA kernel | Low | Preload key index into SMEM once per block. Only measurable inside CAGRA, not standalone |

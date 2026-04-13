@@ -4,7 +4,7 @@
 
 ### What We Built
 - **cu-roaring-bitmap library**: GPU Roaring bitmaps with 2-read query path, direct-map key index, cache-aware PROMOTE_AUTO, fused multi-AND, GPU-native upload pipeline
-- **10 benchmark suites** (B1-B10) across synthetic and real-world data
+- **11 benchmark suites** (B1-B11) across synthetic and real-world data
 - **cuVS/CAGRA integration** with one-line filter constructor
 - **PAPER.md** draft with systems contribution framing
 - **YFCC-10M Big-ANN benchmark** (B10) — downloaded and running on real data
@@ -189,13 +189,41 @@
 | ACORN baseline | **Scripts ready** | Critical | `scripts/setup_baselines.sh` |
 | VecFlow baseline | **Scripts ready** | Critical | CUDA 11 wheel caveat |
 | Baseline comparison | **Scripts ready** | Critical | `scripts/run_baselines.py` + `scripts/compare_results.py` |
-| Selectivity sweep (B11) | **Code written** | Critical | `bench/bench_selectivity_sweep.cu` — needs build + run |
-| Roofline model | **Draft done** | Important | `analysis/roofline_model.md` — needs PAPER.md integration |
-| Related work (2 pages) | **Draft done** | Critical | `analysis/related_work.md` — needs PAPER.md integration |
+| Selectivity sweep (B11) | **DONE** | Critical | `bench/bench_selectivity_sweep.cu` built and documented in README |
+| Roofline model | **Draft done** | Important | `analysis/roofline_model.md` — referenced but not yet inlined into PAPER.md §4 |
+| Related work (2 pages) | **Integrated** | Critical | PAPER.md §6 summarises + points to `analysis/related_work.md` |
+| Complement bitmap optimization | **DONE** | Critical | Documented in README §"Complement optimization" and PAPER.md §3.7 |
+| Stream-ordered allocation | **DONE** | Critical | Documented in README §"Stream-Ordered Allocation" and PAPER.md §3.9, §4.7 |
+| `enumerate_ids` / CSR export | **DONE** | Critical | Documented in README §"Enumerate IDs / CSR export" and PAPER.md §3.8, §4.6 |
+| Negation-aware fused multi_and | **DONE** | Critical | Documented in README and PAPER.md §3.6 |
+| `upload_from_bitset` / `upload_from_device_bitset` | **DONE** | Medium | Documented in README §"Build from flat bitset" |
 | cuVS RAII wrapper | **Updated** | Medium | roaring.hpp + roaring.cu (key_index, negated, total_cardinality) |
 | cuVS benchmark report | **DONE** | Critical | `ROARING_BENCHMARK_REPORT.md` (decompress path) |
 | Paper draft revision | In progress | Critical | PAPER.md needs eval + related work sections |
 | PVLDB July 1 submission | Target | — | ~3 months from now |
+
+---
+
+## Code Optimization Backlog (from April 2026 audit)
+
+These were identified in a critical code review after the April rename. Severity tags indicate correctness bugs vs perf wins. The two `[FIXED]` items are addressed in the follow-up commit; the remainder are open.
+
+### Correctness
+- **[FIXED] Run-container overflow** — `src/decompress.cu`, `src/promote.cu`, `src/set_ops.cu`. The loop `for (uint32_t v = start; v <= start + len; ++v)` wraps to 0 when `start + len ≥ 65536`, producing either infinite loops or silently wrong output for runs that touch the top of a container.
+- **[FIXED] Zeroed cardinalities in fused multi_and** — `src/set_ops.cu` (`fused_multi_and_allbitmap`). Output container cardinalities were left at 0 by the fused kernel, which breaks any downstream code that uses `total_cardinality` (promotion heuristics, `enumerate_ids`, decompression early-exits).
+
+### GPU perf (open)
+- **atomicOr contention in scatter/decompress** — `src/decompress.cu` bitmap/run/array paths, `src/set_ops.cu::scatter_to_bitmaps_kernel`, `src/upload_ids.cu`. Threads serialize on the same 64-bit word. Stage into per-thread `uint64_t` accumulators with one atomic per thread, or partition the output word space across warps.
+- **`promote_to_bitmap` does full D2H → H2D round trip** — `src/promote.cu`. A pure structural transform shouldn't touch the host; port to an on-device kernel (one block per container, read source metadata, expand array/run into destination bitmap pool).
+- **`array_array_and_kernel` serializes to thread 0** — `src/set_ops.cu`. The merge walks both arrays sequentially on a single thread after staging into shared memory; use a block-cooperative two-pointer merge, or fall back to CPU below ~256 elements per side.
+- **`bitmap_array_and_kernel` warp divergence** — `src/set_ops.cu`. Ballot + warp-prefix-sum + one atomic per warp would replace the current per-thread `atomicAdd`.
+
+### Algorithmic (open)
+- **All-negated `multi_and` allocates a dense key space** — `src/set_ops.cu`. When every input is negated, the current path enumerates `[0, max_key]`. Use the union of present keys instead.
+- **CPU-side `std::lower_bound` per common key in fused `multi_and`** — `src/set_ops.cu`. O(n_common × count × log n) host work per call; cache the key→index map once per input.
+
+### Cleanup
+- **Drop outdated "Planned" rows in REPORT.md once new work is shipped** — keep §9 in sync with this backlog rather than duplicating status across both files.
 
 ---
 

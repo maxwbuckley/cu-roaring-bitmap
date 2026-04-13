@@ -508,13 +508,16 @@ cu-roaring-bitmap/
 │       └── make_view.cuh           GpuRoaring → GpuRoaringView
 ├── src/                            implementation (.cpp, .cu)
 ├── test/                           6 test suites (Google Test)
-├── bench/                          benchmarks (B1-B9)
+├── bench/                          benchmarks (B1-B11)
 │   ├── bench_comprehensive.cu      B1/B3/B4/B5: construction, memory, E2E
 │   ├── bench_point_query.cu        B6: point query throughput
 │   ├── bench_optimized_query.cu    B7: optimization analysis
 │   ├── bench_upload_scale.cu       B8: upload latency at XL scale
 │   ├── bench_enumerate_ids.cu      B9: enumerate_ids / CSR export
 │   ├── bench_alloc_strategy.cu     B10: stream-ordered allocation impact
+│   ├── bench_selectivity_sweep.cu  B11: filter selectivity sweep (dense recall curves)
+│   ├── bench_yfcc.cu               YFCC-10M Big-ANN filtered track
+│   ├── bench_multi_and.cu          fused multi-AND / multi-OR
 │   ├── bench_set_ops.cu            set operation microbenchmarks
 │   ├── bench_decompress.cu         decompression microbenchmarks
 │   └── bench_transfer.cu           PCIe transfer comparison
@@ -556,6 +559,9 @@ cd build
 ./bench/bench_upload_scale          # B8: upload latency at XL scale
 ./bench/bench_enumerate_ids         # B9: enumerate_ids / CSR export
 ./bench/bench_alloc_strategy        # B10: stream-ordered allocation impact
+./bench/bench_selectivity_sweep     # B11: selectivity sweep
+./bench/bench_yfcc                  # YFCC-10M Big-ANN filtered track
+./bench/bench_multi_and             # fused multi-AND / multi-OR
 ./bench/bench_comprehensive         # B1/B3/B4/B5: construction, memory, E2E
 ./bench/bench_set_ops               # set operation microbenchmarks
 ./bench/bench_decompress            # decompression microbenchmarks
