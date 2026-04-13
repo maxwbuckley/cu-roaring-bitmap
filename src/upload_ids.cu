@@ -266,16 +266,16 @@ static GpuRoaring build_from_device_ids(uint32_t* d_unique,
     }
 
     // 6. Build direct-map key index on GPU
-    // Get max_key (last element of d_container_keys)
-    uint16_t h_max_key = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&h_max_key,
-                               d_container_keys + h_n_containers - 1,
-                               sizeof(uint16_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    result.max_key = h_max_key;
-
-    uint32_t index_size = static_cast<uint32_t>(h_max_key) + 1;
+    // Derive max_key from universe_size rather than reading the last
+    // container key back to the host — matches the promote.cu trick and
+    // eliminates a stream sync on every upload. Over-allocates by at most
+    // (universe_max_key - actual_max_key) * 2 bytes of sentinel 0xFFFF
+    // cells, which is at most ~130 KB at 1B universe and harmless.
+    uint32_t max_key32 =
+        (universe_size == 0) ? 0u : ((universe_size - 1u) >> 16);
+    if (max_key32 > 0xFFFFu) max_key32 = 0xFFFFu;
+    result.max_key = static_cast<uint16_t>(max_key32);
+    uint32_t index_size = max_key32 + 1u;
     CUDA_CHECK(cudaMallocAsync(&result.key_index, index_size * sizeof(uint16_t), stream));
     // Fill with 0xFFFF
     CUDA_CHECK(cudaMemsetAsync(result.key_index, 0xFF,

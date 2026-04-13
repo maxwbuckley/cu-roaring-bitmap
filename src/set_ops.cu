@@ -447,15 +447,19 @@ struct HostIndex {
     std::vector<uint16_t>      cardinalities;
 };
 
-static HostIndex download_index(const GpuRoaring& g, cudaStream_t stream) {
-    HostIndex h;
+// Issue the 4 index D2H copies for one GpuRoaring onto `stream`. Does
+// NOT synchronise — callers must sync (typically after issuing the
+// copies for both operands, so the two downloads share one sync).
+static void issue_download_index(const GpuRoaring& g,
+                                  HostIndex& h,
+                                  cudaStream_t stream)
+{
     uint32_t n = g.n_containers;
     h.keys.resize(n);
     h.types.resize(n);
     h.offsets.resize(n);
     h.cardinalities.resize(n);
-
-    if (n == 0) return h;
+    if (n == 0) return;
 
     CUDA_CHECK(cudaMemcpyAsync(h.keys.data(), g.keys,
                                n * sizeof(uint16_t),
@@ -469,8 +473,6 @@ static HostIndex download_index(const GpuRoaring& g, cudaStream_t stream) {
     CUDA_CHECK(cudaMemcpyAsync(h.cardinalities.data(), g.cardinalities,
                                n * sizeof(uint16_t),
                                cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    return h;
 }
 
 // ============================================================================
@@ -571,8 +573,12 @@ GpuRoaring set_operation(const GpuRoaring& a, const GpuRoaring& b,
     bool result_negated = false;
     resolve_negation(op, pa, pb, result_negated);
 
-    HostIndex ha = download_index(*pa, stream);
-    HostIndex hb = download_index(*pb, stream);
+    // Issue both operands' index downloads on the same stream, then sync
+    // once — saves a stream-sync round-trip vs the old two-call pattern.
+    HostIndex ha, hb;
+    issue_download_index(*pa, ha, stream);
+    issue_download_index(*pb, hb, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto work = match_containers(
         ha.keys.data(), ha.types.data(), pa->n_containers,
