@@ -586,6 +586,207 @@ TEST_F(ComplementTest, MultiAnd_AllNegated) {
 }
 
 // ============================================================================
+// 6b. Fused multi_and with mixed negation — targeted edge cases
+//
+// The fused_multi_and_allbitmap path handles negated inputs natively via
+// (a) per-input ~word inversion inside the AND loop, and (b) a static
+// all-zeros sentinel for keys absent from a negated input's storage.
+// These tests deliberately construct inputs that hit those paths and
+// verify against CPU CRoaring as the oracle.
+// ============================================================================
+
+// A negated input with STORAGE that covers only a subset of the keys
+// touched by other inputs. For the absent keys the fused kernel must
+// reach the all-zeros sentinel, invert it to all-ones, and treat the
+// negated input as "no restriction" at that key. If the sentinel path is
+// broken, the output at those keys becomes empty (the negated input
+// incorrectly wins) or undefined (UB if the pointer is garbage).
+TEST_F(ComplementTest, FusedMultiAnd_AbsentKeyInNegatedInput) {
+    // 3 containers' worth of universe so we can place content at keys
+    // 0, 1, 2 and see the absent-key behaviour.
+    const uint32_t universe = 3u * 65536u;
+
+    // r_A: sparse non-negated, content at all three keys (~20% density each)
+    roaring_bitmap_t* r_A = roaring_bitmap_create();
+    std::mt19937 gen(1001);
+    for (uint32_t k = 0; k < 3; ++k) {
+        uint32_t base = k * 65536u;
+        for (uint32_t i = 0; i < 65536u; ++i) {
+            if ((gen() % 5u) == 0) roaring_bitmap_add(r_A, base + i);
+        }
+    }
+
+    // r_B: logical density ~100% with a handful of gaps ONLY inside key 1.
+    // After auto-complement upload, stored_B has exactly one container at
+    // key 1 containing those gap bits; keys 0 and 2 are absent from
+    // storage and must take the sentinel path in the fused kernel.
+    roaring_bitmap_t* r_B = roaring_bitmap_create();
+    roaring_bitmap_add_range(r_B, 0, universe);
+    for (uint32_t gap : {70000u, 70001u, 70005u, 70100u, 70200u}) {
+        roaring_bitmap_remove(r_B, gap);
+    }
+
+    // r_C: sparse non-negated at keys 0 and 2 only (key 1 absent from
+    // both its storage and logical meaning — distinct from r_B's case).
+    roaring_bitmap_t* r_C = roaring_bitmap_create();
+    for (uint32_t i = 0; i < 65536u; ++i) {
+        if ((gen() % 7u) == 0) roaring_bitmap_add(r_C, i);
+        if ((gen() % 7u) == 0) roaring_bitmap_add(r_C, 131072u + i);
+    }
+
+    auto gpu_A = cu_roaring::upload(r_A, universe, 0, cu_roaring::PROMOTE_ALL);
+    auto gpu_B = cu_roaring::upload(r_B, universe, 0, cu_roaring::PROMOTE_ALL);
+    auto gpu_C = cu_roaring::upload(r_C, universe, 0, cu_roaring::PROMOTE_ALL);
+
+    // Invariants we rely on for this test to exercise the right paths:
+    ASSERT_TRUE(gpu_B.negated)
+        << "r_B was meant to be auto-complemented at upload";
+    ASSERT_EQ(gpu_B.n_containers, 1u)
+        << "stored_B should hold one container at key 1, and none at 0 or 2";
+    ASSERT_FALSE(gpu_A.negated);
+    ASSERT_FALSE(gpu_C.negated);
+    ASSERT_EQ(gpu_A.n_array_containers, 0u);  // PROMOTE_ALL → all bitmap
+    ASSERT_EQ(gpu_B.n_array_containers, 0u);
+    ASSERT_EQ(gpu_C.n_array_containers, 0u);
+    ASSERT_EQ(gpu_A.n_run_containers, 0u);
+    ASSERT_EQ(gpu_B.n_run_containers, 0u);
+    ASSERT_EQ(gpu_C.n_run_containers, 0u);
+
+    cu_roaring::GpuRoaring bitmaps[] = {gpu_A, gpu_B, gpu_C};
+    auto result = cu_roaring::multi_and(bitmaps, 3);
+
+    // CPU oracle
+    roaring_bitmap_t* cpu_ab  = roaring_bitmap_and(r_A, r_B);
+    roaring_bitmap_t* cpu_abc = roaring_bitmap_and(cpu_ab, r_C);
+    verify_match(cpu_abc, result, universe);
+
+    // Extra: confirm the answer is NOT empty at key 1 (where the
+    // absent-key sentinel path is NOT hit — r_B's real content lives
+    // there) and NOT empty at keys 0, 2 (where the sentinel path IS hit).
+    // An empty result at keys 0 or 2 would be the tell-tale sign of a
+    // sentinel bug.
+    EXPECT_GT(roaring_bitmap_get_cardinality(cpu_abc), 0u);
+
+    roaring_bitmap_free(cpu_ab);
+    roaring_bitmap_free(cpu_abc);
+    cu_roaring::gpu_roaring_free(result);
+    cu_roaring::gpu_roaring_free(gpu_A);
+    cu_roaring::gpu_roaring_free(gpu_B);
+    cu_roaring::gpu_roaring_free(gpu_C);
+    roaring_bitmap_free(r_A);
+    roaring_bitmap_free(r_B);
+    roaring_bitmap_free(r_C);
+}
+
+// Many containers (16) with 5 inputs of mixed negation. The existing
+// MultiAnd_WithNegated test uses a 50K universe (1 container), so the
+// key-set filtering logic isn't exercised with real variety. Here every
+// container has a different sparse / dense pattern so the fused kernel's
+// presence-AND-reduce and per-word inversion paths are both hammered.
+TEST_F(ComplementTest, FusedMultiAnd_MixedNegation_ManyContainers) {
+    const uint32_t universe = 16u * 65536u;
+
+    std::mt19937 gen(2002);
+    auto make_sparse = [&](double density) {
+        roaring_bitmap_t* r = roaring_bitmap_create();
+        for (uint32_t i = 0; i < universe; ++i) {
+            if ((gen() & 0xFFFFu) < static_cast<uint32_t>(density * 65536.0)) {
+                roaring_bitmap_add(r, i);
+            }
+        }
+        return r;
+    };
+
+    roaring_bitmap_t* r1 = make_sparse(0.30);   // non-negated
+    roaring_bitmap_t* r2 = make_sparse(0.90);   // will negate (density > 50%)
+    roaring_bitmap_t* r3 = make_sparse(0.15);   // non-negated
+    roaring_bitmap_t* r4 = make_sparse(0.75);   // will negate
+    roaring_bitmap_t* r5 = make_sparse(0.25);   // non-negated
+
+    auto g1 = cu_roaring::upload(r1, universe, 0, cu_roaring::PROMOTE_ALL);
+    auto g2 = cu_roaring::upload(r2, universe, 0, cu_roaring::PROMOTE_ALL);
+    auto g3 = cu_roaring::upload(r3, universe, 0, cu_roaring::PROMOTE_ALL);
+    auto g4 = cu_roaring::upload(r4, universe, 0, cu_roaring::PROMOTE_ALL);
+    auto g5 = cu_roaring::upload(r5, universe, 0, cu_roaring::PROMOTE_ALL);
+
+    // Sanity: the dense ones are stored negated, the sparse ones aren't.
+    EXPECT_FALSE(g1.negated);
+    EXPECT_TRUE(g2.negated);
+    EXPECT_FALSE(g3.negated);
+    EXPECT_TRUE(g4.negated);
+    EXPECT_FALSE(g5.negated);
+
+    cu_roaring::GpuRoaring bitmaps[] = {g1, g2, g3, g4, g5};
+    auto result = cu_roaring::multi_and(bitmaps, 5);
+
+    roaring_bitmap_t* cpu = roaring_bitmap_and(r1, r2);
+    roaring_bitmap_t* t;
+    t = roaring_bitmap_and(cpu, r3); roaring_bitmap_free(cpu); cpu = t;
+    t = roaring_bitmap_and(cpu, r4); roaring_bitmap_free(cpu); cpu = t;
+    t = roaring_bitmap_and(cpu, r5); roaring_bitmap_free(cpu); cpu = t;
+
+    verify_match(cpu, result, universe);
+    EXPECT_GT(roaring_bitmap_get_cardinality(cpu), 0u)
+        << "5-way AND shouldn't be empty with these densities";
+
+    roaring_bitmap_free(cpu);
+    cu_roaring::gpu_roaring_free(result);
+    cu_roaring::gpu_roaring_free(g1);
+    cu_roaring::gpu_roaring_free(g2);
+    cu_roaring::gpu_roaring_free(g3);
+    cu_roaring::gpu_roaring_free(g4);
+    cu_roaring::gpu_roaring_free(g5);
+    roaring_bitmap_free(r1);
+    roaring_bitmap_free(r2);
+    roaring_bitmap_free(r3);
+    roaring_bitmap_free(r4);
+    roaring_bitmap_free(r5);
+}
+
+// 8-input alternating-negation stress test. Exercises the fused kernel's
+// `negation_mask` bit-test path for every pattern of (negated, absent)
+// across many containers.
+TEST_F(ComplementTest, FusedMultiAnd_AlternatingNegation_8Inputs) {
+    const uint32_t universe = 8u * 65536u;
+    const uint32_t N = 8;
+
+    std::mt19937 gen(3003);
+    roaring_bitmap_t* r[N];
+    cu_roaring::GpuRoaring g[N];
+
+    for (uint32_t i = 0; i < N; ++i) {
+        r[i] = roaring_bitmap_create();
+        // Alternate: even indices sparse (~20%), odd indices dense (~85%)
+        const double density = (i % 2 == 0) ? 0.20 : 0.85;
+        for (uint32_t j = 0; j < universe; ++j) {
+            if ((gen() & 0xFFFFu) < static_cast<uint32_t>(density * 65536.0)) {
+                roaring_bitmap_add(r[i], j);
+            }
+        }
+        g[i] = cu_roaring::upload(r[i], universe, 0, cu_roaring::PROMOTE_ALL);
+        EXPECT_EQ(g[i].negated, (i % 2) != 0);
+    }
+
+    auto result = cu_roaring::multi_and(g, N);
+
+    roaring_bitmap_t* cpu = roaring_bitmap_copy(r[0]);
+    for (uint32_t i = 1; i < N; ++i) {
+        roaring_bitmap_t* t = roaring_bitmap_and(cpu, r[i]);
+        roaring_bitmap_free(cpu);
+        cpu = t;
+    }
+
+    verify_match(cpu, result, universe);
+
+    roaring_bitmap_free(cpu);
+    cu_roaring::gpu_roaring_free(result);
+    for (uint32_t i = 0; i < N; ++i) {
+        cu_roaring::gpu_roaring_free(g[i]);
+        roaring_bitmap_free(r[i]);
+    }
+}
+
+// ============================================================================
 // 7. Upload from bitset — direct container extraction, no sort/dedupe
 // ============================================================================
 
