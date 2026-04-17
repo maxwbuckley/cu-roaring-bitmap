@@ -95,6 +95,58 @@ the host-side orchestration is what changes.
   sub-batch from a larger one (e.g. registering 7,910 YFCC tag bitmaps once
   and then building per-query filter sub-batches)? Defer.
 
+## Future benchmark — YFCC-10M with ID reorder
+
+Target dataset: YFCC-10M from the Big-ANN NeurIPS'23 filtered track — 10M ×
+192-dim uint8 CLIP vectors plus a sparse 10M × 200K tag matrix (~108M
+assignments). Average per-tag selectivity is 0.0054% (~540 docs per tag),
+but the distribution is Zipfian; the 7,910 tags that appear in the public
+query set are what drives the batch-filter memory story. v1's
+`bench/yfcc_export.py` already materialises per-tag ID lists from the
+Big-ANN metadata matrix — reusable as-is.
+
+### Why this dataset tests the batch-first design
+
+Flat-bitset filter memory per Q-query batch is `Q × N / 8`. At Q=1,000 and
+N=10M that's already 1.25 GB; at N=1B it's 125 GB — past any single GPU.
+Roaring swaps the N factor for per-filter cardinality K. A tag with 540
+docs is ~1 KB of ARRAY containers; 7,910 such tags are ~8 MB vs ~10 GB of
+bitsets. That's the scaling regime the batch API was built for.
+
+### Three-row story we want the benchmark to produce
+
+| Row | Per-tag storage | 7,910-tag batch | Notes |
+|---|---|---|---|
+| Flat bitset | 1.25 MB (N/8, constant) | ~10 GB | Doesn't scale with N, Q, or clustering |
+| Roaring, natural IDs | ~1 KB avg (ARRAY-dominated small tags) | ~8 MB | ~1,000× over bitset on raw ingest |
+| Roaring, presorted IDs | medium-to-large tags drop to handfuls of runs | single-digit MB | BITMAP → RUN flip on the Zipfian head |
+
+"Presorted": reorder doc IDs so docs sharing popular tags get consecutive
+numbers. Tiny tags already fit in small ARRAY containers and don't benefit
+much; the real win is on medium-to-large tags that would otherwise cross
+into BITMAP (8 KB) and instead stay RUN (hundreds of bytes). Because the
+Zipfian head dominates both memory and query traffic, this matters more
+than the averages suggest.
+
+### Reorder strategy
+
+Recursive graph bisection / BP (Dhulipala et al., "Compressing Graphs and
+Indexes with Recursive Graph Bisection", KDD 2016) is the canonical
+IR-literature method for this reordering.
+
+First pass: **frequency-sorted reorder** — number docs by descending
+membership in the top-K tags. Cheap, deterministic, probably captures most
+of the compression for the Zipfian head. Full BP is a later polish if the
+first-pass numbers aren't enough.
+
+### Benchmark slot
+
+After the v2 `.cu` rewrites land and `bench_vs_bitset.cu` is running, add
+`bench/bench_yfcc.cu` with a `--reorder` flag that applies the
+frequency-sorted reorder before building the CRoaring bitmaps. The library
+itself needs no changes — reorder is a data-pipeline step; the library
+just sees CRoaring bitmaps with whatever IDs were assigned.
+
 ## Not in scope for this rewrite
 
 - Wiring `add_subdirectory(v2)` into the repo-root `CMakeLists.txt`.
