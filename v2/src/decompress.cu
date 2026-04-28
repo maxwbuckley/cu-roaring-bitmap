@@ -8,12 +8,38 @@ namespace cu_roaring::v2 {
 
 namespace {
 
-// One block per container. Each block writes exactly the 1024-word window
-// belonging to its container (word_base = key * 1024), so work across blocks
-// never races. Within a block, ARRAY uses atomicOr for the natural
-// word-collision case; RUN and BITMAP do plain stores since they partition
-// words across threads without overlap.
+// Find the bitmap index `b` that owns global container `cid`, defined by
+// container_starts[b] <= cid < container_starts[b+1]. The CSR start array is
+// monotone non-decreasing with length n_bitmaps + 1, so this is upper_bound on
+// the suffix [1, n_bitmaps+1). Pure device-side, O(log n_bitmaps), one read of
+// container_starts per binary-search step.
+__device__ __forceinline__
+uint32_t find_owning_bitmap(const uint32_t* container_starts,
+                            uint32_t        n_bitmaps,
+                            uint32_t        cid)
+{
+    uint32_t lo = 0u;
+    uint32_t hi = n_bitmaps;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) >> 1;
+        if (container_starts[mid + 1u] > cid) hi = mid;
+        else                                  lo = mid + 1u;
+    }
+    return lo;
+}
+
+// One block per global container. Each block resolves its owning bitmap b,
+// then writes its 1024-word window into device_bitsets[b * words_each + key *
+// 1024 .. + 1024]. Per Roaring's invariants, distinct global containers within
+// a single bitmap own disjoint key prefixes (different `key`), so the per-block
+// windows never overlap and the kernel needs no cross-block synchronisation.
+//
+// Caller owns zero-initialisation of device_bitsets. ARRAY / RUN paths use
+// atomicOr to set bits within their assigned word and rely on the pre-zeroed
+// state.
 __global__ void decompress_kernel(
+    const uint32_t*      container_starts,
+    uint32_t             n_bitmaps,
     const uint16_t*      keys,
     const ContainerType* types,
     const uint32_t*      offsets,
@@ -21,19 +47,30 @@ __global__ void decompress_kernel(
     const uint64_t*      bitmap_pool,
     const uint16_t*      array_pool,
     const uint16_t*      run_pool,
-    uint32_t             n_containers,
-    uint64_t*            out_bitset,
-    size_t               out_words)
+    uint32_t             total_containers,
+    uint64_t*            out_bitsets,
+    uint64_t             words_each)
 {
+    __shared__ uint32_t s_b;
+
     const uint32_t cid = blockIdx.x;
-    if (cid >= n_containers) return;
+    if (cid >= total_containers) return;
 
-    const size_t word_base = static_cast<size_t>(keys[cid]) * 1024u;
-    if (word_base >= out_words) return;
+    if (threadIdx.x == 0) {
+        s_b = find_owning_bitmap(container_starts, n_bitmaps, cid);
+    }
+    __syncthreads();
+    const uint32_t b = s_b;
 
-    const size_t window = (out_words - word_base < 1024u)
-        ? (out_words - word_base) : 1024u;
-    uint64_t* dst = out_bitset + word_base;
+    const size_t bitmap_base = static_cast<size_t>(b) * words_each;
+    const size_t bitmap_end  = bitmap_base + words_each;
+    const size_t word_base   = bitmap_base
+                             + static_cast<size_t>(keys[cid]) * 1024u;
+    if (word_base >= bitmap_end) return;
+
+    const size_t window = (bitmap_end - word_base < 1024u)
+        ? (bitmap_end - word_base) : 1024u;
+    uint64_t* dst = out_bitsets + word_base;
 
     const ContainerType type = types[cid];
     const uint32_t      off  = offsets[cid];
@@ -48,12 +85,6 @@ __global__ void decompress_kernel(
         return;
     }
 
-    // ARRAY / RUN: zero the window first so we can OR in on top.
-    for (uint32_t w = threadIdx.x; w < window; w += blockDim.x) {
-        dst[w] = 0ULL;
-    }
-    __syncthreads();
-
     if (type == ContainerType::ARRAY) {
         const uint16_t* arr = reinterpret_cast<const uint16_t*>(
             reinterpret_cast<const char*>(array_pool) + off);
@@ -61,16 +92,18 @@ __global__ void decompress_kernel(
             const uint16_t val      = arr[i];
             const uint32_t word_idx = val / 64u;
             if (word_idx < window) {
-                atomicOr(
-                    reinterpret_cast<unsigned long long*>(&dst[word_idx]),
-                    static_cast<unsigned long long>(1ULL << (val % 64u)));
+                atomicOr(reinterpret_cast<unsigned long long*>(&dst[word_idx]),
+                         static_cast<unsigned long long>(1ULL << (val % 64u)));
             }
         }
         return;
     }
 
-    // RUN: emit whole 64-bit words per run. Runs within a container are disjoint
-    // by Roaring's invariants, so different threads never target the same word.
+    // RUN: emit whole 64-bit words per run. Within a container the runs are
+    // disjoint per Roaring invariants, so threads writing different runs never
+    // target the same word. AtomicOr is kept as a defensive measure: if either
+    // the CRoaring builder or the upload path ever produced overlapping runs,
+    // we'd degrade to correct-but-slower rather than silent data races.
     const uint16_t* runs = reinterpret_cast<const uint16_t*>(
         reinterpret_cast<const char*>(run_pool) + off);
     for (uint32_t r = threadIdx.x; r < card; r += blockDim.x) {
@@ -84,10 +117,6 @@ __global__ void decompress_kernel(
         const uint32_t head_bit  = start % 64u;
         const uint32_t tail_bit  = end   % 64u;
 
-        // Still use atomicOr as defence-in-depth: the disjoint-runs invariant
-        // lives in the CPU CRoaring builder and in our RLE path. If either ever
-        // produces overlapping runs we degrade to correct-but-slower rather
-        // than silent data races.
         if (head_word == tail_word) {
             if (head_word >= window) continue;
             const uint32_t nbits = tail_bit - head_bit + 1u;
@@ -118,28 +147,38 @@ __global__ void decompress_kernel(
 
 } // namespace
 
-void decompress_to_bitset(const GpuRoaring& bm,
-                          uint64_t*         device_bitset,
-                          size_t            words,
-                          cudaStream_t      stream)
+void decompress_batch(const GpuRoaringBatch& batch,
+                      uint64_t*              device_bitsets,
+                      uint64_t               words_each,
+                      cudaStream_t           stream)
 {
-    if (bm.n_containers == 0) return;
-    if (device_bitset == nullptr) {
-        throw std::invalid_argument("decompress_to_bitset: device_bitset is null");
+    if (batch.n_bitmaps == 0 || batch.total_containers == 0) return;
+    if (device_bitsets == nullptr) {
+        throw std::invalid_argument("decompress_batch: device_bitsets is null");
     }
 
-    const size_t required = (static_cast<size_t>(bm.universe_size) + 63u) / 64u;
-    if (words < required) {
+    // Validate words_each on the host using the cached universe sizes; this
+    // turns a potential silent OOB write inside the kernel into an immediate,
+    // diagnosable error at the API boundary.
+    uint32_t max_universe = 0u;
+    for (uint32_t b = 0; b < batch.n_bitmaps; ++b) {
+        if (batch.host_universe_sizes[b] > max_universe) {
+            max_universe = batch.host_universe_sizes[b];
+        }
+    }
+    const uint64_t required_words = (static_cast<uint64_t>(max_universe) + 63ull) / 64ull;
+    if (words_each < required_words) {
         throw std::invalid_argument(
-            "decompress_to_bitset: bitset capacity " + std::to_string(words) +
-            " words < required " + std::to_string(required) + " words");
+            "decompress_batch: words_each " + std::to_string(words_each) +
+            " < required " + std::to_string(required_words));
     }
 
-    decompress_kernel<<<bm.n_containers, 256, 0, stream>>>(
-        bm.keys, bm.types, bm.offsets, bm.cardinalities,
-        bm.bitmap_data, bm.array_data, bm.run_data,
-        bm.n_containers,
-        device_bitset, words);
+    decompress_kernel<<<batch.total_containers, 256, 0, stream>>>(
+        batch.container_starts, batch.n_bitmaps,
+        batch.keys, batch.types, batch.offsets, batch.cardinalities,
+        batch.bitmap_data, batch.array_data, batch.run_data,
+        batch.total_containers,
+        device_bitsets, words_each);
     CU_ROARING_V2_CHECK_CUDA(cudaGetLastError());
 }
 

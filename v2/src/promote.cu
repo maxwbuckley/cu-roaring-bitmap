@@ -1,38 +1,80 @@
 #include "cu_roaring_v2/api.hpp"
 #include "internal.hpp"
 
+#include <cstring>
+
 namespace cu_roaring::v2 {
 
 namespace {
 
-// One block per source container. Each block fully materialises its 8 KB output
-// bitmap in shared memory, copies it out, and block-reduces the popcount to
-// write the per-container cardinality. The kernel also writes keys, types,
-// offsets, and scatters the direct-map key_index entry for this container.
+constexpr size_t ALIGN = 8;
+
+// Output device layout for a fully-promoted batch. n_bitmap_containers_total
+// equals total_containers, and there are no ARRAY/RUN pools. The CSR start
+// arrays and key_indices keep the same shape as the input batch — promotion
+// preserves keys and per-bitmap container ordering.
+struct DeviceLayout {
+    size_t cstart_off, kstart_off;
+    size_t keys_off, types_off, offsets_off, cards_off;
+    size_t kidx_off;
+    size_t bmp_off;
+    size_t total_bytes;
+};
+
+DeviceLayout compute_layout(uint32_t n_bitmaps,
+                            uint32_t total_containers,
+                            uint64_t total_kidx_len)
+{
+    using detail::align_up;
+    DeviceLayout L{};
+    size_t off = 0;
+    L.cstart_off  = off;
+    off = align_up(off + (n_bitmaps + 1u) * sizeof(uint32_t), ALIGN);
+    L.kstart_off  = off;
+    off = align_up(off + (n_bitmaps + 1u) * sizeof(uint32_t), ALIGN);
+    L.keys_off    = off;
+    off = align_up(off + total_containers * sizeof(uint16_t), ALIGN);
+    L.types_off   = off;
+    off = align_up(off + total_containers * sizeof(ContainerType), ALIGN);
+    L.offsets_off = off;
+    off = align_up(off + total_containers * sizeof(uint32_t), ALIGN);
+    L.cards_off   = off;
+    off = align_up(off + total_containers * sizeof(uint16_t), ALIGN);
+    L.kidx_off    = off;
+    off = align_up(off + total_kidx_len * sizeof(uint16_t), ALIGN);
+    L.bmp_off     = off;
+    off += static_cast<size_t>(total_containers) * 1024u * sizeof(uint64_t);
+    L.total_bytes = align_up(off, ALIGN);
+    if (L.total_bytes == 0) L.total_bytes = ALIGN;
+    return L;
+}
+
+// One block per global container. Reads the source container (selected by
+// src_types[cid]) into shared memory as a 1024 × uint64 dense bitmap, copies it
+// out to the output bitmap pool slot, and reduces popcount for the per-container
+// cardinality. Also writes types[cid] = BITMAP and offsets[cid] = cid * 8192.
+//
+// Keys, key_indices, container_starts, key_index_starts are NOT touched here —
+// they're D2D-copied from the source batch since promotion doesn't change them.
 __global__ void promote_kernel(
-    const uint16_t*      src_keys,
     const ContainerType* src_types,
     const uint32_t*      src_offsets,
     const uint16_t*      src_cards,
-    const uint64_t*      src_bitmap_pool,  // may be nullptr when n_bitmap == 0
-    const uint16_t*      src_array_pool,   // may be nullptr
-    const uint16_t*      src_run_pool,     // may be nullptr
-    uint16_t*            dst_keys,
+    const uint64_t*      src_bitmap_pool,
+    const uint16_t*      src_array_pool,
+    const uint16_t*      src_run_pool,
     ContainerType*       dst_types,
     uint32_t*            dst_offsets,
     uint16_t*            dst_cards,
     uint64_t*            dst_bitmap_pool,
-    uint16_t*            dst_key_index,
-    uint32_t             n)
+    uint32_t             total_containers)
 {
     __shared__ uint64_t smem[1024];
-    __shared__ uint32_t warp_sum[8];  // 256 threads / 32 lanes = 8 warps
+    __shared__ uint32_t warp_sum[8];
 
     const uint32_t cid = blockIdx.x;
-    if (cid >= n) return;
+    if (cid >= total_containers) return;
 
-    // Zero the shared output accumulator for every container (including BITMAP,
-    // which will overwrite every word — the zero is a cheap no-op path).
     for (uint32_t w = threadIdx.x; w < 1024u; w += blockDim.x) {
         smem[w] = 0ULL;
     }
@@ -51,8 +93,8 @@ __global__ void promote_kernel(
     } else if (type == ContainerType::ARRAY) {
         const uint16_t* arr = reinterpret_cast<const uint16_t*>(
             reinterpret_cast<const char*>(src_array_pool) + off);
-        // Thread-strided scatter. Collisions on the same 64-bit word require
-        // atomicOr on shared memory (cheap: a handful of cycles on smem).
+        // Threads scatter their assigned values into shared bits. Word-level
+        // collisions go through atomicOr on shared memory (a few cycles each).
         for (uint32_t i = threadIdx.x; i < card; i += blockDim.x) {
             const uint16_t val = arr[i];
             atomicOr(reinterpret_cast<unsigned long long*>(&smem[val / 64u]),
@@ -61,9 +103,6 @@ __global__ void promote_kernel(
     } else {  // RUN
         const uint16_t* runs = reinterpret_cast<const uint16_t*>(
             reinterpret_cast<const char*>(src_run_pool) + off);
-        // One thread per run; each thread emits whole 64-bit words instead of
-        // bit-by-bit. A run of length L costs ceil((L+1)/64) atomicOrs rather
-        // than L+1 individual bit sets.
         for (uint32_t r = threadIdx.x; r < card; r += blockDim.x) {
             const uint32_t start  = runs[r * 2u];
             const uint32_t length = runs[r * 2u + 1u];
@@ -99,7 +138,6 @@ __global__ void promote_kernel(
     }
     __syncthreads();
 
-    // Copy smem → global bitmap pool while accumulating popcount for cardinality.
     uint64_t* dst = dst_bitmap_pool + static_cast<size_t>(cid) * 1024u;
     uint32_t  local_pop = 0;
     for (uint32_t w = threadIdx.x; w < 1024u; w += blockDim.x) {
@@ -108,7 +146,6 @@ __global__ void promote_kernel(
         local_pop += static_cast<uint32_t>(__popcll(word));
     }
 
-    // Warp-shuffle reduce, then 8-warp aggregation.
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5;
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -123,87 +160,131 @@ __global__ void promote_kernel(
             v += __shfl_down_sync(~0u, v, offset);
         }
         if (lane == 0) {
-            const uint16_t key = src_keys[cid];
-            dst_keys[cid]          = key;
-            dst_types[cid]         = ContainerType::BITMAP;
-            dst_offsets[cid]       = cid * 8192u;  // bytes
-            dst_cards[cid]         = static_cast<uint16_t>(v > 65535u ? 0u : v);
-            dst_key_index[key]     = static_cast<uint16_t>(cid);
+            dst_types[cid]   = ContainerType::BITMAP;
+            dst_offsets[cid] = cid * 8192u;
+            dst_cards[cid]   = static_cast<uint16_t>(v > 65535u ? 0u : v);
         }
     }
 }
 
-struct Layout {
-    size_t keys_off, types_off, offsets_off, cards_off, kidx_off, bmp_off;
-    size_t total_bytes;
-    uint32_t key_index_len;
-};
+// Clone the source's host metadata block into a fresh allocation and patch
+// host_n_bitmap_containers[b] = n_containers[b] (everything is BITMAP after
+// promotion). Other fields are unchanged.
+char* clone_and_patch_host_meta(const GpuRoaringBatch&        src,
+                                const detail::HostMetaLayout& M)
+{
+    const uint32_t n = src.n_bitmaps;
+    char* meta = new char[M.total_bytes];
+    std::memset(meta, 0, M.total_bytes);
 
-Layout compute_layout(uint32_t n, uint16_t max_key) {
-    using detail::align_up;
-    Layout L{};
-    L.key_index_len = static_cast<uint32_t>(max_key) + 1u;
+    if (n > 0) {
+        std::memcpy(meta + M.total_card_off, src.host_total_cardinalities,
+                    n * sizeof(uint64_t));
+        std::memcpy(meta + M.universe_off, src.host_universe_sizes,
+                    n * sizeof(uint32_t));
+    }
+    std::memcpy(meta + M.cstart_off, src.host_container_starts,
+                (n + 1u) * sizeof(uint32_t));
+    std::memcpy(meta + M.kstart_off, src.host_key_index_starts,
+                (n + 1u) * sizeof(uint32_t));
 
-    constexpr size_t A = 8;
-    size_t off = 0;
-    L.keys_off    = off; off = align_up(off + n * sizeof(uint16_t), A);
-    L.types_off   = off; off = align_up(off + n * sizeof(ContainerType), A);
-    L.offsets_off = off; off = align_up(off + n * sizeof(uint32_t), A);
-    L.cards_off   = off; off = align_up(off + n * sizeof(uint16_t), A);
-    L.kidx_off    = off; off = align_up(off + L.key_index_len * sizeof(uint16_t), A);
-    L.bmp_off     = off; off += static_cast<size_t>(n) * 1024u * sizeof(uint64_t);
-    L.total_bytes = align_up(off, A);
-    return L;
+    auto* nbm = reinterpret_cast<uint32_t*>(meta + M.n_bitmap_off);
+    for (uint32_t b = 0; b < n; ++b) {
+        nbm[b] = src.host_container_starts[b + 1] - src.host_container_starts[b];
+    }
+    return meta;
 }
 
 } // namespace
 
-GpuRoaring promote_to_bitmap(const GpuRoaring& bm, cudaStream_t stream) {
-    if (bm.n_containers == 0) {
-        GpuRoaring r{};
-        r.universe_size = bm.universe_size;
-        return r;
-    }
+GpuRoaringBatch promote_batch(const GpuRoaringBatch& batch, cudaStream_t stream)
+{
+    if (batch.n_bitmaps == 0) return GpuRoaringBatch{};
 
-    const Layout L = compute_layout(bm.n_containers, bm.max_key);
+    const uint32_t n          = batch.n_bitmaps;
+    const uint32_t total      = batch.total_containers;
+    const uint64_t kidx_total =
+        static_cast<uint64_t>(batch.host_key_index_starts[n]);
+
+    const DeviceLayout            L = compute_layout(n, total, kidx_total);
+    const detail::HostMetaLayout  M = detail::compute_host_meta_layout(n);
 
     char* d_buf = nullptr;
     CU_ROARING_V2_CHECK_CUDA(cudaMallocAsync(reinterpret_cast<void**>(&d_buf),
                                              L.total_bytes, stream));
-    // key_index defaults to 0xFFFF per entry; the kernel will scatter the present
-    // containers in a single pass.
-    CU_ROARING_V2_CHECK_CUDA(cudaMemsetAsync(d_buf + L.kidx_off, 0xFF,
-                                             L.key_index_len * sizeof(uint16_t),
-                                             stream));
 
-    auto* d_keys    = reinterpret_cast<uint16_t*>(d_buf + L.keys_off);
-    auto* d_types   = reinterpret_cast<ContainerType*>(d_buf + L.types_off);
-    auto* d_offs    = reinterpret_cast<uint32_t*>(d_buf + L.offsets_off);
-    auto* d_cards   = reinterpret_cast<uint16_t*>(d_buf + L.cards_off);
-    auto* d_kidx    = reinterpret_cast<uint16_t*>(d_buf + L.kidx_off);
-    auto* d_bmp     = reinterpret_cast<uint64_t*>(d_buf + L.bmp_off);
+    auto* d_cstart = reinterpret_cast<uint32_t*>(d_buf + L.cstart_off);
+    auto* d_kstart = reinterpret_cast<uint32_t*>(d_buf + L.kstart_off);
+    auto* d_keys   = reinterpret_cast<uint16_t*>(d_buf + L.keys_off);
+    auto* d_types  = reinterpret_cast<ContainerType*>(d_buf + L.types_off);
+    auto* d_offs   = reinterpret_cast<uint32_t*>(d_buf + L.offsets_off);
+    auto* d_cards  = reinterpret_cast<uint16_t*>(d_buf + L.cards_off);
+    auto* d_kidx   = reinterpret_cast<uint16_t*>(d_buf + L.kidx_off);
+    auto* d_bmp    = reinterpret_cast<uint64_t*>(d_buf + L.bmp_off);
 
-    promote_kernel<<<bm.n_containers, 256, 0, stream>>>(
-        bm.keys, bm.types, bm.offsets, bm.cardinalities,
-        bm.bitmap_data, bm.array_data, bm.run_data,
-        d_keys, d_types, d_offs, d_cards, d_bmp, d_kidx,
-        bm.n_containers);
-    CU_ROARING_V2_CHECK_CUDA(cudaGetLastError());
+    // D2D copies of the sections promotion preserves verbatim. All async on
+    // the stream — no sync, no host round-trip.
+    CU_ROARING_V2_CHECK_CUDA(cudaMemcpyAsync(
+        d_cstart, batch.container_starts,
+        (n + 1u) * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+    CU_ROARING_V2_CHECK_CUDA(cudaMemcpyAsync(
+        d_kstart, batch.key_index_starts,
+        (n + 1u) * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+    if (total > 0) {
+        CU_ROARING_V2_CHECK_CUDA(cudaMemcpyAsync(
+            d_keys, batch.keys,
+            total * sizeof(uint16_t), cudaMemcpyDeviceToDevice, stream));
+    }
+    if (kidx_total > 0) {
+        CU_ROARING_V2_CHECK_CUDA(cudaMemcpyAsync(
+            d_kidx, batch.key_indices,
+            kidx_total * sizeof(uint16_t), cudaMemcpyDeviceToDevice, stream));
+    }
 
-    GpuRoaring r{};
-    r._alloc_base         = d_buf;
-    r.n_containers        = bm.n_containers;
-    r.n_bitmap_containers = bm.n_containers;
-    r.universe_size       = bm.universe_size;
-    r.max_key             = bm.max_key;
-    r.total_cardinality   = bm.total_cardinality;  // promotion preserves the set
-    r.keys          = d_keys;
-    r.types         = d_types;
-    r.offsets       = d_offs;
-    r.cardinalities = d_cards;
-    r.key_index     = d_kidx;
-    r.bitmap_data   = d_bmp;
-    return r;
+    if (total > 0) {
+        promote_kernel<<<total, 256, 0, stream>>>(
+            batch.types, batch.offsets, batch.cardinalities,
+            batch.bitmap_data, batch.array_data, batch.run_data,
+            d_types, d_offs, d_cards, d_bmp,
+            total);
+        CU_ROARING_V2_CHECK_CUDA(cudaGetLastError());
+    }
+
+    char* h_meta = clone_and_patch_host_meta(batch, M);
+
+    GpuRoaringBatch out{};
+    out.n_bitmaps                 = n;
+    out.total_containers          = total;
+    out.n_bitmap_containers_total = total;
+    out.array_pool_bytes          = 0;
+    out.run_pool_bytes            = 0;
+
+    out.container_starts = d_cstart;
+    out.key_index_starts = d_kstart;
+    out.keys             = d_keys;
+    out.types            = d_types;
+    out.offsets          = d_offs;
+    out.cardinalities    = d_cards;
+    out.key_indices      = d_kidx;
+    out.bitmap_data      = (total > 0) ? d_bmp : nullptr;
+    out.array_data       = nullptr;
+    out.run_data         = nullptr;
+
+    out._alloc_base     = d_buf;
+    out._host_meta_base = h_meta;
+
+    out.host_total_cardinalities  =
+        reinterpret_cast<uint64_t*>(h_meta + M.total_card_off);
+    out.host_universe_sizes       =
+        reinterpret_cast<uint32_t*>(h_meta + M.universe_off);
+    out.host_container_starts     =
+        reinterpret_cast<uint32_t*>(h_meta + M.cstart_off);
+    out.host_key_index_starts     =
+        reinterpret_cast<uint32_t*>(h_meta + M.kstart_off);
+    out.host_n_bitmap_containers  =
+        reinterpret_cast<uint32_t*>(h_meta + M.n_bitmap_off);
+
+    return out;
 }
 
 } // namespace cu_roaring::v2

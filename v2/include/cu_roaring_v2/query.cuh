@@ -69,6 +69,8 @@ bool contains_in_container(const ContainerType* types,
 // the kernel.
 __device__ __forceinline__
 bool contains(const GpuRoaringView& view, uint32_t id) {
+    // A view onto an empty bitmap has key_index == nullptr; bail before reading.
+    if (view.n_containers == 0) return false;
     const uint16_t high = static_cast<uint16_t>(id >> 16);
     if (static_cast<uint32_t>(high) > view.max_key) return false;
 

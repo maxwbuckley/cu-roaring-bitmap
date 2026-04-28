@@ -63,10 +63,22 @@ struct GpuRoaringBatch {
     uint16_t* array_data  = nullptr;
     uint16_t* run_data    = nullptr;
 
-    // Host-side mirrors of per-bitmap scalars (length n_bitmaps). Readable
-    // without a D2H; never dereferenced from device. Point into _host_meta_base.
+    // Host-side mirrors of per-bitmap scalars. Readable without a D2H; never
+    // dereferenced from device. All point into _host_meta_base.
+    //
+    //   host_total_cardinalities  : length n_bitmaps          (popcount per bitmap)
+    //   host_universe_sizes       : length n_bitmaps          ((max_key+1) << 16)
+    //   host_container_starts     : length n_bitmaps + 1      (mirror of device CSR)
+    //   host_key_index_starts     : length n_bitmaps + 1      (mirror of device CSR)
+    //   host_n_bitmap_containers  : length n_bitmaps          (per-bitmap BITMAP-type count;
+    //                                                          used to validate "all-bitmap"
+    //                                                          inputs on the host without
+    //                                                          touching device memory)
     const uint64_t* host_total_cardinalities = nullptr;
     const uint32_t* host_universe_sizes      = nullptr;
+    const uint32_t* host_container_starts    = nullptr;
+    const uint32_t* host_key_index_starts    = nullptr;
+    const uint32_t* host_n_bitmap_containers = nullptr;
 
     // Ownership. free_batch() releases both blocks and nulls every field.
     void* _alloc_base     = nullptr;  // device

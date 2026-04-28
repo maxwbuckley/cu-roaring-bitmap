@@ -97,3 +97,9 @@ option(CU_ROARING_BUILD_BENCHMARKS "Build benchmarks" ON)
 if(CU_ROARING_BUILD_BENCHMARKS)
     add_subdirectory(bench)
 endif()
+
+# v2 (batch-first rewrite). See v2/PLAN.md and v2/README.md.
+option(CU_ROARING_BUILD_V2 "Build cu_roaring v2 (batch-first)" ON)
+if(CU_ROARING_BUILD_V2)
+    add_subdirectory(v2)
+endif()

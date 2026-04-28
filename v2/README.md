@@ -91,9 +91,11 @@ run_data[]                   → per-type pools SHARED across the batch;
                                 selected by types[cid].
 ```
 
-All device pointers alias into a single `cudaMallocAsync` block. Per-bitmap
-scalars (`total_cardinality`, `universe_size`) are mirrored in host-side
-arrays so callers can read them without a D2H.
+All device pointers alias into a single `cudaMallocAsync` block. The
+per-bitmap scalars callers need at orchestration time (`total_cardinality`,
+`universe_size`, `container_starts`, `key_index_starts`,
+`n_bitmap_containers`) are mirrored in host-side arrays so `make_view`,
+`multi_and` launch sizing, and all-bitmap validation never trigger a D2H.
 
 ## What's kept from the single-bitmap design
 

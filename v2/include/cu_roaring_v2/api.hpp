@@ -4,12 +4,11 @@
 #include <cuda_runtime.h>
 #include "cu_roaring_v2/types.cuh"
 
-// Opaque forward-declaration of CRoaring's bitmap type. Clients that never call
-// upload_batch from the CPU side do not need to pull in roaring/roaring.h.
-extern "C" {
-struct roaring_bitmap_s;
-typedef struct roaring_bitmap_s roaring_bitmap_t;
-}
+// CRoaring's C++ build wraps the C types in roaring::api, so a plain
+// extern-"C" forward-decl of roaring_bitmap_t would clash with the real type
+// once roaring/roaring.h is included downstream. Pull the real header in here
+// and let any cu_roaring::v2 user pick it up transitively, matching v1.
+#include <roaring/roaring.h>
 
 namespace cu_roaring::v2 {
 
