@@ -72,6 +72,7 @@ add_library(cu_roaring_bitmap
     src/upload_ids.cu
     src/promote.cu
     src/to_csr.cu
+    src/enumerate_runs.cu
 )
 
 # Header-only interface target for device-side API (roaring_view, warp_query)
