@@ -231,3 +231,25 @@ TEST_F(DecompressTest, FullContainer) {
     cu_roaring::gpu_roaring_free(gpu);
     roaring_bitmap_free(r);
 }
+
+TEST_F(DecompressTest, RunsSharingBoundaryWord) {
+    // Two runs in the same container whose expansions land on the SAME output
+    // word: [10,20) ends in word 0; [25,40) starts in word 0 (bits 25-31) and
+    // ends in word 1. The word-at-a-time RUN optimization keeps atomicOr on
+    // partial boundary words precisely so these two threads do not clobber
+    // each other -- a plain store here would drop one run's bits.
+    roaring_bitmap_t* r = roaring_bitmap_create();
+    roaring_bitmap_add_range(r, 10, 20);
+    roaring_bitmap_add_range(r, 25, 40);
+    roaring_bitmap_run_optimize(r);
+
+    auto gpu = cu_roaring::upload(r);
+    uint32_t n_words = (gpu.universe_size + 31) / 32;
+    uint32_t* d_bitset = cu_roaring::decompress_to_bitset(gpu);
+
+    verify_bitset(r, d_bitset, n_words, gpu.universe_size);
+
+    cudaFree(d_bitset);
+    cu_roaring::gpu_roaring_free(gpu);
+    roaring_bitmap_free(r);
+}

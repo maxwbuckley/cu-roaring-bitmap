@@ -124,5 +124,5 @@ BENCHMARK(BM_GPU_Decompress_Runs)
     ->Args({256000000, 512})  // scale check at a mid run length
     ->Unit(benchmark::kMillisecond)
     ->UseManualTime()
-    ->Repetitions(10)
+    ->Repetitions(30)
     ->DisplayAggregatesOnly(true);

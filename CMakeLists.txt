@@ -73,13 +73,14 @@ add_library(cu_roaring_bitmap
     src/promote.cu
     src/to_csr.cu
     src/enumerate_runs.cu
+    src/filtered_search.cu
 )
 
 # Header-only interface target for device-side API (roaring_view, warp_query)
 add_library(cu_roaring_device INTERFACE)
 target_include_directories(cu_roaring_device INTERFACE include/)
 target_include_directories(cu_roaring_bitmap PUBLIC include/)
-target_link_libraries(cu_roaring_bitmap PUBLIC roaring CUDA::cudart)
+target_link_libraries(cu_roaring_bitmap PUBLIC roaring CUDA::cudart_static CUDA::cublas)
 set_target_properties(cu_roaring_bitmap PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
