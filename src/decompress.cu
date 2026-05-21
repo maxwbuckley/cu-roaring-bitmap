@@ -58,28 +58,68 @@ __global__ void decompress_kernel(
             }
         }
     } else if (ctype == ContainerType::RUN) {
-        // Run container: each run is (start, length) pair of uint16_t
-        // offset is in bytes into run_data
+        // Run container: each run is a (start, length) pair of uint16_t.
+        // offset is in bytes into run_data.
         const uint16_t* runs =
             run_data + (offset / sizeof(uint16_t));
         uint16_t n_runs = cardinalities[cid];
 
-        // Distribute runs across threads
+        // One thread per run, expanded word-at-a-time rather than bit-at-a-time:
+        //   - interior fully-covered words: a plain store of 0xFFFFFFFF.
+        //     Roaring runs within a container are sorted and disjoint, so a
+        //     word lying strictly inside a run is owned exclusively by that
+        //     run -- no other run, and no other container (each block handles
+        //     one key region of a pre-zeroed, per-bitmap buffer), can touch it.
+        //   - first/last partially-covered words: atomicOr with a bit mask,
+        //     because a neighbouring run in the same container (handled by a
+        //     different thread) may share that boundary word.
+        // This turns O(run_length) atomics into ~2 atomics + O(run_length/32)
+        // plain stores per run. NOTE: the interior plain stores are only valid
+        // because the output is a single bitmap's own buffer; if this kernel
+        // is ever reused for a shared/packed output they must become atomicOr.
         for (uint32_t r = threadIdx.x; r < n_runs; r += blockDim.x) {
-            uint16_t start  = runs[r * 2];
-            uint16_t length = runs[r * 2 + 1];
+            uint32_t start  = runs[r * 2];
+            uint32_t length = runs[r * 2 + 1];
 
-            // Set bits [start, start + length] (inclusive) within this container.
+            // Inclusive value range [start, end] within this container.
             // Clamp end to 0xFFFF so a malformed run (start + length > 65535)
             // can never leak bits into a neighbouring container.
-            uint32_t end = static_cast<uint32_t>(start) + length;
+            uint32_t end = start + length;
             if (end > 0xFFFFu) end = 0xFFFFu;
-            for (uint32_t v = start; v <= end; ++v) {
-                uint32_t abs_bit = (static_cast<uint32_t>(key) << 16) | v;
-                uint32_t word_idx = abs_bit / 32u;
-                uint32_t bit_pos  = abs_bit % 32u;
-                if (word_idx < output_size_words) {
-                    atomicOr(&output[word_idx], 1u << bit_pos);
+
+            uint32_t first_bit  = (static_cast<uint32_t>(key) << 16) | start;
+            uint32_t last_bit   = (static_cast<uint32_t>(key) << 16) | end;
+            uint32_t first_word = first_bit >> 5;
+            uint32_t last_word  = last_bit >> 5;
+            uint32_t first_pos  = first_bit & 31u;   // 0..31
+            uint32_t last_pos   = last_bit & 31u;    // 0..31
+
+            if (first_word == last_word) {
+                // Whole run lives in one word: bits [first_pos, last_pos].
+                uint32_t span = last_pos - first_pos;  // 0..31
+                uint32_t mask = (span == 31u)
+                                    ? 0xFFFFFFFFu
+                                    : (((1u << (span + 1u)) - 1u) << first_pos);
+                if (first_word < output_size_words) {
+                    atomicOr(&output[first_word], mask);
+                }
+            } else {
+                // First (partial) word: bits [first_pos, 31].
+                if (first_word < output_size_words) {
+                    atomicOr(&output[first_word], 0xFFFFFFFFu << first_pos);
+                }
+                // Interior full words: exclusive to this run -> plain store.
+                for (uint32_t w = first_word + 1u; w < last_word; ++w) {
+                    if (w < output_size_words) {
+                        output[w] = 0xFFFFFFFFu;
+                    }
+                }
+                // Last (partial) word: bits [0, last_pos].
+                uint32_t last_mask = (last_pos == 31u)
+                                         ? 0xFFFFFFFFu
+                                         : ((1u << (last_pos + 1u)) - 1u);
+                if (last_word < output_size_words) {
+                    atomicOr(&output[last_word], last_mask);
                 }
             }
         }

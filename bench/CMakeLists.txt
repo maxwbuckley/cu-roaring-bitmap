@@ -18,6 +18,7 @@ endfunction()
 
 add_cu_roaring_bench(bench_set_ops)
 add_cu_roaring_bench(bench_decompress)
+add_cu_roaring_bench(bench_decompress_runs)
 add_cu_roaring_bench(bench_transfer)
 
 # Comprehensive benchmark (no google benchmark dependency, standalone)
