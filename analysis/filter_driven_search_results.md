@@ -3,137 +3,234 @@
 *Implements the container→schedule dispatch sketched in
 [`filter_driven_search.md`](filter_driven_search.md): a roaring-filtered
 brute-force vector search where the filter becomes the loop bounds of the GEMM
-instead of a post-hoc mask. Measured on an RTX 5090 (sm_120), 2026-05-22.*
+instead of a post-hoc mask. Measured on an RTX 5090 (sm_120), 2026-05-22.
+Comparison uses cuVS (`v25.12.00a`) `brute_force::search` + raft
+`bitset_filter` as the production baseline.*
 
 ## What was built
 
 A complete container-type dispatch + search executor in `src/filtered_search.cu`
 (API: `include/cu_roaring/detail/filtered_search.cuh`).
 
-| Container in the filter | Schedule | GEMM cost |
+| Container in the filter | Schedule | Notes |
 |---|---|---|
-| absent (no set bits in the 64K block) | **skipped** | 0 |
-| run, width ≥ 64K | **direct range GEMM** on `db[start:end]`, no copy | run width |
-| run, width < 64K | **gathered** into the compact GEMM (see shape gate) | cardinality |
-| array (sparse scattered) | **gather** rows → one compact GEMM | cardinality |
-| bitmap, density ≥ 50% | **range GEMM + bitset mask** (the container's own words) | 64K |
-| bitmap, density < 50% | **gather** (bit-scan → ids) | popcount |
-| `negated` bitmap | complement schedule: absent blocks → full ranges, excluded containers → range + inverted mask | universe − excluded |
+| absent (no set bits in the 64K block) | **skipped** | 0 cost |
+| run, width ≥ 64K | **direct range GEMM** on `db[start:end]` | no copy |
+| run, width < 64K | **gathered** | shape gate |
+| array (sparse scattered) | **gather** rows → one compact GEMM | |
+| bitmap, density ≥ 50% | **range GEMM + bitset mask** | mask = container's own words |
+| bitmap, density < 50% | **gather** (bit-scan → ids) | |
+| `negated` bitmap | complement schedule | absent blocks → full ranges, excluded containers → range + inverted mask |
 
-`build_schedule()` walks the roaring containers and emits a `SearchSchedule` —
-direct range tasks + one gather buffer. `roaring_filtered_search()` runs each
-task: cuBLAS GEMM of the queries against that task's database columns → optional
-mask → column-parallel two-pass top-k merged into a running per-query top-k.
-The whole task sequence is **CUDA-graph-captured and replayed** (a filtered
-search issues O(tasks) kernels; per-launch host overhead would otherwise
-dominate). The dense baseline is the same executor over one `[0,N)` range with
-the decompressed filter bitset as the mask — the design doc's "option 1".
+`build_schedule()` walks the roaring containers and emits a `SearchSchedule`
+— direct range tasks + at most one gather buffer. `roaring_filtered_search()`
+runs each task: cuBLAS GEMM of the queries against that task's database
+columns → optional mask → column-parallel top-k merged into a running
+per-query top-k. The whole task sequence is **CUDA-graph-captured and
+replayed** (a filtered search issues O(tasks) kernels; per-launch host
+overhead would otherwise dominate). The dense baseline is the same executor
+over one `[0,N)` range with the decompressed filter bitset as the mask —
+the design doc's "option 1".
 
 ## Correctness
 
 `test/test_filtered_search.cu` — 7 cases (run / array / dense-bitmap /
-sparse-bitmap / mixed / negated / fragmentation-fallback). Each builds a filter
-that lands in one dispatch regime, asserts the schedule took that path, and
-verifies both the schedule-driven search and the dense baseline against an
-exhaustive CPU top-k reference — twice, so the CUDA-graph replay path is also
-covered. All pass. In the cuVS comparison below, schedule-driven results match
-the production cuVS bitset path at **recall@10 = 1.000** for every config.
+sparse-bitmap / mixed / negated / fragmentation-fallback). Each builds a
+filter that lands in one dispatch regime, asserts the schedule took that
+path, and verifies both the schedule-driven search and the dense baseline
+against an exhaustive CPU top-k reference — twice, so the CUDA-graph replay
+path is also covered. All pass. **In the cuVS comparison below, schedule-
+driven results match cuVS's bitset-filtered brute force at `recall@10 = 1.000`
+for every config.**
 
-## Result 1 — vs cuVS production bitset filter
+## Result 1 — vs cuVS bitset filter, main grid
 
-`bench_schedule_driven_roaring.cu`, wired into the cuVS benchmark tree:
-cuVS `brute_force::search` + raft `bitset_filter` (the production dense-bitset
-prefilter) vs `cu_roaring::roaring_filtered_search`. Inner-product top-10,
-D=128, 64 queries, random-scattered filter, median of 30 interleaved A/B reps.
+Inner-product top-10, D=128, Q=64. Median of 3 replicates × 20 interleaved
+A/B iterations (cv < 2%). Filter shape is either uniform Bernoulli
+("scattered") or 4 equally-spaced contiguous runs ("clustered"). For
+clustered, the filter is built through CRoaring with `run_optimize()` then
+uploaded preserving RUN containers — that's what fires the direct-range
+dispatch path.
 
-| N | selectivity | cuVS bitset | roaring-schedule | speedup |
+### Scattered (Bernoulli — produces BITMAP containers, no RUN)
+
+| N | sel | card | containers (run/arr/bmp) | schedule (D/M/G) | cuVS bitset | roaring | speedup | bitset QPS | roaring QPS |
+|---|---|---|---|---|---|---|---|---|---|
+| 1M | 1% | 9,922 | 0/0/16 | 0/0/1 | 2.6 ms | 0.10 ms | **27×** | 25 k | 673 k |
+| 1M | 5% | 49,923 | 0/0/16 | 0/0/1 | 4.6 ms | 0.36 ms | **13×** | 14 k | 179 k |
+| 1M | 25% | 249,738 | 0/0/16 | 0/0/1 | 4.5 ms | 1.13 ms | 4.0× | 14 k | 56 k |
+| 1M | 50% | 500,275 | 0/0/16 | 0/16/0 | 5.1 ms | 6.9 ms | 0.74× | 13 k | 9 k |
+| 5M | 5% | 249,054 | 0/0/77 | 0/0/1 | 15.9 ms | 1.13 ms | **14×** | 4 k | 56 k |
+| 5M | 10% | 499,607 | 0/0/77 | 0/0/1 | 32.2 ms | 1.65 ms | **20×** | 2 k | 39 k |
+| 5M | 50% | 2,499,161 | 0/0/77 | 0/37/1 | 12.8 ms | 20.3 ms | 0.63× | 5 k | 3 k |
+| 10M | 1% | 99,572 | 0/0/153 | 0/0/1 | 7.3 ms | 0.66 ms | **11×** | 9 k | 97 k |
+| 10M | 5% | 499,833 | 0/0/153 | 0/0/1 | 32.2 ms | 1.64 ms | **20×** | 2 k | 39 k |
+| 10M | 10% | 998,671 | 0/0/153 | 0/0/1 | 65.3 ms | 2.46 ms | **27×** | 1 k | 26 k |
+| 10M | 50% | 5,001,379 | 0/0/153 | 0/153/0 | 18.7 ms | 68.9 ms | **0.27×** | 3 k | 0.9 k |
+| 25M | 5% | 1,250,015 | 0/0/382 | 0/0/1 | 81.9 ms | 3.53 ms | **23×** | 0.8 k | 18 k |
+| 25M | 50% | 12,499,860 | 0/0/382 | 0/194/1 | 34.1 ms | 102.6 ms | 0.33× | 2 k | 0.6 k |
+| 50M | 1% | 501,047 | 0/0/763 | 0/0/1 | 32.3 ms | 1.65 ms | **19×** | 2 k | 39 k |
+| 50M | 5% | 2,501,961 | 0/0/763 | 0/0/1 | 165.3 ms | 6.49 ms | **25×** | 0.4 k | 10 k |
+| 50M | 10% | 4,997,866 | 0/0/763 | 0/0/1 | 3,295 ms | 12.2 ms | **271×** ✱ | 0.02 k | 5 k |
+
+✱ At 10% selectivity (sparsity = 0.9, exactly cuVS's CSR↔dense dispatch
+threshold) cuVS picks CSR/SpGEMM, which scales catastrophically at 50M.
+
+### Clustered (4 equally-spaced contiguous runs — RUN containers preserved)
+
+| N | sel | card | containers (run/arr/bmp) | schedule (D/M/G) | cuVS bitset | roaring | speedup | bitset QPS | roaring QPS |
+|---|---|---|---|---|---|---|---|---|---|
+| 1M | 1% | 10,000 | **4**/0/0 | 0/0/1 | 2.6 ms | 0.10 ms | 27× | 25 k | 669 k |
+| 1M | 25% | 250,000 | 7/0/0 | 0/0/1 | 4.3 ms | 1.14 ms | 3.8× | 15 k | 56 k |
+| 1M | 50% | 500,000 | 11/0/0 | **4/0/0** | 4.7 ms | 3.3 ms | **1.4×** | 14 k | 19 k |
+| 5M | 10% | 500,000 | 10/0/0 | **4/0/0** | 31.4 ms | 3.3 ms | **9.6×** | 2 k | 19 k |
+| 5M | 25% | 1,250,000 | 20/0/0 | **4/0/0** | 11.3 ms | 5.1 ms | 2.2× | 6 k | 13 k |
+| 5M | 50% | 2,500,000 | 40/0/0 | **4/0/0** | 11.4 ms | 7.4 ms | **1.5×** | 6 k | 9 k |
+| 10M | 5% | 500,000 | 11/0/0 | **4/0/0** | 32.0 ms | 3.3 ms | 9.8× | 2 k | 19 k |
+| 10M | 10% | 1,000,000 | 18/0/0 | **4/0/0** | 65.8 ms | 4.5 ms | **15×** | 1 k | 14 k |
+| 10M | 25% | 2,500,000 | 40/0/0 | **4/0/0** | 15.9 ms | 7.4 ms | 2.2× | 4 k | 9 k |
+| 10M | 50% | 5,000,000 | 80/0/0 | **4/0/0** | 15.7 ms | 14.1 ms | **1.1×** | 4 k | 5 k |
+| 25M | 50% | 12,500,000 | 194/0/0 | **4/0/0** | 27.9 ms | 29.8 ms | 0.93× | 2 k | 2 k |
+| 50M | 10% | 5,000,000 | 80/0/0 | **4/0/0** | 1,599 ms | 14.1 ms | **114×** | 0.04 k | 5 k |
+
+**Container dispatch confirmed.** Scattered → 100% BITMAP containers, schedule
+collapses to one gather task at low/moderate selectivity, one masked-range
+task per BITMAP at 50% selectivity. Clustered → 100% RUN containers; once
+runs are ≥ 64K wide the schedule's `direct-range` (D) bucket fires — that's
+the no-copy direct-GEMM path. The "fallback" column is 1 when narrow runs
+got gathered, 0 when direct ranges fired.
+
+## Result 2 — D sweep (N=2M, sel=5%, Q=64)
+
+| D | shape | cuVS bitset | roaring | speedup | bitset QPS | roaring QPS |
+|---|---|---|---|---|---|---|
+| 128 | scattered | 7.3 ms | 0.66 ms | 11× | 9 k | 97 k |
+| 128 | clustered | 7.0 ms | 0.66 ms | 11× | 9 k | 97 k |
+| 384 | scattered | 10.1 ms | 0.76 ms | 13× | 6 k | 84 k |
+| 384 | clustered | 10.0 ms | 0.76 ms | 13× | 6 k | 84 k |
+| 768 | scattered | 14.8 ms | 0.91 ms | **16×** | 4 k | 70 k |
+| 768 | clustered | 14.6 ms | 0.91 ms | **16×** | 4 k | 71 k |
+| 1536 | scattered | 23.4 ms | 1.19 ms | **20×** | 3 k | 54 k |
+| 1536 | clustered | 23.1 ms | 1.18 ms | **20×** | 3 k | 54 k |
+
+The schedule-driven advantage **grows with D**: at D=128 it's 11×, at
+D=1536 (typical for modern embeddings) it's 20×. The dense path's GEMM cost
+scales linearly with `N · D`; the schedule-driven path's GEMM scales with
+`card · D`. So the bigger D gets, the bigger the proportional saving from
+not scanning the universe. Shape doesn't matter here — at card=100k both
+shapes collapse to one gather task.
+
+## Result 3 — Q sweep (N=10M, sel=5%, D=128, scattered)
+
+| Q | cuVS bitset | roaring | speedup | bitset QPS | roaring QPS |
+|---|---|---|---|---|---|
+| 1 | 3.6 ms | 0.22 ms | 17× | 0.28 k | 4.6 k |
+| 8 | 5.5 ms | 0.41 ms | 14× | 1.4 k | 20 k |
+| 32 | 21.6 ms | 0.95 ms | 23× | 1.5 k | 34 k |
+| 64 | 32.2 ms | 1.64 ms | 20× | 2 k | 39 k |
+| 128 | 41.5 ms | 3.10 ms | 13× | 3 k | 41 k |
+
+The speedup is roughly flat across the GEMV→GEMM transition (13–23×) — the
+schedule-driven path saves work in proportion to `card / N`, and that ratio
+doesn't depend on Q. The headline throughput is at Q=128: **41k QPS on a
+single 5090** for a 5%-selective filter over 10M-row inner-product top-10.
+
+## Investigation: the 50% scattered regression
+
+At ≥40% selectivity on scattered data, schedule-driven slows down to
+0.27–0.74× of the bitset baseline (the design doc's own caveat: "doing
+less work is not faster if it fragments into many small awkward GEMMs"). I
+profiled `10M / 50% / scattered` with `nsys` (mode A = bitset, mode B =
+roaring, 90 timed iterations each). Per-kernel time, schedule-driven side:
+
+| kernel | instances | avg | total | % |
 |---|---|---|---|---|
-| 100K | 1% | 1.28 ms | 0.058 ms | **22.1×** |
-| 100K | 5% | 2.54 ms | 0.075 ms | **34.0×** |
-| 100K | 25% | 0.89 ms | 0.229 ms | 3.9× |
-| 100K | 50% | 0.86 ms | 0.369 ms | 2.3× |
-| 1M | 1% | 2.17 ms | 0.116 ms | **18.8×** |
-| 1M | 5% | 4.38 ms | 0.376 ms | **11.7×** |
-| 1M | 25% | 5.02 ms | 1.14 ms | 4.4× |
-| 1M | 50% | 4.88 ms | 3.21 ms | 1.5× |
-| 5M | 1% | 4.38 ms | 0.374 ms | **11.7×** |
-| 5M | 5% | 15.68 ms | 1.14 ms | **13.8×** |
-| 5M | 25% | 12.79 ms | 3.55 ms | 3.6× |
-| 5M | 50% | 13.19 ms | 34.48 ms | 0.38× |
-| 10M | 1% | 6.96 ms | 0.655 ms | **10.6×** |
-| 10M | 5% | 31.76 ms | 1.65 ms | **19.2×** |
-| 10M | 25% | 18.62 ms | 6.49 ms | 2.9× |
-| 10M | 50% | 18.62 ms | 37.28 ms | 0.50× |
+| `partial_topk_kernel` (mine) | 153 | 383 µs | 58.7 ms | **42%** |
+| `cutlass_simt_sgemm_128x64` (mine) | 152 | 34 µs | 5.2 ms | 4% |
+| `reduce_into_running_kernel` (mine) | 153 | 22 µs | 3.4 ms | 2% |
+| `apply_mask_kernel` (mine) | 153 | 8.7 µs | 1.3 ms | 1% |
 
-**Typical case 10–20× below ~10% selectivity, 3–4× at 25%, crossing to a loss
-above ~40%.** Schedule-driven search makes GEMM work scale with filter
-cardinality; the cuVS bitset path runs the full Q×N GEMM and masks. At ≥50%
-selectivity the gather copies most of the database — more traffic than the
-dense masked GEMM — so the dense path wins; this is the documented next step
-(a search-level selectivity gate, see below).
+The GEMM itself isn't the bottleneck — at 10M/50% the schedule does *fewer*
+total GEMM columns than cuVS (~7.6M vs 10M). The bottleneck is **my top-k
+fires once per task**: at 50% scattered the schedule fragments into ~76
+small masked-range tasks (one per dense BITMAP container), each pays a
+`partial_topk_kernel` call. cuVS's side:
 
-## Result 2 — internal sweep (schedule-driven vs dense-masked)
+| kernel | instances | avg | total |
+|---|---|---|---|
+| `magma_sgemmEx` (cuVS GEMM) | 505 | 984 µs | 497 ms |
+| `cub for_each` (cuVS mask) | 505 | 726 µs | 367 ms |
+| `raft warpsort block_kernel` (cuVS top-k) | 1010 | 170 µs | **172 ms** |
 
-`bench_filtered_search.cu`, N=2M, inner-product top-10, median of 30 reps
-(cv < 2.5%), CUDA-graph replay, schedule pre-built.
+cuVS runs one big tiled GEMM + raft's `warpsort` top-k once per search.
+**Clustered (RUN containers) recovers most of the regression.** Same N×sel
+but 4 wide runs instead of 76 small masked blocks:
 
-| Sweep | Schedule-driven speedup vs dense-masked |
-|---|---|
-| Selectivity (Q=32, 8 runs): 0.1 / 1 / 5 / 25 / 50 / 90 % | **33.8× / 17.4× / 4.6×** / 0.93× / 0.61× / 0.44× |
-| Batch size (5%, 8 runs): Q = 1 / 8 / 32 / 128 | 10.4× / 7.4× / 4.6× / 5.0× |
-| Dimension (5%, Q=32): D = 64 / 128 / 768 | 3.9× / 4.6× / **11.2×** |
-| Fragmentation (10%, Q=32): 8 / 512 / 16384 / 90000 runs | 3.0× / 3.1× / 4.4× / 4.8× |
+| config | scattered roaring | clustered roaring | improvement |
+|---|---|---|---|
+| 5M / 50% | 20.3 ms | 7.4 ms | 2.7× |
+| 10M / 50% | 68.9 ms | 14.1 ms | **4.9×** |
+| 25M / 50% | 102.6 ms | 29.8 ms | 3.4× |
 
-## Optimization analysis
+4 direct-range tasks + 4 top-ks beats 76 masked-range tasks + 76 top-ks
+cleanly. The 10M/50% case goes from **0.27× to 1.12× vs cuVS** — the
+regression is *data-layout-dependent*, not fundamental.
 
-Profiled with `nsys` + `ptxas -v`. Two findings, one fixed in this branch.
+## Investigation: cuVS's bitset_filter pays a popcount kernel per search
 
-**1. Shape-gate mis-calibration — found by the benchmark, fixed.** The first
-implementation gated the gather fallback on *mean* range width (< 256). The
-fragmentation sweep then exposed a pathological config: 512 runs of ~390
-columns each passed the gate and issued **512 separate skinny GEMMs**, running
-**10× slower than the dense baseline** (0.10×). cuBLAS runs a 390-column GEMM
-at a tiny fraction of peak. The fix is a **per-range partition**: a range keeps
-its own direct (no-copy) GEMM only if it is ≥ 64K columns wide — wide enough to
-saturate the GPU — otherwise it joins the single compact gather GEMM. A
-schedule may mix a few huge direct ranges with a gather of the rest. This is
-the single highest-leverage optimization: it lifted 0.1%-selectivity from 5.9×
-to **33.8×** and turned the 512-run regression into a 3.1× win.
+cuVS's `raft::core::bitset` does **not** store cardinality.
+`knn_brute_force.cuh:629` calls `bitset_view::count(res)` on every filtered
+search, which runs a popcount kernel (`raft::popc`) over the whole bitset to
+compute sparsity, then dispatches CSR/SpGEMM at sparsity ≥ 0.9 vs
+dense+mask below. This is the cause of the non-monotonic shape of the
+bitset baseline's cost: it's not one curve, it's two paths joined at the
+sparsity-0.9 threshold. Most starkly visible at 50M / 10% (sparsity exactly
+0.9 — picks CSR — collapses to **3.3 seconds**).
 
-**2. Top-k is local-memory-latency bound (remaining, ~40% of GPU time).**
-`partial_topk_kernel` keeps each thread's running top-k in a 32-slot array that
-is dynamically indexed (insertion shifts), so ptxas places it in a 1 KB
-per-thread stack frame (local memory) — 0 register spills, but every insert
-touches local memory at ~31% occupancy, too low to hide L2 latency. *Fix:* a
-register-resident or warp-distributed top-k (each lane owns k/32 of the list,
-bitonic merge over shuffles).
+The roaring filter, by contrast, stores cardinality as a field
+(`cu_roaring::GpuRoaring::total_cardinality`), populated at upload. cuVS's
+brute_force path reads it directly (`brute_force.cu:46`), so the
+schedule-driven path computes sparsity for free.
 
-**3. High-selectivity crossover.** Above ~40% selectivity the gather copies
-most of the database and schedule-driven loses to the dense masked GEMM. A
-search-level **selectivity gate** — fall back to `dense_filtered_search` when
-`cardinality / N` exceeds ~0.3 — would make the search never lose. Not yet
-implemented; the data above shows exactly where the crossover sits.
+## Optimisation analysis
 
-Schedule build (`enumerate_runs` + dispatch kernels) is O(n_containers+n_runs),
-sub-millisecond, amortised across the query batch — not a bottleneck.
+Two issues, both quantified above.
 
-## Files
+1. **Top-k is local-memory-latency bound + per-task overhead.**
+   `partial_topk_kernel` keeps each thread's running top-k in a 32-slot
+   array that is dynamically indexed, so ptxas places it in a 1 KB
+   per-thread stack frame; the kernel runs at ~31% occupancy. Fix: a
+   register-resident or warp-distributed top-k (each lane owns k/32 of the
+   list, bitonic merge over shuffles), or just adopt raft's `warpsort`. The
+   stand-alone per-call speed isn't the only issue — the **per-task multiplier
+   at fragmented schedules** is.
 
-| File | Role |
-|---|---|
-| `include/cu_roaring/detail/filtered_search.cuh` | `GemmTask` / `SearchSchedule` API |
-| `src/filtered_search.cu` | dispatch, executor, CUDA-graph cache, top-k |
-| `test/test_filtered_search.cu` | 7 correctness cases vs CPU reference |
-| `bench/bench_filtered_search.cu` | schedule-driven vs dense sweeps |
-| `cuvs/.../bench_schedule_driven_roaring.cu` | vs cuVS bitset filter (lives in the cuVS tree) |
+2. **Search-level selectivity gate.** Above ~30% selectivity on scattered
+   data the schedule-driven path loses cleanly. The fix is to fall back to
+   `dense_filtered_search` (one big GEMM + one warpsort) when
+   `cardinality / N` exceeds a learned threshold. The benchmark above
+   locates the crossover exactly; the gate is a 5-line change in
+   `roaring_filtered_search`. Not implemented in this branch; documented as
+   the next step.
+
+A third opportunity is **per-task gather coalescing for clustered data with
+many medium runs**: as Result 1 shows, scattered (1 gather task) beats
+clustered (4 direct tasks) at moderate selectivity because the per-task
+top-k × n_tasks bill outweighs the no-copy advantage of direct GEMMs. The
+right rule is probably "use direct only when each run is big enough that
+the GEMM is the bulk of the work" — formally a function of D and Q.
 
 ## Reproduce
 
 ```bash
+# cu-roaring side: implementation, tests, dense baseline
 cd build && cmake --build . --target test_filtered_search bench_filtered_search -j
 ctest -R filtered_search --output-on-failure
-./bench/bench_filtered_search                      # internal sweeps
+./bench/bench_filtered_search
 
-# cuVS comparison: cu_roaring must be built with the cuVS CUDA toolchain
-# (CUDA 12.4 / sm_89) so it device-links with the cuVS benchmark tree.
+# cuVS comparison: bench_schedule_driven_roaring.cu lives in the cuVS bench
+# tree (cpp/bench/prims/core). It needs cu_roaring built with the cuVS bench
+# toolchain (CUDA 12.4 / sm_89) so the static library device-links.
 ```
+
+Raw results: [`bench_cuvs_comparison.json`](bench_cuvs_comparison.json).
