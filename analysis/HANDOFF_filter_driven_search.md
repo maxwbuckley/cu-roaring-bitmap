@@ -12,13 +12,15 @@ vector search lives on branch **`run-optimizations`** (pushed to
 `origin/run-optimizations` on `maxwbuckley/cu-roaring-bitmap`). Verified
 on RTX 5090. **Search-only is 14–27× faster than cuVS `brute_force` +
 raft `bitset_filter`** across the synthetic configs; **end-to-end on
-real YFCC-10M is 1.24× (unsorted) / 1.39× (sorted) faster than cuVS**
+real YFCC-10M is 1.45× (unsorted) / 1.54× (sorted) faster than cuVS**
 with `recall@10 = 1.000`. Two more optimisation levers are identified
 and unimplemented; see "Next" below.
 
 ## Branch state (GitHub)
 
 ```
+afad483 upload_from_device_bitset: complement check default off + 6 internal opts
+2a0dbaa Add handoff doc — index of branch state, results, next steps
 b82b9ce filtered_search: skip enumerate_runs + persistent scratch -> YFCC beats cuVS
 df46f1e YFCC: GPU-side construction via upload_from_device_bitset cuts build 2.6x
 e420e3e Add YFCC sorted-by-tag-tuple result: tag bitmaps shrink 4000-7000x ...
@@ -100,8 +102,9 @@ Recall = 1.000 everywhere.
 | cuVS bitset            | 0.76 ms | 0.82 ms |
 | roaring search only    | 0.049 ms (**15.5×**) | 0.049 ms (**16.6×**) |
 | roaring build (host)   | 2.60 ms | 2.95 ms |
-| roaring build (GPU+opts1+2) | **0.55 ms** | **0.53 ms** |
-| roaring end-to-end (GPU+opts1+2) | **0.61 ms (1.24× cuVS)** | **0.59 ms (1.39× cuVS)** |
+| roaring build (GPU + opts 1–2) | 0.55 ms | 0.53 ms |
+| roaring build (GPU + opts 1–7) | **0.48 ms** | **0.45 ms** |
+| roaring end-to-end (GPU + opts 1–7) | **0.53 ms (1.45× cuVS)** | **0.52 ms (1.54× cuVS)** |
 | recall@10              | 1.000 | 1.000 |
 
 ## Implementation summary
@@ -194,6 +197,13 @@ SYNTH_FILTER_DIR=$PWD/output/sweep_10M/bitmaps SYNTH_N=10000000 \
   uncommitted files (`upload_pool.hpp`, four `bench_*.cu` files) — they
   are committed now.
 
+## What's been shipped on top of the original `9d9390a` implementation
+
+| commit | what |
+|---|---|
+| `b82b9ce` | Opts 1+2: skip enumerate_runs when no RUN containers; persistent scratch for `build_schedule`. **YFCC: 0.23× → 1.24× cuVS.** |
+| `afad483` | Opts 3–7 on `upload_from_device_bitset`: skip outer popcount (`check_complement=false` default), persistent scratch, coalesced metadata alloc, device-side chunk-map via CUB `InclusiveSum` + finalize kernel, device-side `key_index`. **YFCC: 1.24× → 1.45× cuVS.** Adds `_scratched` flag to `GpuRoaring`; `gpu_roaring_free` honors it. |
+
 ## What's left — next-step optimisations, ordered by payoff
 
 1. **Search-level selectivity gate (≈5 lines).** When
@@ -204,13 +214,15 @@ SYNTH_FILTER_DIR=$PWD/output/sweep_10M/bitmaps SYNTH_N=10000000 \
    "shared filter across batch" workloads at high sel.
 
 2. **GPU-side `run_optimize`.** The `upload_from_device_bitset` path
-   emits only ARRAY/BITMAP. Add a per-block transition-count scan + emit
-   RUN when low (single extra branch in the existing upload kernel), or
-   a separate `run_optimize_gpu(GpuRoaring&)` post-pass. Sorted-layout
-   YFCC's tag bitmaps compress 4000–7000× via host `run_optimize` but
-   that benefit doesn't currently propagate to the GPU search. With
-   GPU-side run detection the direct-range dispatch should fire on
-   sorted YFCC and push the win further.
+   emits only ARRAY/BITMAP (the optimisations shipped don't change that —
+   they cut overhead, not what kind of containers come out). Add a
+   per-block transition-count scan + emit RUN when low (single extra
+   branch in the existing upload kernel), or a separate
+   `run_optimize_gpu(GpuRoaring&)` post-pass. Sorted-layout YFCC's tag
+   bitmaps compress 4000–7000× via host `run_optimize` but that benefit
+   doesn't currently propagate to the GPU search. With GPU-side run
+   detection the direct-range dispatch should fire on sorted YFCC and
+   push the win further.
 
 3. **Pre-uploaded tag bitmaps + GPU-side `multi_and`.** For YFCC's 7910
    query-relevant tags, upload all of them once at startup
