@@ -1,0 +1,10 @@
+{
+  "gpu":"NVIDIA GeForce RTX 5090","n":10000000,"dim":512,"nq":64,"k":10,
+  "warmup":5,"iters":15,
+  "a":"cuvs brute_force + raft bitset_filter (H2D bitset + search + D2H)",
+  "b":"cu_roaring schedule-driven (H2D upload + schedule + search + D2H)",
+  "timed_region":"alloc+H2D+setup+search+D2H+free per call",
+  "results":[
+    {"sel":0.300000,"card":3000000,"sparsity":0.700000,"roaring_host_bytes":1254608,"bitset_host_bytes":1250000,"containers":{"run":0,"array":0,"bitmap":153},"schedule":{"direct_tasks":0,"direct_cols":0,"masked_tasks":0,"masked_cols":0,"gather_tasks":1,"gather_cols":3000000,"fallback":0},"cuvs_ms":36.7832,"cuvs_p10":35.5994,"cuvs_p90":38.2699,"cuvs_std":1.0525,"cuvs_qps":1740,"roaring_ms":24.9410,"roaring_p10":24.0954,"roaring_p90":25.1941,"roaring_std":0.4976,"roaring_qps":2566,"speedup":1.4748,"recall":1.0000}
+  ]
+}

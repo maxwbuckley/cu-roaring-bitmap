@@ -1,0 +1,18 @@
+GPU: NVIDIA GeForce RTX 5090   N=10000000  D=512  Q=64  K=10   free=30.2 GB
+warmup=5  iters=15  selectivities=1
+
+Allocating dataset (20.5 GB)...
+Building cuVS brute_force index...
+  free after dataset+index: 11.9 GB
+
+=== sel=50.0000%  card=5000000 ===
+  roaring portable bytes: 1225.20 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=0 arr=0 bmp=153   schedule: D=0(0.0M) M=76(5.0M) G=1(2.5M)
+  cuvs   : 34.704 ms  (p10=33.898 p90=35.706 std=0.737)  1844 QPS
+  count  : 0.103 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 34.600 ms  (cuvs minus count; fair-comparison)
+  roaring: 65.553 ms  (p10=64.722 p90=66.525 std=0.816)  976 QPS
+  speedup raw=0.53x   fair=0.53x     recall@10: 1.0000
+
+wrote bench_e2e_sweep.json

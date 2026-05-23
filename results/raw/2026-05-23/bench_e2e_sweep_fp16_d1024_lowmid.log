@@ -1,0 +1,88 @@
+GPU: NVIDIA GeForce RTX 5090   N=10000000  D=1024  Q=64  K=10   dtype=fp16   free=30.2 GB
+warmup=5  iters=15  selectivities=9
+
+Allocating dataset (20.5 GB, fp16)...
+Building cuVS brute_force index...
+  free after dataset+index: 11.9 GB
+
+=== sel=0.0100%  card=1000 ===
+  roaring portable bytes: 3.16 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=0 arr=153 bmp=0   schedule: D=0(0.0M) M=0(0.0M) G=1(0.0M)
+  cuvs   : 1.672 ms  (p10=1.561 p90=1.814 std=0.109)  38289 QPS
+  count  : 0.108 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 1.564 ms  (cuvs minus count; fair-comparison)
+  roaring: 1.010 ms  (p10=0.919 p90=1.092 std=0.072)  63369 QPS
+  speedup raw=1.66x   fair=1.55x     recall@10: 1.0000
+
+=== sel=0.1000%  card=10000 ===
+  roaring portable bytes: 20.73 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=0 arr=153 bmp=0   schedule: D=0(0.0M) M=0(0.0M) G=1(0.0M)
+  cuvs   : 3.525 ms  (p10=3.246 p90=3.775 std=0.227)  18158 QPS
+  count  : 0.107 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 3.418 ms  (cuvs minus count; fair-comparison)
+  roaring: 1.062 ms  (p10=1.002 p90=1.125 std=0.052)  60236 QPS
+  speedup raw=3.32x   fair=3.22x     recall@10: 1.0000
+
+=== sel=1.0000%  card=100000 ===
+  roaring portable bytes: 196.52 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=0 arr=153 bmp=0   schedule: D=0(0.0M) M=0(0.0M) G=1(0.1M)
+  cuvs   : 18.183 ms  (p10=17.830 p90=18.869 std=0.475)  3520 QPS
+  count  : 0.108 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 18.075 ms  (cuvs minus count; fair-comparison)
+  roaring: 2.187 ms  (p10=2.078 p90=2.308 std=0.101)  29269 QPS
+  speedup raw=8.32x   fair=8.27x     recall@10: 1.0000
+
+=== sel=3.0000%  card=300000 ===
+  roaring portable bytes: 587.14 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=0 arr=153 bmp=0   schedule: D=0(0.0M) M=0(0.0M) G=1(0.3M)
+  cuvs   : 50.764 ms  (p10=50.273 p90=51.558 std=0.490)  1261 QPS
+  count  : 0.117 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 50.646 ms  (cuvs minus count; fair-comparison)
+  roaring: 4.135 ms  (p10=4.067 p90=4.334 std=0.114)  15478 QPS
+  speedup raw=12.28x   fair=12.25x     recall@10: 1.0000
+
+=== sel=5.0000%  card=500000 ===
+  roaring portable bytes: 977.77 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=0 arr=153 bmp=0   schedule: D=0(0.0M) M=0(0.0M) G=1(0.5M)
+  cuvs   : 83.352 ms  (p10=82.815 p90=83.751 std=0.416)  768 QPS
+  count  : 0.098 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 83.254 ms  (cuvs minus count; fair-comparison)
+  roaring: 5.855 ms  (p10=5.761 p90=5.983 std=0.096)  10930 QPS
+  speedup raw=14.23x   fair=14.22x     recall@10: 1.0000
+
+=== sel=10.0000%  card=1000000 ===
+  roaring portable bytes: 1224.79 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=0 arr=1 bmp=152   schedule: D=0(0.0M) M=0(0.0M) G=1(1.0M)
+  cuvs   : 167.140 ms  (p10=166.654 p90=168.095 std=0.678)  383 QPS
+  count  : 0.162 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 166.978 ms  (cuvs minus count; fair-comparison)
+  roaring: 9.776 ms  (p10=9.685 p90=10.023 std=0.306)  6547 QPS
+  speedup raw=17.10x   fair=17.08x     recall@10: 1.0000
+
+=== sel=15.0000%  card=1500000 ===
+  roaring portable bytes: 1225.20 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=0 arr=0 bmp=153   schedule: D=0(0.0M) M=0(0.0M) G=1(1.5M)
+  cuvs   : 28.920 ms  (p10=28.114 p90=29.399 std=0.534)  2213 QPS
+  count  : 0.154 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 28.766 ms  (cuvs minus count; fair-comparison)
+  roaring: 14.442 ms  (p10=14.338 p90=15.003 std=0.371)  4431 QPS
+  speedup raw=2.00x   fair=1.99x     recall@10: 1.0000
+
+=== sel=20.0000%  card=2000000 ===
+  roaring portable bytes: 1225.20 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  SKIP: need ~max(cuvs 2.83 GB, gather 8.19 GB) + 0.5 GB headroom; free 5.64 GB
+
+=== sel=30.0000%  card=3000000 ===
+  roaring portable bytes: 1225.20 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  SKIP: need ~max(cuvs 2.83 GB, gather 12.29 GB) + 0.5 GB headroom; free 5.64 GB
+
+wrote bench_e2e_sweep_fp16_d1024_lowmid.json

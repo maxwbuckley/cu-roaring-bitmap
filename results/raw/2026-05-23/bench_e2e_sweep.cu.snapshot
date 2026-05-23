@@ -1,0 +1,527 @@
+/*
+ * bench_e2e_sweep — selectivity sweep for filtered brute-force search,
+ * cu_roaring (schedule-driven, host-side roaring bitmap) vs cuVS bitset
+ * (raft::core::bitset on device).
+ *
+ * Fixed shape: N=10M, D=512, Q=64, k=10, uniform-random IDs.
+ * Selectivity grid: 0.0001, 0.001, 0.01, 0.05, 0.10, 0.20, 0.30, 0.50, 0.90.
+ *
+ * Timed region per call (both paths):
+ *   1. H2D copy of the filter (compressed roaring portable buffer for cu_roaring,
+ *      flat 32-bit-word bitset for cuVS).
+ *   2. Any per-filter setup: schedule build (cu_roaring), bitset_filter wrap (cuVS).
+ *   3. The search itself.
+ *   4. D2H of the top-k id matrix.
+ *   5. Free of per-call resources.
+ *
+ * This mirrors "I have a roaring bitmap on the host, I want one query batch
+ * answered now" — i.e. neither side is allowed to amortize a one-time upload
+ * across many calls. The dataset (10M × 512 fp32 = 20 GB) and the cuVS
+ * brute_force index are built once outside the timed region, since they're
+ * always on-device in production.
+ *
+ * Correctness check: run A once, capture top-k id matrix; run B once, compute
+ * recall vs A. recall == 1.0 means bitwise-identical top-k ids.
+ *
+ * Output: bench_e2e_sweep.json next to the executable.
+ *
+ *   env knobs:
+ *     E2E_N=10000000   E2E_D=512   E2E_Q=64   (overridable)
+ *     E2E_WARMUP=5     E2E_ITERS=15
+ */
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include <curand.h>
+
+#include <cuvs/neighbors/brute_force.hpp>
+#include <cuvs/neighbors/common.hpp>
+
+#include <cu_roaring/cu_roaring.cuh>
+#include <cu_roaring/types.cuh>
+#include <cu_roaring/detail/upload.cuh>
+#include <cu_roaring/detail/upload_ids.cuh>
+#include <cu_roaring/detail/filtered_search.cuh>
+
+#include <roaring/roaring.h>
+
+#include <raft/core/device_mdarray.hpp>
+#include <raft/core/resources.hpp>
+#include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/bitset.cuh>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <random>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+namespace cu_roaring {
+void gpu_roaring_free(GpuRoaring& bitmap);
+void gpu_roaring_free_async(GpuRoaring& bitmap, cudaStream_t stream);
+}
+
+namespace {
+
+struct Stats { double median, mean, std_dev, p10, p90; };
+Stats stats_of(std::vector<double> t)
+{
+  if (t.empty()) return {0,0,0,0,0};
+  std::sort(t.begin(), t.end());
+  int n = static_cast<int>(t.size());
+  double sum = 0; for (double v : t) sum += v;
+  double mean = sum / n;
+  double var = 0; for (double v : t) var += (v - mean) * (v - mean);
+  double std_dev = std::sqrt(var / std::max(1, n - 1));
+  auto pct = [&](double p){
+    double idx = p * (n - 1);
+    int lo = static_cast<int>(std::floor(idx));
+    int hi = static_cast<int>(std::ceil(idx));
+    double f = idx - lo;
+    return t[lo] * (1.0 - f) + t[hi] * f;
+  };
+  return {t[n / 2], mean, std_dev, pct(0.10), pct(0.90)};
+}
+
+double recall_at_k(const std::vector<uint32_t>& got,
+                   const std::vector<int64_t>& ref, int nq, int k)
+{
+  int hit = 0;
+  for (int q = 0; q < nq; ++q)
+    for (int i = 0; i < k; ++i) {
+      uint32_t g = got[q * k + i];
+      for (int j = 0; j < k; ++j)
+        if (static_cast<int64_t>(g) == ref[q * k + j]) { ++hit; break; }
+    }
+  return static_cast<double>(hit) / (nq * k);
+}
+
+// Uniform-random card-selection of `card` distinct ids in [0,N).
+// Reservoir-style draw to avoid materialising the full N permutation.
+std::vector<uint32_t> sample_unique_ids(uint32_t N, uint64_t card, uint64_t seed)
+{
+  std::vector<uint32_t> ids;
+  ids.reserve(card);
+  // For sel < ~10% we draw with rejection (faster than a Fisher-Yates of N).
+  // For sel >= ~10% we sample the complement (N-card values) and emit the rest.
+  std::mt19937_64 rng(seed);
+  if (card * 4 < static_cast<uint64_t>(N)) {
+    std::vector<uint8_t> taken(N, 0);
+    while (ids.size() < card) {
+      uint32_t x = static_cast<uint32_t>(rng() % N);
+      if (!taken[x]) { taken[x] = 1; ids.push_back(x); }
+    }
+    std::sort(ids.begin(), ids.end());
+  } else {
+    uint64_t out_card = static_cast<uint64_t>(N) - card;
+    std::vector<uint8_t> dropped(N, 0);
+    uint64_t dropped_count = 0;
+    while (dropped_count < out_card) {
+      uint32_t x = static_cast<uint32_t>(rng() % N);
+      if (!dropped[x]) { dropped[x] = 1; ++dropped_count; }
+    }
+    for (uint32_t i = 0; i < N; ++i) if (!dropped[i]) ids.push_back(i);
+  }
+  return ids;
+}
+
+size_t free_vram() { size_t f=0, t=0; cudaMemGetInfo(&f, &t); return f; }
+
+// fp32 -> fp16 in-place cast kernel; used to fill an fp16 dataset/queries
+// buffer from a small fp32 staging chunk (curand has no native fp16 gen).
+__global__ void f32_to_f16_kernel(const float* __restrict__ src,
+                                  __half* __restrict__ dst, size_t n) {
+    size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+
+// Fill d_out with N(0,1) samples. fp32 uses curandGenerateNormal directly;
+// fp16 generates fp32 chunks into a small staging buffer then casts down,
+// avoiding the ~2x peak memory you'd need to hold the full fp32 image at
+// the largest configurations (10M*1024*4 = 40 GB).
+template <typename T>
+void generate_normal_typed(curandGenerator_t rng, T* d_out, size_t n_elems,
+                           cudaStream_t stream) {
+  if constexpr (std::is_same_v<T, float>) {
+    curandGenerateNormal(rng, d_out, n_elems, 0.0f, 1.0f);
+  } else {
+    static_assert(std::is_same_v<T, __half>, "T must be float or __half");
+    // 256 MB of fp32 per chunk = 64 M elements.
+    constexpr size_t kChunk = 64ull * 1024 * 1024;
+    float* d_chunk = nullptr;
+    size_t alloc_elems = std::min<size_t>(kChunk, n_elems);
+    cudaMalloc(&d_chunk, alloc_elems * sizeof(float));
+    for (size_t off = 0; off < n_elems; off += alloc_elems) {
+      size_t this_chunk = std::min(alloc_elems, n_elems - off);
+      curandGenerateNormal(rng, d_chunk, this_chunk, 0.0f, 1.0f);
+      uint32_t grid = static_cast<uint32_t>((this_chunk + 255) / 256);
+      f32_to_f16_kernel<<<grid, 256, 0, stream>>>(d_chunk, d_out + off, this_chunk);
+    }
+    cudaStreamSynchronize(stream);
+    cudaFree(d_chunk);
+  }
+}
+
+} // namespace
+
+template <typename T>
+int run_sweep(int N, int D, int NQ, int WARMUP, int ITERS,
+              const std::vector<double>& sel_grid)
+{
+  constexpr int K = 10;
+  constexpr const char* dtype_name =
+      std::is_same_v<T, float> ? "fp32" : "fp16";
+  raft::resources res;
+  auto stream = raft::resource::get_cuda_stream(res);
+  cublasHandle_t cublas;
+  cublasCreate(&cublas);
+  curandGenerator_t rng;
+  curandCreateGenerator(&rng, CURAND_RNG_PSEUDO_DEFAULT);
+  curandSetStream(rng, stream);
+  curandSetPseudoRandomGeneratorSeed(rng, 0xC0FFEE);
+
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, 0);
+  printf("GPU: %s   N=%d  D=%d  Q=%d  K=%d   dtype=%s   free=%.1f GB\n",
+         prop.name, N, D, NQ, K, dtype_name,
+         free_vram() / (1024.0 * 1024.0 * 1024.0));
+  printf("warmup=%d  iters=%d  selectivities=%zu\n\n",
+         WARMUP, ITERS, sel_grid.size());
+
+  // --- Dataset + cuVS index (built once) -----------------------------------
+  size_t dataset_bytes = static_cast<size_t>(N) * D * sizeof(T);
+  printf("Allocating dataset (%.1f GB, %s)...\n",
+         dataset_bytes / 1e9, dtype_name);
+  fflush(stdout);
+  auto dataset = raft::make_device_matrix<T, int64_t>(res, N, D);
+  generate_normal_typed<T>(rng, dataset.data_handle(),
+                           static_cast<size_t>(N) * D, stream);
+  raft::resource::sync_stream(res);
+  printf("Building cuVS brute_force index...\n"); fflush(stdout);
+
+  cuvs::neighbors::brute_force::index_params bp;
+  bp.metric = cuvs::distance::DistanceType::InnerProduct;
+  auto index = cuvs::neighbors::brute_force::build(
+    res, bp, raft::make_const_mdspan(dataset.view()));
+  raft::resource::sync_stream(res);
+  printf("  free after dataset+index: %.1f GB\n\n", free_vram() / 1e9);
+  fflush(stdout);
+
+  auto queries = raft::make_device_matrix<T, int64_t>(res, NQ, D);
+  generate_normal_typed<T>(rng, queries.data_handle(),
+                           static_cast<size_t>(NQ) * D, stream);
+  raft::resource::sync_stream(res);
+
+  // --- Persistent host/device buffers --------------------------------------
+  // result D2H targets (host-pinned for honest copy timing).
+  uint32_t* h_rid = nullptr;
+  int64_t*  h_nbr = nullptr;
+  cudaMallocHost(&h_rid, static_cast<size_t>(NQ) * K * sizeof(uint32_t));
+  cudaMallocHost(&h_nbr, static_cast<size_t>(NQ) * K * sizeof(int64_t));
+
+  // Device output buffers — these are owned by the caller in both APIs
+  // and would be reused across calls in production, so they live outside
+  // the timed region.
+  uint32_t* d_rid = nullptr;
+  float*    d_rsc = nullptr;
+  cudaMalloc(&d_rid, static_cast<size_t>(NQ) * K * sizeof(uint32_t));
+  cudaMalloc(&d_rsc, static_cast<size_t>(NQ) * K * sizeof(float));
+  auto neighbors = raft::make_device_matrix<int64_t, int64_t>(res, NQ, K);
+  auto dists     = raft::make_device_matrix<float,   int64_t>(res, NQ, K);
+
+  cudaEvent_t e0, e1;
+  cudaEventCreate(&e0); cudaEventCreate(&e1);
+
+  const char* out_path = std::getenv("E2E_OUT") ? std::getenv("E2E_OUT")
+                                                : "bench_e2e_sweep.json";
+  FILE* jf = fopen(out_path, "w");
+  fprintf(jf,
+    "{\n"
+    "  \"gpu\":\"%s\",\"n\":%d,\"dim\":%d,\"nq\":%d,\"k\":%d,\"dtype\":\"%s\",\n"
+    "  \"warmup\":%d,\"iters\":%d,\n"
+    "  \"a\":\"cuvs brute_force + raft bitset_filter (H2D bitset + search + D2H)\",\n"
+    "  \"b\":\"cu_roaring schedule-driven (H2D upload + schedule + search + D2H)\",\n"
+    "  \"timed_region\":\"alloc+H2D+setup+search+D2H+free per call\",\n"
+    "  \"results\":[\n",
+    prop.name, N, D, NQ, K, dtype_name, WARMUP, ITERS);
+  bool first_result = true;
+
+  for (double sel : sel_grid) {
+    uint64_t card = static_cast<uint64_t>(std::round(static_cast<double>(N) * sel));
+    if (card == 0) card = 1;
+    double sparsity = 1.0 - static_cast<double>(card) / N;
+
+    printf("=== sel=%.4f%%  card=%llu ===\n",
+           sel * 100, static_cast<unsigned long long>(card));
+    fflush(stdout);
+
+    // ---- Host artefacts (built once per cell; live on host) ---------------
+    std::vector<uint32_t> ids = sample_unique_ids(static_cast<uint32_t>(N), card,
+                                                  0xCAFEBABEull ^ static_cast<uint64_t>(card));
+    roaring_bitmap_t* cpu_bm = roaring_bitmap_create();
+    roaring_bitmap_add_many(cpu_bm, ids.size(), ids.data());
+    roaring_bitmap_run_optimize(cpu_bm);
+    size_t roaring_host_bytes = roaring_bitmap_portable_size_in_bytes(cpu_bm);
+
+    uint32_t nw = (static_cast<uint32_t>(N) + 31) / 32;
+    std::vector<uint32_t> host_bitset(nw, 0);
+    for (uint32_t id : ids) host_bitset[id / 32] |= (1u << (id % 32));
+
+    printf("  roaring portable bytes: %.2f KB   bitset host bytes: %.2f KB\n",
+           roaring_host_bytes / 1024.0, host_bitset.size() * 4 / 1024.0);
+
+    // Container/schedule stats are sampled from the first warmup B-call below
+    // (built into the timed lambda's first invocation pre-search). This avoids
+    // a separate census step that would pre-allocate the persistent scratch
+    // and leave too little headroom for the cuVS reference search at high sel.
+    int n_direct = 0, n_masked = 0, n_gather = 0;
+    uint64_t c_direct = 0, c_masked = 0, c_gather = 0;
+    bool fallback = false;
+    uint32_t n_run = 0, n_arr = 0, n_bmp = 0;
+    bool census_done = false;
+
+    printf("  (schedule census deferred to first warmup B-call)\n");
+
+    // Headroom guard: cuVS brute_force materialises an NQ x N distance tile
+    // (~Q*N*sizeof(float)) plus row norms; the cu_roaring schedule may emit
+    // a gather buffer up to ~card*D*sizeof(float). At sel >= 0.5 the schedule
+    // generally dispatches each container to the masked path (no gather), so
+    // we cap the gather estimate by the smaller of {kept, complement} which
+    // is the most a complement-aware path would ever need.
+    size_t free_b = free_vram();
+    size_t need_cuvs   = static_cast<size_t>(NQ) * N * sizeof(float)
+                       + 256ull * 1024 * 1024;   // norms + small temps
+    size_t gather_cap_cols = std::min<size_t>(card, N - card);
+    size_t need_gather = gather_cap_cols * D * sizeof(T);
+    if (free_b < std::max(need_cuvs, need_gather) + 512ull * 1024 * 1024) {
+      printf("  SKIP: need ~max(cuvs %.2f GB, gather %.2f GB) + 0.5 GB headroom; free %.2f GB\n\n",
+             need_cuvs / 1e9, need_gather / 1e9, free_b / 1e9);
+      roaring_bitmap_free(cpu_bm);
+      continue;
+    }
+
+    // ---- Reference top-k (one cuVS call, outside timed region) -----------
+    {
+      raft::core::bitset<uint32_t, int64_t> bits(res, static_cast<int64_t>(N), false);
+      raft::update_device(bits.data(), host_bitset.data(), nw, stream);
+      raft::resource::sync_stream(res);
+      auto bf = cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>(bits.view());
+      cuvs::neighbors::brute_force::search_params sp;
+      cuvs::neighbors::brute_force::search(res, sp, index,
+        raft::make_const_mdspan(queries.view()),
+        neighbors.view(), dists.view(), bf);
+      raft::resource::sync_stream(res);
+    }
+    std::vector<int64_t> ref_ids(static_cast<size_t>(NQ) * K);
+    cudaMemcpy(ref_ids.data(), neighbors.data_handle(),
+               ref_ids.size() * sizeof(int64_t), cudaMemcpyDeviceToHost);
+
+    // ---- Timed cuVS-bitset path (A) --------------------------------------
+    // raft::core::bitset owns its device buffer; constructing it inside the
+    // timed region exercises the cudaMalloc + zero-init too. update_device
+    // does the H2D copy of the user's packed words.
+    auto run_a = [&] {
+      raft::core::bitset<uint32_t, int64_t> bits(res, static_cast<int64_t>(N), false);
+      raft::update_device(bits.data(), host_bitset.data(), nw, stream);
+      auto bf = cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>(bits.view());
+      cuvs::neighbors::brute_force::search_params sp;
+      cuvs::neighbors::brute_force::search(res, sp, index,
+        raft::make_const_mdspan(queries.view()),
+        neighbors.view(), dists.view(), bf);
+      cudaMemcpyAsync(h_nbr, neighbors.data_handle(),
+                      static_cast<size_t>(NQ) * K * sizeof(int64_t),
+                      cudaMemcpyDeviceToHost, stream);
+      // bits drops out of scope at the end of the lambda → device free.
+    };
+
+    // ---- Timed cu_roaring path (B) ---------------------------------------
+    // gpu_roaring_free_async: upload_impl allocates the device buffer through
+    // cudaMallocAsync(stream); the matching free MUST be cudaFreeAsync(stream)
+    // or the stream-ordered pool sees a non-pool free and corrupts state.
+    // Mixing produces silent UB that manifests under load as illegal-address
+    // errors on the next pool allocation.
+    auto run_b = [&] {
+      cu_roaring::GpuRoaring gpu = cu_roaring::upload(cpu_bm,
+                                                     static_cast<uint32_t>(N),
+                                                     stream);
+      auto sched = cu_roaring::build_schedule(gpu, N, dataset.data_handle(),
+                                              D, stream);
+      // One-shot census: capture container/schedule shape on the first call,
+      // before search-side allocations would distort future reporting.
+      if (!census_done) {
+        n_run = gpu.n_run_containers;
+        n_arr = gpu.n_array_containers;
+        n_bmp = gpu.n_bitmap_containers;
+        for (const auto& t : sched.tasks) {
+          if (t.kind == cu_roaring::GemmTask::kGather) { ++n_gather; c_gather += t.n_cols; }
+          else if (t.mask)                              { ++n_masked; c_masked += t.n_cols; }
+          else                                          { ++n_direct; c_direct += t.n_cols; }
+        }
+        fallback = sched.used_fallback;
+        census_done = true;
+      }
+      if constexpr (std::is_same_v<T, float>) {
+        cu_roaring::roaring_filtered_search(cublas, queries.data_handle(), NQ,
+          dataset.data_handle(), N, D, sched, K, d_rid, d_rsc, stream);
+      } else {
+        cu_roaring::roaring_filtered_search_fp16(cublas, queries.data_handle(), NQ,
+          dataset.data_handle(), N, D, sched, K, d_rid, d_rsc, stream);
+      }
+      cudaMemcpyAsync(h_rid, d_rid,
+                      static_cast<size_t>(NQ) * K * sizeof(uint32_t),
+                      cudaMemcpyDeviceToHost, stream);
+      cu_roaring::free_schedule(sched);
+      cu_roaring::gpu_roaring_free_async(gpu, stream);
+    };
+
+    for (int i = 0; i < WARMUP; ++i) { run_a(); run_b(); }
+    cudaStreamSynchronize(stream);
+    printf("  containers: run=%u arr=%u bmp=%u   schedule: D=%d(%.1fM) M=%d(%.1fM) G=%d(%.1fM)%s\n",
+           n_run, n_arr, n_bmp,
+           n_direct, c_direct / 1e6, n_masked, c_masked / 1e6,
+           n_gather, c_gather / 1e6, fallback ? "  FALLBACK" : "");
+
+    auto time = [&](auto&& f) {
+      cudaEventRecord(e0, stream); f();
+      cudaEventRecord(e1, stream); cudaEventSynchronize(e1);
+      float ms; cudaEventElapsedTime(&ms, e0, e1);
+      return static_cast<double>(ms);
+    };
+
+    std::vector<double> ta, tb;
+    ta.reserve(ITERS); tb.reserve(ITERS);
+    for (int i = 0; i < ITERS; ++i) {
+      if (i & 1) { tb.push_back(time(run_b)); ta.push_back(time(run_a)); }
+      else       { ta.push_back(time(run_a)); tb.push_back(time(run_b)); }
+    }
+    auto sa = stats_of(ta);
+    auto sb = stats_of(tb);
+
+    // ---- Fairness: time the bitset cardinality count() in isolation -------
+    // cuVS's brute_force calls `filter.view().count(res)` on every search to
+    // pick its dense vs sparse code path. That's a raft::popc kernel + a D2H
+    // + a stream sync. cu_roaring already knows the cardinality from CRoaring
+    // host-side and never pays this cost. raft's bitset has no set_count API
+    // we can use to hand it our cached value, so for an apples-to-apples
+    // comparison we measure count() on its own and report
+    // `cuvs_ms_no_count = cuvs_ms - count_ms` alongside the raw cuVS number.
+    double count_ms_med = 0.0;
+    {
+      raft::core::bitset<uint32_t, int64_t> bits(res, static_cast<int64_t>(N), false);
+      raft::update_device(bits.data(), host_bitset.data(), nw, stream);
+      raft::resource::sync_stream(res);
+      auto v = bits.view();
+      auto count_once = [&] { (void)v.count(res); };
+      for (int i = 0; i < 3; ++i) count_once();
+      cudaStreamSynchronize(stream);
+      std::vector<double> tc; tc.reserve(8);
+      for (int i = 0; i < 8; ++i) tc.push_back(time(count_once));
+      count_ms_med = stats_of(tc).median;
+    }
+    double cuvs_ms_no_count = std::max(0.0, sa.median - count_ms_med);
+
+    // ---- Recall (top-k id agreement vs reference) ------------------------
+    run_b();
+    cudaStreamSynchronize(stream);
+    std::vector<uint32_t> got(static_cast<size_t>(NQ) * K);
+    cudaMemcpy(got.data(), d_rid, got.size() * sizeof(uint32_t),
+               cudaMemcpyDeviceToHost);
+    double recall = recall_at_k(got, ref_ids, NQ, K);
+
+    double speedup_raw  = sa.median        / sb.median;
+    double speedup_fair = cuvs_ms_no_count / sb.median;
+    double qps_a   = NQ / (sa.median * 1e-3);
+    double qps_b   = NQ / (sb.median * 1e-3);
+    printf("  cuvs   : %.3f ms  (p10=%.3f p90=%.3f std=%.3f)  %.0f QPS\n",
+           sa.median, sa.p10, sa.p90, sa.std_dev, qps_a);
+    printf("  count  : %.3f ms  (raft popc + D2H, included in cuvs above)\n",
+           count_ms_med);
+    printf("  cuvs-count: %.3f ms  (cuvs minus count; fair-comparison)\n",
+           cuvs_ms_no_count);
+    printf("  roaring: %.3f ms  (p10=%.3f p90=%.3f std=%.3f)  %.0f QPS\n",
+           sb.median, sb.p10, sb.p90, sb.std_dev, qps_b);
+    printf("  speedup raw=%.2fx   fair=%.2fx     recall@%d: %.4f%s\n\n",
+           speedup_raw, speedup_fair, K, recall,
+           fallback ? "  (schedule fallback)" : "");
+    fflush(stdout);
+
+    fprintf(jf,
+      "    %s{\"sel\":%.6f,\"card\":%llu,\"sparsity\":%.6f,"
+      "\"roaring_host_bytes\":%zu,\"bitset_host_bytes\":%zu,"
+      "\"containers\":{\"run\":%u,\"array\":%u,\"bitmap\":%u},"
+      "\"schedule\":{\"direct_tasks\":%d,\"direct_cols\":%llu,"
+      "\"masked_tasks\":%d,\"masked_cols\":%llu,"
+      "\"gather_tasks\":%d,\"gather_cols\":%llu,\"fallback\":%d},"
+      "\"cuvs_ms\":%.4f,\"cuvs_p10\":%.4f,\"cuvs_p90\":%.4f,\"cuvs_std\":%.4f,"
+      "\"cuvs_qps\":%.0f,"
+      "\"count_ms\":%.4f,\"cuvs_ms_no_count\":%.4f,"
+      "\"roaring_ms\":%.4f,\"roaring_p10\":%.4f,\"roaring_p90\":%.4f,"
+      "\"roaring_std\":%.4f,\"roaring_qps\":%.0f,"
+      "\"speedup\":%.4f,\"speedup_fair\":%.4f,\"recall\":%.4f}",
+      first_result ? "" : ",\n",
+      sel, (unsigned long long)card, sparsity,
+      roaring_host_bytes, host_bitset.size() * sizeof(uint32_t),
+      n_run, n_arr, n_bmp,
+      n_direct, (unsigned long long)c_direct,
+      n_masked, (unsigned long long)c_masked,
+      n_gather, (unsigned long long)c_gather, fallback ? 1 : 0,
+      sa.median, sa.p10, sa.p90, sa.std_dev, qps_a,
+      count_ms_med, cuvs_ms_no_count,
+      sb.median, sb.p10, sb.p90, sb.std_dev, qps_b,
+      speedup_raw, speedup_fair, recall);
+    first_result = false;
+
+    roaring_bitmap_free(cpu_bm);
+  }
+
+  fprintf(jf, "\n  ]\n}\n");
+  fclose(jf);
+
+  cudaFree(d_rid); cudaFree(d_rsc);
+  cudaFreeHost(h_rid); cudaFreeHost(h_nbr);
+  cudaEventDestroy(e0); cudaEventDestroy(e1);
+  curandDestroyGenerator(rng);
+  cublasDestroy(cublas);
+  printf("wrote %s\n", out_path);
+  return 0;
+}
+
+int main()
+{
+  int N  = std::getenv("E2E_N")      ? std::atoi(std::getenv("E2E_N"))      : 10'000'000;
+  int D  = std::getenv("E2E_D")      ? std::atoi(std::getenv("E2E_D"))      : 512;
+  int NQ = std::getenv("E2E_Q")      ? std::atoi(std::getenv("E2E_Q"))      : 64;
+  int WARMUP = std::getenv("E2E_WARMUP") ? std::atoi(std::getenv("E2E_WARMUP")) : 5;
+  int ITERS  = std::getenv("E2E_ITERS")  ? std::atoi(std::getenv("E2E_ITERS"))  : 15;
+
+  std::vector<double> sel_grid = {0.0001, 0.001, 0.01, 0.03,
+                                  0.05, 0.10, 0.15, 0.20,
+                                  0.30, 0.50, 0.90};
+  if (const char* sels = std::getenv("E2E_SELS")) {
+    sel_grid.clear();
+    std::string s(sels);
+    size_t i = 0;
+    while (i < s.size()) {
+      size_t j = s.find(',', i);
+      if (j == std::string::npos) j = s.size();
+      if (j > i) sel_grid.push_back(std::stod(s.substr(i, j - i)));
+      i = j + 1;
+    }
+  }
+
+  // Dtype dispatch. Default fp32 to match prior data; set E2E_DTYPE=fp16 to
+  // exercise the cublasGemmEx + __half gather path. fp16 halves dataset bytes
+  // so D=1024 at N=10M is reachable (20 GB instead of 40 GB).
+  const char* dtype = std::getenv("E2E_DTYPE");
+  if (dtype && (std::string(dtype) == "fp16" || std::string(dtype) == "half")) {
+    return run_sweep<__half>(N, D, NQ, WARMUP, ITERS, sel_grid);
+  }
+  return run_sweep<float>(N, D, NQ, WARMUP, ITERS, sel_grid);
+}

@@ -1,0 +1,48 @@
+GPU: NVIDIA GeForce RTX 5090   N=10000000  D=512  Q=64  K=10   free=30.2 GB
+warmup=5  iters=15  selectivities=4
+
+Allocating dataset (20.5 GB)...
+Building cuVS brute_force index...
+  free after dataset+index: 11.9 GB
+
+=== sel=0.0100%  card=1000 ===
+  roaring portable bytes: 3.16 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=0 arr=153 bmp=0   schedule: D=0(0.0M) M=0(0.0M) G=1(0.0M)
+  cuvs   : 1.625 ms  (p10=1.387 p90=1.847 std=0.205)  39373 QPS
+  count  : 0.104 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 1.521 ms  (cuvs minus count; fair-comparison)
+  roaring: 0.986 ms  (p10=0.843 p90=1.145 std=0.136)  64910 QPS
+  speedup raw=1.65x   fair=1.54x     recall@10: 1.0000
+
+=== sel=1.0000%  card=100000 ===
+  roaring portable bytes: 196.52 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=0 arr=153 bmp=0   schedule: D=0(0.0M) M=0(0.0M) G=1(0.1M)
+  cuvs   : 12.554 ms  (p10=12.348 p90=12.859 std=0.200)  5098 QPS
+  count  : 0.209 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 12.345 ms  (cuvs minus count; fair-comparison)
+  roaring: 2.037 ms  (p10=1.964 p90=2.203 std=0.130)  31419 QPS
+  speedup raw=6.16x   fair=6.06x     recall@10: 1.0000
+
+=== sel=2.0000%  card=200000 ===
+  roaring portable bytes: 391.83 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=0 arr=153 bmp=0   schedule: D=0(0.0M) M=0(0.0M) G=1(0.2M)
+  cuvs   : 23.045 ms  (p10=22.690 p90=23.458 std=0.347)  2777 QPS
+  count  : 0.153 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 22.893 ms  (cuvs minus count; fair-comparison)
+  roaring: 2.863 ms  (p10=2.801 p90=2.994 std=0.089)  22357 QPS
+  speedup raw=8.05x   fair=8.00x     recall@10: 1.0000
+
+=== sel=3.0000%  card=300000 ===
+  roaring portable bytes: 587.14 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=0 arr=153 bmp=0   schedule: D=0(0.0M) M=0(0.0M) G=1(0.3M)
+  cuvs   : 34.095 ms  (p10=33.521 p90=34.548 std=0.517)  1877 QPS
+  count  : 0.105 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 33.990 ms  (cuvs minus count; fair-comparison)
+  roaring: 3.539 ms  (p10=3.414 p90=3.683 std=0.179)  18086 QPS
+  speedup raw=9.64x   fair=9.61x     recall@10: 1.0000
+
+wrote bench_e2e_sweep.json

@@ -1,0 +1,13 @@
+{
+  "gpu":"NVIDIA GeForce RTX 5090","n":10000000,"dim":512,"nq":64,"k":10,
+  "warmup":5,"iters":15,
+  "a":"cuvs brute_force + raft bitset_filter (H2D bitset + search + D2H)",
+  "b":"cu_roaring schedule-driven (H2D upload + schedule + search + D2H)",
+  "timed_region":"alloc+H2D+setup+search+D2H+free per call",
+  "results":[
+    {"sel":0.000100,"card":1000,"sparsity":0.999900,"roaring_host_bytes":3232,"bitset_host_bytes":1250000,"containers":{"run":0,"array":153,"bitmap":0},"schedule":{"direct_tasks":0,"direct_cols":0,"masked_tasks":0,"masked_cols":0,"gather_tasks":1,"gather_cols":1000,"fallback":0},"cuvs_ms":1.6255,"cuvs_p10":1.3874,"cuvs_p90":1.8474,"cuvs_std":0.2054,"cuvs_qps":39373,"count_ms":0.1045,"cuvs_ms_no_count":1.5210,"roaring_ms":0.9860,"roaring_p10":0.8428,"roaring_p90":1.1450,"roaring_std":0.1357,"roaring_qps":64910,"speedup":1.6486,"speedup_fair":1.5426,"recall":1.0000}    ,
+{"sel":0.010000,"card":100000,"sparsity":0.990000,"roaring_host_bytes":201232,"bitset_host_bytes":1250000,"containers":{"run":0,"array":153,"bitmap":0},"schedule":{"direct_tasks":0,"direct_cols":0,"masked_tasks":0,"masked_cols":0,"gather_tasks":1,"gather_cols":100000,"fallback":0},"cuvs_ms":12.5540,"cuvs_p10":12.3476,"cuvs_p90":12.8586,"cuvs_std":0.1997,"cuvs_qps":5098,"count_ms":0.2093,"cuvs_ms_no_count":12.3447,"roaring_ms":2.0370,"roaring_p10":1.9645,"roaring_p90":2.2028,"roaring_std":0.1297,"roaring_qps":31419,"speedup":6.1631,"speedup_fair":6.0604,"recall":1.0000}    ,
+{"sel":0.020000,"card":200000,"sparsity":0.980000,"roaring_host_bytes":401232,"bitset_host_bytes":1250000,"containers":{"run":0,"array":153,"bitmap":0},"schedule":{"direct_tasks":0,"direct_cols":0,"masked_tasks":0,"masked_cols":0,"gather_tasks":1,"gather_cols":200000,"fallback":0},"cuvs_ms":23.0454,"cuvs_p10":22.6899,"cuvs_p90":23.4582,"cuvs_std":0.3469,"cuvs_qps":2777,"count_ms":0.1526,"cuvs_ms_no_count":22.8927,"roaring_ms":2.8627,"roaring_p10":2.8008,"roaring_p90":2.9937,"roaring_std":0.0892,"roaring_qps":22357,"speedup":8.0503,"speedup_fair":7.9969,"recall":1.0000}    ,
+{"sel":0.030000,"card":300000,"sparsity":0.970000,"roaring_host_bytes":601232,"bitset_host_bytes":1250000,"containers":{"run":0,"array":153,"bitmap":0},"schedule":{"direct_tasks":0,"direct_cols":0,"masked_tasks":0,"masked_cols":0,"gather_tasks":1,"gather_cols":300000,"fallback":0},"cuvs_ms":34.0951,"cuvs_p10":33.5206,"cuvs_p90":34.5477,"cuvs_std":0.5171,"cuvs_qps":1877,"count_ms":0.1051,"cuvs_ms_no_count":33.9900,"roaring_ms":3.5386,"roaring_p10":3.4136,"roaring_p90":3.6833,"roaring_std":0.1786,"roaring_qps":18086,"speedup":9.6352,"speedup_fair":9.6055,"recall":1.0000}
+  ]
+}
