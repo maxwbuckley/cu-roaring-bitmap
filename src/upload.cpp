@@ -316,6 +316,13 @@ GpuRoaring upload(const roaring_bitmap_t* cpu_bitmap,
 }
 
 void gpu_roaring_free(GpuRoaring& bitmap) {
+    if (bitmap._scratched) {
+        // Pointers belong to a process-lifetime scratch (e.g. the fast-path
+        // upload_from_device_bitset). Just zero the handle; the buffers will
+        // be reused by the next call.
+        bitmap = GpuRoaring{};
+        return;
+    }
     if (bitmap._alloc_base) {
         // Packed allocation: all device pointers are offsets into one block
         cudaFree(bitmap._alloc_base);
@@ -334,6 +341,10 @@ void gpu_roaring_free(GpuRoaring& bitmap) {
 }
 
 void gpu_roaring_free_async(GpuRoaring& bitmap, cudaStream_t stream) {
+    if (bitmap._scratched) {
+        bitmap = GpuRoaring{};
+        return;
+    }
     if (bitmap._alloc_base) {
         CUDA_CHECK(cudaFreeAsync(bitmap._alloc_base, stream));
     } else {

@@ -51,6 +51,11 @@ struct GpuRoaring {
     // all device pointers above are offsets into this block, and
     // gpu_roaring_free() frees only this pointer.
     void*     _alloc_base        = nullptr;
+
+    // When true, all device pointers above point into process-lifetime
+    // scratch owned by the constructor (e.g. upload_from_device_bitset's
+    // fast path). gpu_roaring_free() must NOT free anything.
+    bool      _scratched         = false;
 };
 
 struct GpuRoaringMeta {

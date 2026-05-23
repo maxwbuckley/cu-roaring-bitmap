@@ -374,19 +374,19 @@ input. Drop-in change: 5 lines in the bench.
 
 | path | unsorted | sorted | recall@10 |
 |---|---|---|---|
-| **cuVS bitset** | 0.76 ms (1.3k QPS) | 0.82 ms | — |
-| roaring search only | 0.049 ms (20k QPS) | 0.049 ms (20k QPS) | 1.000 |
-| roaring build, **host AND + upload(bm,N)** | 2.60 ms | 2.95 ms | — |
-| roaring build, **`upload_from_device_bitset`** (pre-opt) | 1.17 ms | 1.04 ms | — |
-| roaring build, **`upload_from_device_bitset` + opts 1+2** | **0.55 ms** | **0.53 ms** | — |
-| end-to-end **host path** | 2.65 ms (0.29×) | 3.05 ms (0.27×) | 1.000 |
-| end-to-end **GPU-bitset + opts 1+2** | **0.61 ms (1.24× cuVS)** | **0.59 ms (1.39× cuVS)** | 1.000 |
+| **cuVS bitset** | 0.77 ms (1.3k QPS) | 0.80 ms | — |
+| roaring search only | 0.049 ms (20k QPS) | 0.048 ms (21k QPS) | 1.000 |
+| roaring build, **host AND + upload(bm,N)** | 2.70 ms | 3.00 ms | — |
+| roaring build, **`upload_from_device_bitset`** (orig) | 1.17 ms | 1.04 ms | — |
+| roaring build, **`upload_from_device_bitset` + opts 1+2 only** | 0.55 ms | 0.53 ms | — |
+| roaring build, **`upload_from_device_bitset` + opts 1–7** | **0.48 ms** | **0.45 ms** | — |
+| end-to-end **host path** | 2.76 ms (0.28×) | 3.11 ms (0.26×) | 1.000 |
+| end-to-end **GPU-bitset + opts 1–7** | **0.53 ms (1.45× cuVS)** | **0.52 ms (1.54× cuVS)** | 1.000 |
 
-The GPU-side construction cuts per-query build to **0.55 ms** (5–6× cheaper
-than the original host path); with optimisations #1 and #2 below applied
-(implemented and committed), schedule-driven now **beats cuVS by 1.24–1.39×
-end-to-end** on real YFCC queries, with `recall@10 = 1.000` and the 15×
-search-only speedup intact. Optimisations applied:
+Seven cumulative optimisations bring per-query build to **0.48 ms**
+(unsorted) / **0.45 ms** (sorted) — schedule-driven now **beats cuVS by
+1.45× / 1.54× end-to-end** on real YFCC queries, with `recall@10 = 1.000`
+and the 15× search-only speedup intact. Optimisations applied:
 
 1. **Skip `enumerate_runs` when the filter has no RUN containers.** The
    `upload_from_device_bitset` path produces only ARRAY/BITMAP containers
@@ -399,6 +399,36 @@ search-only speedup intact. Optimisations applied:
    `SearchSchedule` carries a `scratched` flag so `free_schedule` skips
    the `cudaFree`. Saves ~5 `cudaMalloc`/`cudaFree` round-trips per call
    and lets the H2D copies for descriptors go async.
+3. **Eliminate the redundant outer popcount in `upload_from_device_bitset`.**
+   The original code popcounted the full bitset twice (once for the
+   complement decision, once inside the build). The complement check is
+   now off by default (callers opt in with a new `check_complement=false`
+   parameter); for the common per-query-filter case the outer pass is
+   gone entirely.
+4. **Persistent scratch for `upload_from_device_bitset`.** Same pattern
+   as #2 applied to the build path: popcounts, chunk-map, bitmap pool,
+   metadata pool, key index, CUB temp — all process-lifetime, grow-only.
+   `GpuRoaring` gets a matching `_scratched` flag so `gpu_roaring_free`
+   is a no-op for these.
+5. **Coalesced metadata allocation.** `keys` (2n) / `types` (1n) /
+   `offsets` (4n) / `cardinalities` (2n) become four offsets into one
+   9n-byte scratch buffer rather than four separate allocations.
+6. **Device-side chunk-map via CUB `InclusiveSum`.** The original loop
+   was: D2H all popcounts → host loop building `chunk_map[i] = container
+   index for chunk i` → H2D back. Now: a one-line markers kernel +
+   `cub::DeviceScan::InclusiveSum` produces the chunk map device-side,
+   and one tiny finalize kernel writes `n_containers` and `total_card`
+   into a 3×4-byte scratch buffer. Per call: one D2H of 12 bytes, one
+   sync, no host roundtrip for the chunk map.
+7. **Device-side `key_index` build.** Replaced the host-side fill +
+   H2D + sync with a single kernel that reads the (now device-resident)
+   chunk_map and writes `key_index` in-place.
+
+(*A would-be #8 — kernel fusion of `chunk_popcount` + `compact_chunks` into
+one cooperative-group kernel — was attempted in design but skipped: the
+saving (one launch) is dominated by the launches now on the per-task
+loop, and the cooperative-grid sync makes the kernel meaningfully more
+complex for ~50 µs of payoff.*)
 
 **Note on `run_optimize`.** The bitset-derived path **does not currently
 run-optimise**. `upload_from_device_bitset` always emits ARRAY (card ≤

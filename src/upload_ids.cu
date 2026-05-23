@@ -700,103 +700,279 @@ __global__ void mask_tail_kernel(uint32_t* data, uint32_t word_idx, uint32_t mas
     data[word_idx] &= mask;
 }
 
-// Core implementation: build GpuRoaring from a device-resident bitset.
-static GpuRoaring build_from_device_bitset(const uint32_t* d_bitset,
-                                            uint32_t n_words,
-                                            uint32_t universe_size,
-                                            bool should_negate,
-                                            uint64_t original_cardinality,
-                                            cudaStream_t stream)
-{
-    uint32_t n_chunks = (n_words + 2047) / 2048;
+// ============================================================================
+// Process-lifetime scratch for upload_from_device_bitset.
+//
+// Builds for the per-query-filter regime (e.g. YFCC) hit this routine once
+// per query. With persistent scratch all device buffers live across calls;
+// per-call work collapses to a few kernels + at most one D2H scalar sync.
+// The returned GpuRoaring carries _scratched=true so gpu_roaring_free is a
+// no-op for it. The result is invalidated by the NEXT call on the same
+// thread (the buffers get reused).
+// ============================================================================
+namespace {
+struct UploadScratch {
+    // d_popcounts[i]      : popcount of chunk i (uint32_t).
+    // d_chunk_map_incl[i] : inclusive scan of (popcount[i] > 0 ? 1 : 0).
+    //                      For a non-empty chunk i, its container index is
+    //                      d_chunk_map_incl[i] - 1.
+    // d_finals[2]         : [n_containers, total_card_low].
+    // d_meta              : combined keys/types/offsets/cardinalities pool.
+    // d_bitmap_pool       : compacted bitmap container pool.
+    // d_key_index         : direct-map key→container index.
+    // d_inverted          : storage for the inverted bitset (complement path).
+    // d_cub_temp          : CUB scratch.
+    uint32_t* popcounts        = nullptr;  size_t popcounts_cap        = 0;
+    uint32_t* markers          = nullptr;  size_t markers_cap          = 0;
+    uint32_t* chunk_map_incl   = nullptr;  size_t chunk_map_incl_cap   = 0;
+    uint32_t* d_finals         = nullptr;  size_t d_finals_cap         = 0;
+    uint8_t*  meta             = nullptr;  size_t meta_cap             = 0;  // bytes
+    uint64_t* bitmap_pool      = nullptr;  size_t bitmap_pool_cap_u64  = 0;
+    uint16_t* key_index        = nullptr;  size_t key_index_cap        = 0;
+    uint32_t* d_inverted       = nullptr;  size_t d_inverted_cap       = 0;
+    void*     cub_temp         = nullptr;  size_t cub_temp_cap         = 0;
 
-    // 1. Popcount each chunk
-    uint32_t* d_popcounts = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&d_popcounts, n_chunks * sizeof(uint32_t), stream));
-    chunk_popcount_kernel<<<n_chunks, 256, 0, stream>>>(
-        d_bitset, d_popcounts, n_chunks, n_words);
-    CUDA_CHECK(cudaGetLastError());
-
-    // Download popcounts (small: n_chunks * 4 bytes, typically < 1 KB)
-    std::vector<uint32_t> h_popcounts(n_chunks);
-    CUDA_CHECK(cudaMemcpyAsync(h_popcounts.data(), d_popcounts,
-                               n_chunks * sizeof(uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // 2. Identify non-empty chunks and build compaction map
-    std::vector<uint32_t> h_chunk_map(n_chunks, 0xFFFFFFFF);
-    uint32_t n_containers = 0;
-    uint64_t total_card = 0;
-    for (uint32_t i = 0; i < n_chunks; ++i) {
-        total_card += h_popcounts[i];
-        if (h_popcounts[i] > 0) {
-            h_chunk_map[i] = n_containers++;
-        }
+    template <typename T>
+    void grow(T*& ptr, size_t& cap, size_t need_elems)
+    {
+        size_t bytes = need_elems * sizeof(T);
+        if (need_elems <= cap) return;
+        if (ptr) { CUDA_CHECK(cudaFree(ptr)); }
+        size_t new_elems = cap > 0 ? cap : 1;
+        while (new_elems < need_elems) new_elems *= 2;
+        void* p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, new_elems * sizeof(T)));
+        ptr = static_cast<T*>(p);
+        cap = new_elems;
+        (void)bytes;
     }
+    void grow_bytes(void*& ptr, size_t& cap, size_t need_bytes)
+    {
+        if (need_bytes <= cap) return;
+        if (ptr) { CUDA_CHECK(cudaFree(ptr)); }
+        size_t new_cap = cap > 0 ? cap : 1;
+        while (new_cap < need_bytes) new_cap *= 2;
+        CUDA_CHECK(cudaMalloc(&ptr, new_cap));
+        cap = new_cap;
+    }
+};
+inline UploadScratch& upload_scratch_state()
+{
+    static UploadScratch s;
+    return s;
+}
 
+// Per-chunk non-empty marker: 1 if popcount[i] > 0, else 0. Written into a
+// dedicated buffer so CUB's plain InclusiveSum works without a transform
+// iterator (which has moved across CUDA versions and isn't worth a header
+// dance for a 153-element transform).
+__global__ void markers_from_popcount_kernel(const uint32_t* popcounts,
+                                              uint32_t* markers,
+                                              uint32_t n_chunks)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_chunks) return;
+    markers[i] = popcounts[i] > 0u ? 1u : 0u;
+}
+
+// Tiny finalize kernel: writes [n_containers, total_card_low_32_bits] into
+// d_finals so the host can D2H 8 bytes in one transfer instead of D2H'ing
+// the whole popcount array.
+__global__ void bitset_finalize_kernel(const uint32_t* popcounts,
+                                       const uint32_t* chunk_map_incl,
+                                       uint32_t n_chunks,
+                                       uint32_t* d_finals)
+{
+    // One block, 256 threads: reduce popcounts to total_card.
+    uint64_t local = 0;
+    for (uint32_t i = threadIdx.x; i < n_chunks; i += blockDim.x) {
+        local += popcounts[i];
+    }
+    // Warp reduce.
+    for (int off = 16; off > 0; off >>= 1) {
+        local += __shfl_down_sync(0xFFFFFFFFu, local, off);
+    }
+    __shared__ uint64_t warp_sums[8];
+    uint32_t warp = threadIdx.x >> 5;
+    uint32_t lane = threadIdx.x & 31u;
+    if (lane == 0) warp_sums[warp] = local;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint64_t total = 0;
+        uint32_t nwarp = (blockDim.x + 31u) / 32u;
+        for (uint32_t w = 0; w < nwarp; ++w) total += warp_sums[w];
+        // d_finals[0] = n_containers (= last inclusive-sum entry).
+        d_finals[0] = n_chunks > 0 ? chunk_map_incl[n_chunks - 1] : 0u;
+        // d_finals[1..2] = total_card (uint64 split into two uint32s).
+        d_finals[1] = static_cast<uint32_t>(total & 0xFFFFFFFFu);
+        d_finals[2] = static_cast<uint32_t>(total >> 32);
+    }
+}
+
+// Build the direct-map key_index on the device. For each non-empty chunk,
+// write its container index at key_index[chunk]; otherwise leave 0xFFFF.
+__global__ void build_key_index_kernel(const uint32_t* popcounts,
+                                       const uint32_t* chunk_map_incl,
+                                       uint16_t* key_index,
+                                       uint32_t n_chunks)
+{
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_chunks) return;
+    key_index[i] = (popcounts[i] > 0u)
+                       ? static_cast<uint16_t>(chunk_map_incl[i] - 1u)
+                       : static_cast<uint16_t>(0xFFFFu);
+}
+
+// Variant of compact_chunks_kernel that reads the *inclusive*-scan chunk_map
+// (container index = chunk_map_incl[chunk] - 1 for non-empty chunks).
+__global__ void compact_chunks_incl_kernel(const uint32_t* bitset,
+                                           const uint32_t* chunk_map_incl,
+                                           const uint32_t* chunk_popcounts,
+                                           uint64_t* bitmap_pool,
+                                           uint16_t* out_keys,
+                                           ContainerType* out_types,
+                                           uint32_t* out_offsets,
+                                           uint16_t* out_cardinalities,
+                                           uint32_t n_chunks,
+                                           uint32_t n_words_total)
+{
+    uint32_t chunk = blockIdx.x;
+    if (chunk >= n_chunks) return;
+    uint32_t pc = chunk_popcounts[chunk];
+    if (pc == 0) return;
+
+    uint32_t out_idx  = chunk_map_incl[chunk] - 1u;
+    uint32_t base_word = chunk * 2048u;
+    uint64_t* dst = bitmap_pool + static_cast<size_t>(out_idx) * 1024;
+    for (uint32_t i = threadIdx.x; i < 1024u; i += blockDim.x) {
+        uint32_t w0_idx = base_word + i * 2u;
+        uint32_t w1_idx = base_word + i * 2u + 1u;
+        uint32_t w0 = (w0_idx < n_words_total) ? bitset[w0_idx] : 0u;
+        uint32_t w1 = (w1_idx < n_words_total) ? bitset[w1_idx] : 0u;
+        dst[i] = static_cast<uint64_t>(w0) | (static_cast<uint64_t>(w1) << 32);
+    }
+    if (threadIdx.x == 0) {
+        out_keys[out_idx]          = static_cast<uint16_t>(chunk);
+        out_types[out_idx]         = ContainerType::BITMAP;
+        out_offsets[out_idx]       =
+            static_cast<uint32_t>(static_cast<size_t>(out_idx) * 1024 * sizeof(uint64_t));
+        out_cardinalities[out_idx] = static_cast<uint16_t>(pc > 65535u ? 0u : pc);
+    }
+}
+
+}  // namespace
+
+// ----------------------------------------------------------------------------
+// Core fast-path build: no complement check. One popcount, CUB scan in place,
+// one D2H scalar transfer to learn n_containers + total_card, then compact +
+// key_index built device-side. All output buffers come from process-lifetime
+// scratch and the returned GpuRoaring is marked _scratched.
+// ----------------------------------------------------------------------------
+static GpuRoaring build_from_device_bitset_fast(const uint32_t* d_bitset,
+                                                 uint32_t n_words,
+                                                 uint32_t universe_size,
+                                                 bool should_negate,
+                                                 uint64_t original_cardinality,
+                                                 cudaStream_t stream)
+{
     GpuRoaring result{};
     result.universe_size = universe_size;
-    result.total_cardinality = should_negate ? original_cardinality : total_card;
-    result.negated = should_negate;
-    result.n_containers = n_containers;
+    result.negated       = should_negate;
+    result._scratched    = true;
+
+    if (n_words == 0) return result;
+
+    uint32_t n_chunks = (n_words + 2047u) / 2048u;
+    UploadScratch& sc = upload_scratch_state();
+
+    sc.grow(sc.popcounts,      sc.popcounts_cap,      n_chunks);
+    sc.grow(sc.chunk_map_incl, sc.chunk_map_incl_cap, n_chunks);
+    sc.grow(sc.d_finals,       sc.d_finals_cap,       4);  // [n_cont, lo, hi, _]
+
+    // 1) Per-chunk popcount.
+    chunk_popcount_kernel<<<n_chunks, 256, 0, stream>>>(
+        d_bitset, sc.popcounts, n_chunks, n_words);
+    CUDA_CHECK(cudaGetLastError());
+
+    // 2) Markers + inclusive scan into chunk_map_incl.
+    sc.grow(sc.markers, sc.markers_cap, n_chunks);
+    uint32_t grid_mark = (n_chunks + 255u) / 256u;
+    markers_from_popcount_kernel<<<grid_mark, 256, 0, stream>>>(
+        sc.popcounts, sc.markers, n_chunks);
+    CUDA_CHECK(cudaGetLastError());
+    size_t cub_bytes = 0;
+    cub::DeviceScan::InclusiveSum(nullptr, cub_bytes, sc.markers,
+                                  sc.chunk_map_incl,
+                                  static_cast<int>(n_chunks), stream);
+    sc.grow_bytes(sc.cub_temp, sc.cub_temp_cap, cub_bytes);
+    cub::DeviceScan::InclusiveSum(sc.cub_temp, cub_bytes, sc.markers,
+                                  sc.chunk_map_incl,
+                                  static_cast<int>(n_chunks), stream);
+
+    // 3) Finalize: write n_containers + total_card into sc.d_finals.
+    bitset_finalize_kernel<<<1, 256, 0, stream>>>(
+        sc.popcounts, sc.chunk_map_incl, n_chunks, sc.d_finals);
+    CUDA_CHECK(cudaGetLastError());
+
+    // 4) D2H 12 bytes. This is the only sync of the whole pipeline.
+    uint32_t h_finals[3] = {0, 0, 0};
+    CUDA_CHECK(cudaMemcpyAsync(h_finals, sc.d_finals,
+                               3 * sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    uint32_t n_containers = h_finals[0];
+    uint64_t total_card   = static_cast<uint64_t>(h_finals[1]) |
+                            (static_cast<uint64_t>(h_finals[2]) << 32);
+
+    result.total_cardinality   = should_negate ? original_cardinality : total_card;
+    result.n_containers        = n_containers;
     result.n_bitmap_containers = n_containers;
-    result.n_array_containers = 0;
-    result.n_run_containers = 0;
+    result.n_array_containers  = 0;
+    result.n_run_containers    = 0;
+    if (n_containers == 0) return result;
 
-    if (n_containers == 0) {
-        CUDA_CHECK(cudaFreeAsync(d_popcounts, stream));
-        return result;
-    }
+    // 5) Grow output scratch.
+    sc.grow(sc.bitmap_pool, sc.bitmap_pool_cap_u64,
+            static_cast<size_t>(n_containers) * 1024u);
+    // Coalesced metadata: offsets(4n) | keys(2n) | cardinalities(2n) | types(n).
+    size_t meta_bytes = static_cast<size_t>(n_containers) * 9u;
+    void*  meta_void  = sc.meta;
+    sc.grow_bytes(meta_void, sc.meta_cap, meta_bytes);
+    sc.meta = static_cast<uint8_t*>(meta_void);
+    sc.grow(sc.key_index, sc.key_index_cap, n_chunks);
 
-    // 3. Upload chunk map and run compaction kernel
-    uint32_t* d_chunk_map = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&d_chunk_map, n_chunks * sizeof(uint32_t), stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_chunk_map, h_chunk_map.data(),
-                               n_chunks * sizeof(uint32_t),
-                               cudaMemcpyHostToDevice, stream));
+    uint8_t* meta_base = sc.meta;
+    uint32_t*       d_offsets       = reinterpret_cast<uint32_t*>(meta_base);
+    uint16_t*       d_keys          = reinterpret_cast<uint16_t*>(meta_base +
+                                          static_cast<size_t>(n_containers) * 4u);
+    uint16_t*       d_cardinalities = reinterpret_cast<uint16_t*>(meta_base +
+                                          static_cast<size_t>(n_containers) * 6u);
+    ContainerType*  d_types         = reinterpret_cast<ContainerType*>(meta_base +
+                                          static_cast<size_t>(n_containers) * 8u);
 
-    CUDA_CHECK(cudaMallocAsync(&result.bitmap_data,
-                          static_cast<size_t>(n_containers) * 1024 * sizeof(uint64_t), stream));
-    CUDA_CHECK(cudaMallocAsync(&result.keys, n_containers * sizeof(uint16_t), stream));
-    CUDA_CHECK(cudaMallocAsync(&result.types, n_containers * sizeof(ContainerType), stream));
-    CUDA_CHECK(cudaMallocAsync(&result.offsets, n_containers * sizeof(uint32_t), stream));
-    CUDA_CHECK(cudaMallocAsync(&result.cardinalities, n_containers * sizeof(uint16_t), stream));
-
-    compact_chunks_kernel<<<n_chunks, 256, 0, stream>>>(
-        d_bitset, d_chunk_map, d_popcounts,
-        result.bitmap_data, result.keys, result.types,
-        result.offsets, result.cardinalities,
+    // 6) Compact bitset → bitmap_pool + metadata, in one kernel.
+    compact_chunks_incl_kernel<<<n_chunks, 256, 0, stream>>>(
+        d_bitset, sc.chunk_map_incl, sc.popcounts,
+        sc.bitmap_pool, d_keys, d_types, d_offsets, d_cardinalities,
         n_chunks, n_words);
     CUDA_CHECK(cudaGetLastError());
 
-    CUDA_CHECK(cudaFreeAsync(d_chunk_map, stream));
-    CUDA_CHECK(cudaFreeAsync(d_popcounts, stream));
+    // 7) Build key_index device-side.
+    uint32_t grid_idx = (n_chunks + 255u) / 256u;
+    build_key_index_kernel<<<grid_idx, 256, 0, stream>>>(
+        sc.popcounts, sc.chunk_map_incl, sc.key_index, n_chunks);
+    CUDA_CHECK(cudaGetLastError());
 
-    // 4. Build key_index
-    // Find max_key from the non-empty chunks
-    uint16_t max_key = 0;
-    for (uint32_t i = n_chunks; i > 0; --i) {
-        if (h_chunk_map[i - 1] != 0xFFFFFFFF) {
-            max_key = static_cast<uint16_t>(i - 1);
-            break;
-        }
-    }
-    result.max_key = max_key;
-
-    uint32_t index_size = static_cast<uint32_t>(max_key) + 1;
-    std::vector<uint16_t> h_key_index(index_size, 0xFFFF);
-    for (uint32_t i = 0; i < n_chunks; ++i) {
-        if (h_chunk_map[i] != 0xFFFFFFFF) {
-            h_key_index[i] = static_cast<uint16_t>(h_chunk_map[i]);
-        }
-    }
-    CUDA_CHECK(cudaMallocAsync(&result.key_index, index_size * sizeof(uint16_t), stream));
-    CUDA_CHECK(cudaMemcpyAsync(result.key_index, h_key_index.data(),
-                               index_size * sizeof(uint16_t),
-                               cudaMemcpyHostToDevice, stream));
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // 8) Wire up the result. max_key is conservative (n_chunks-1); the contains
+    //    path correctly returns "absent" via key_index = 0xFFFF for any over-
+    //    range key, so this is a no-op for query correctness.
+    result.bitmap_data   = sc.bitmap_pool;
+    result.keys          = d_keys;
+    result.types         = d_types;
+    result.offsets       = d_offsets;
+    result.cardinalities = d_cardinalities;
+    result.key_index     = sc.key_index;
+    result.max_key       = static_cast<uint32_t>(n_chunks > 0 ? n_chunks - 1u : 0u);
     return result;
 }
 
@@ -806,64 +982,82 @@ static GpuRoaring build_from_device_bitset(const uint32_t* d_bitset,
 GpuRoaring upload_from_device_bitset(const uint32_t* d_bitset,
                                       uint32_t n_words,
                                       uint32_t universe_size,
-                                      cudaStream_t stream)
+                                      cudaStream_t stream,
+                                      bool check_complement)
 {
     if (n_words == 0) {
         GpuRoaring result{};
         result.universe_size = universe_size;
+        result._scratched    = true;
         return result;
     }
 
-    // Popcount the full bitset to decide on complement
-    // We'll compute per-chunk popcounts inside build_from_device_bitset anyway,
-    // but we need the total now for the complement decision.
-    // Quick total via chunk_popcount_kernel + host sum:
-    uint32_t n_chunks = (n_words + 2047) / 2048;
-    uint32_t* d_popcounts = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&d_popcounts, n_chunks * sizeof(uint32_t), stream));
-    chunk_popcount_kernel<<<n_chunks, 256, 0, stream>>>(
-        d_bitset, d_popcounts, n_chunks, n_words);
+    if (!check_complement) {
+        // Fast path: skip the outer popcount entirely. The finalize kernel
+        // inside build_from_device_bitset_fast computes total_card device-
+        // side, so we don't need to know it on the host beforehand.
+        return build_from_device_bitset_fast(d_bitset, n_words, universe_size,
+                                              /*should_negate=*/false,
+                                              /*original_card=*/0, stream);
+    }
 
-    std::vector<uint32_t> h_popcounts(n_chunks);
-    CUDA_CHECK(cudaMemcpyAsync(h_popcounts.data(), d_popcounts,
-                               n_chunks * sizeof(uint32_t),
+    // Opt-in complement path: popcount once, sum device-side via the finalize
+    // kernel, decide, possibly invert, then run the fast build (which will
+    // popcount again on the inverted bitset -- unavoidable since its
+    // per-chunk popcounts differ from the original).
+    uint32_t n_chunks = (n_words + 2047u) / 2048u;
+    UploadScratch& sc = upload_scratch_state();
+    sc.grow(sc.popcounts,      sc.popcounts_cap,      n_chunks);
+    sc.grow(sc.chunk_map_incl, sc.chunk_map_incl_cap, n_chunks);
+    sc.grow(sc.d_finals,       sc.d_finals_cap,       4);
+    chunk_popcount_kernel<<<n_chunks, 256, 0, stream>>>(
+        d_bitset, sc.popcounts, n_chunks, n_words);
+    sc.grow(sc.markers, sc.markers_cap, n_chunks);
+    uint32_t grid_mark_c = (n_chunks + 255u) / 256u;
+    markers_from_popcount_kernel<<<grid_mark_c, 256, 0, stream>>>(
+        sc.popcounts, sc.markers, n_chunks);
+    size_t cub_bytes = 0;
+    cub::DeviceScan::InclusiveSum(nullptr, cub_bytes, sc.markers,
+                                  sc.chunk_map_incl,
+                                  static_cast<int>(n_chunks), stream);
+    sc.grow_bytes(sc.cub_temp, sc.cub_temp_cap, cub_bytes);
+    cub::DeviceScan::InclusiveSum(sc.cub_temp, cub_bytes, sc.markers,
+                                  sc.chunk_map_incl,
+                                  static_cast<int>(n_chunks), stream);
+    bitset_finalize_kernel<<<1, 256, 0, stream>>>(
+        sc.popcounts, sc.chunk_map_incl, n_chunks, sc.d_finals);
+    uint32_t h_finals[3] = {0, 0, 0};
+    CUDA_CHECK(cudaMemcpyAsync(h_finals, sc.d_finals,
+                               3 * sizeof(uint32_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaFreeAsync(d_popcounts, stream));
-
-    uint64_t total_card = 0;
-    for (uint32_t i = 0; i < n_chunks; ++i) total_card += h_popcounts[i];
-
-    bool should_negate = (total_card > static_cast<uint64_t>(universe_size) / 2);
+    uint64_t total_card = static_cast<uint64_t>(h_finals[1]) |
+                          (static_cast<uint64_t>(h_finals[2]) << 32);
+    bool should_negate = total_card > static_cast<uint64_t>(universe_size) / 2u;
 
     if (should_negate) {
-        // Invert the bitset on GPU, then build from the inverted copy
-        uint32_t* d_inverted = nullptr;
-        CUDA_CHECK(cudaMallocAsync(&d_inverted, n_words * sizeof(uint32_t), stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_inverted, d_bitset,
+        sc.grow(sc.d_inverted, sc.d_inverted_cap, n_words);
+        CUDA_CHECK(cudaMemcpyAsync(sc.d_inverted, d_bitset,
                                    n_words * sizeof(uint32_t),
                                    cudaMemcpyDeviceToDevice, stream));
-
-        uint32_t inv_blocks = (n_words + 255) / 256;
-        invert_bitset_u32_kernel<<<inv_blocks, 256, 0, stream>>>(d_inverted, n_words);
-
-        // Mask tail bits beyond universe_size
-        uint32_t tail_bits = universe_size % 32;
+        uint32_t inv_blocks = (n_words + 255u) / 256u;
+        invert_bitset_u32_kernel<<<inv_blocks, 256, 0, stream>>>(
+            sc.d_inverted, n_words);
+        uint32_t tail_bits = universe_size % 32u;
         if (tail_bits > 0) {
-            uint32_t tail_word_idx = universe_size / 32;
+            uint32_t tail_word_idx = universe_size / 32u;
             if (tail_word_idx < n_words) {
                 uint32_t tail_mask = (1u << tail_bits) - 1u;
-                mask_tail_kernel<<<1, 1, 0, stream>>>(d_inverted, tail_word_idx, tail_mask);
+                mask_tail_kernel<<<1, 1, 0, stream>>>(
+                    sc.d_inverted, tail_word_idx, tail_mask);
             }
         }
-
-        GpuRoaring result = build_from_device_bitset(
-            d_inverted, n_words, universe_size, true, total_card, stream);
-        CUDA_CHECK(cudaFreeAsync(d_inverted, stream));
-        return result;
+        return build_from_device_bitset_fast(sc.d_inverted, n_words,
+                                              universe_size, true, total_card,
+                                              stream);
     }
-
-    return build_from_device_bitset(d_bitset, n_words, universe_size, false, 0, stream);
+    return build_from_device_bitset_fast(d_bitset, n_words, universe_size,
+                                          false, 0, stream);
 }
 
 // ============================================================================

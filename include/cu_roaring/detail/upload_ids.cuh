@@ -50,9 +50,25 @@ GpuRoaring upload_from_bitset(const uint32_t* host_bitset,
                                uint32_t universe_size,
                                cudaStream_t stream = 0);
 
+// Build a GpuRoaring directly from a device-resident uint32 bitset.
+//
+// The result lives in process-lifetime scratch (the returned GpuRoaring's
+// _scratched flag is set; gpu_roaring_free is a no-op). It is only valid
+// until the *next* call to this function on the same thread. For most
+// per-query-filter workloads that's exactly what you want; just be careful
+// not to keep two upload results live across calls.
+//
+// check_complement (default false): when true, popcount the bitset
+// up-front and -- if cardinality > universe/2 -- store the complement and
+// set negated=true. This is the classic roaring storage optimisation and
+// shrinks the on-GPU representation by ~2x for dense filters. It costs
+// one extra full bitset popcount + a D2H sync per call (~100-200us on
+// WSL2), so it defaults to *off*; opt in only when the filter may be
+// dense.
 GpuRoaring upload_from_device_bitset(const uint32_t* d_bitset,
                                       uint32_t n_words,
                                       uint32_t universe_size,
-                                      cudaStream_t stream = 0);
+                                      cudaStream_t stream = 0,
+                                      bool check_complement = false);
 
 }  // namespace cu_roaring
