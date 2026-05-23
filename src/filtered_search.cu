@@ -756,6 +756,52 @@ SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
         CUDA_CHECK(cudaGetLastError());
     }
 
+    // -- Coalesce adjacent masked tasks --------------------------------------
+    // The bitmap branch above emits one masked task per 65536-wide container
+    // (per-block in the negated case). At high selectivity that's one task
+    // per container — at sel=90% with 153 dense bitmap containers, the
+    // executor runs 153 separate sgemm + apply_mask + top-k passes, each
+    // GEMM ~30us of math but ~10-15us of launch overhead. Coalescing pairs
+    // (a,b) where (1) rows are contiguous (a.start+a.n_cols == b.start),
+    // (2) mask buffers are memory-contiguous (a.mask + a.n_cols/32 == b.mask),
+    // (3) mask_bit0 == 0 and (4) mask_invert matches collapses runs of
+    // dense-bitmap or runs of negated-block masks into one wide task — same
+    // mask kernel reads, one outer task iteration in the executor, ~10x
+    // fewer kernel launches.
+    //
+    // Memory-contiguity holds by construction in both paths: bitmap_data is
+    // packed in container-index (== key-sorted) order, and the negated path
+    // writes its per-block masks into scratch.mask_pool at a uniform 2048-
+    // uint32 stride in need_mask-iteration order, which IS block order.
+    // The row-contiguity check is the safety net for any gap (an array/run
+    // container interleaved, or a fully-excluded block in the negated path).
+    //
+    // Cap at kTileWMax so per-task scratch (~tile_w * q * 4 bytes) stays
+    // bounded; the executor's inner tile loop handles any task >= tile_w.
+    {
+        std::vector<GemmTask> coalesced;
+        coalesced.reserve(masked.size());
+        for (const GemmTask& t : masked) {
+            if (!coalesced.empty()) {
+                GemmTask& back = coalesced.back();
+                const uint32_t stride_words = back.n_cols >> 5;
+                const bool rows_contig  = back.start + back.n_cols == t.start;
+                const bool mask_contig  = back.mask + stride_words == t.mask;
+                const bool both_word0   = back.mask_bit0 == 0u && t.mask_bit0 == 0u;
+                const bool invert_match = back.mask_invert == t.mask_invert;
+                const bool fits         =
+                    static_cast<uint64_t>(back.n_cols) +
+                    static_cast<uint64_t>(t.n_cols) <= kTileWMax;
+                if (rows_contig && mask_contig && both_word0 && invert_match && fits) {
+                    back.n_cols += t.n_cols;
+                    continue;
+                }
+            }
+            coalesced.push_back(t);
+        }
+        masked = std::move(coalesced);
+    }
+
     // -- Assemble the task list ----------------------------------------------
     for (auto& r : ranges) {
         GemmTask t;
