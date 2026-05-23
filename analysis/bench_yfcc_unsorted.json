@@ -2,10 +2,14 @@
   "gpu":"NVIDIA GeForce RTX 5090","n":10000000,"dim":192,"k":10,
   "sampled_queries":256,"skipped_empty":0,
   "card_median":15238,"card_mean":193203.6,
-  "cuvs_bitset_ms_median":0.6406,"cuvs_bitset_ms_mean":1.5279,
-  "roaring_search_ms_median":0.0465,"roaring_search_ms_mean":0.1466,
-  "roaring_build_ms_median":2.8681,"roaring_build_ms_mean":4.5030,
-  "roaring_endtoend_ms_median":2.9200,"roaring_endtoend_ms_mean":4.6496,
-  "speedup_search_only":13.7796,
-  "speedup_endtoend":0.2194
+  "cuvs_bitset_ms_median":0.7243,"cuvs_bitset_ms_mean":1.6064,
+  "roaring_search_ms_median":0.0517,"roaring_search_ms_mean":0.1477,
+  "roaring_build_ms_median":3.0605,"roaring_build_ms_mean":5.4441,
+  "roaring_endtoend_ms_median":3.1057,"roaring_endtoend_ms_mean":5.5918,
+  "roaring_build_gpu_ms_median":1.1721,"roaring_build_gpu_ms_mean":2.8100,
+  "roaring_endtoend_gpu_ms_median":1.2149,"roaring_endtoend_gpu_ms_mean":2.9577,
+  "recall_at_k":1.0000,
+  "speedup_search_only":14.0077,
+  "speedup_endtoend_host":0.2332,
+  "speedup_endtoend_gpu":0.5962
 }

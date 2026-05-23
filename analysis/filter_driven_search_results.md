@@ -361,13 +361,51 @@ meaningfully. Why:
 **What would move the needle.** The schedule-driven path is built for
 "filter shared across a batch" — that's where the 10–27× speedups live
 (Results 1–4). For per-query-filter workloads like YFCC, the architectural
-change required is to keep the *tag* bitmaps GPU-resident and uploaded
-once at startup, and build per-query filters with a **GPU-side multi-AND**
-(`cu_roaring::fused_multi_and` already exists) — bypassing the per-query
-host→device upload entirely. With cached tag bitmaps the per-query work
-collapses to one device-side AND + one `build_schedule` call. That should
-make end-to-end competitive on YFCC; not implemented in this branch, but
-the diagnostic above shows where the cost actually lives.
+change required is to skip the per-query CRoaring construction on the host
+and build the GpuRoaring **directly from a device-resident bitset**.
+
+### Result 6 — GPU-side construction (`upload_from_device_bitset`)
+
+`cu_roaring::upload_from_device_bitset` already exists: it takes a device
+`uint32_t*` bitset and constructs the GpuRoaring entirely on the GPU
+(popcount-per-block → container metadata → key index, no H2D). The same
+device bitset we have to build anyway for cuVS's `bitset_filter` is the
+input. Drop-in change: 5 lines in the bench.
+
+| path | unsorted | sorted | recall@10 |
+|---|---|---|---|
+| **cuVS bitset** | 0.72 ms (1.4k QPS) | 0.71 ms | — |
+| roaring search only | 0.052 ms (19k QPS) | 0.050 ms (20k QPS) | 1.000 |
+| roaring build, **host AND + upload(bm,N)** | 3.06 ms | 3.14 ms | — |
+| roaring build, **`upload_from_device_bitset`** | **1.17 ms** | **1.04 ms** | — |
+| end-to-end **host path** | 3.11 ms (0.23×) | 3.34 ms (0.21×) | 1.000 |
+| end-to-end **GPU-bitset path** | **1.22 ms (0.60×)** | **1.15 ms (0.62×)** | 1.000 |
+
+The GPU-side construction cuts per-query build by **2.6×** and closes most
+of the end-to-end gap — schedule-driven is now ~1.6× of cuVS rather than
+4.5×, with the same correct top-10. The remaining ~1.1 ms is GPU-side
+infrastructure: ~10 kernel launches inside `upload_from_device_bitset` +
+`build_schedule` (gather setup, key-index build, enumerate_runs sync), at
+WSL2's per-launch latency. Further levers (none implemented):
+
+- **Pre-uploaded tag bitmaps + GPU-side multi-AND.** `cu_roaring::multi_and`
+  already exists. For YFCC's 7910 query-relevant tags, upload all of them
+  once at startup (memory: a few hundred MB), then build per-query
+  filters with one `multi_and` call → directly a `GpuRoaring`, no upload
+  step at all. Cuts another ~1 ms.
+- **Scratch buffer reuse across queries.** `build_schedule` reallocates
+  the gather buffer per call; a `SearchSchedule` pool keyed by max
+  cardinality would amortise.
+- **Skip `enumerate_runs` when the input is known to be array/bitmap-only.**
+  The bitset path never produces RUN containers, so the run-enumeration
+  pass is wasted work.
+
+For the sorted layout, the tag bitmaps themselves compress dramatically
+(`tag 1`: 535 KB → 75 bytes after `run_optimize`, 7100×). The end-to-end
+search numbers are nearly identical because the per-query AND lands at
+card ≈ 15K — below the 64K direct-range threshold — so both layouts route
+to the gather path in the executor. The compression matters most for
+**storage and the upload cost**, not the per-query search itself.
 
 ## Reproduce
 
