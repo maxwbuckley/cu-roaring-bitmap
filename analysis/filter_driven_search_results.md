@@ -220,6 +220,57 @@ top-k × n_tasks bill outweighs the no-copy advantage of direct GEMMs. The
 right rule is probably "use direct only when each run is big enough that
 the GEMM is the bulk of the work" — formally a function of D and Q.
 
+## Result 4 — synthetic filter generators
+
+Filters loaded from the `roaring-benchmark` library's five distribution
+generators (CRoaring portable `.bin` files), each at N=10M. Same database
++ harness as Result 1 (D=128, Q=64, k=10, interleaved A/B, recall=1.000
+throughout). Cells are `bitset_ms / roaring_ms = speedup`.
+
+| sel | uniform | clustered | multi_tenant | power_law | temporal |
+|---|---|---|---|---|---|
+| 0.01% | 0.8 / 0.05 = **17×** | 1.1 / 0.05 = **22×** | 1.0 / 0.05 = **21×** | 1.0 / 0.05 = **21×** | 0.9 / 0.05 = **19×** |
+| 0.1% | 2.4 / 0.11 = **21×** | 2.5 / 0.11 = **22×** | 2.2 / 0.10 = **22×** | 2.2 / 0.10 = **23×** | 2.0 / 0.10 = **21×** |
+| 1% | 7.2 / 0.66 = 11× | 7.5 / 0.66 = 11× | 6.3 / 0.58 = 11× | 6.9 / 0.64 = 11× | 7.1 / 0.66 = 11× |
+| 5% | 32.4 / 1.66 = **20×** | 31.3 / 2.63 = 12× | 10.9 / 0.91 = 12× | 36.6 / 1.76 = **21×** | 32.1 / 1.65 = **19×** |
+| 10% | 65.9 / 2.47 = **27×** | 66.2 / 5.21 = 13× | 10.8 / 0.91 = 12× | 59.1 / 2.34 = **25×** | 18.1 / 2.49 = 7× |
+| 25% | 18.4 / 6.50 = 2.8× | 16.2 / 11.2 = 1.5× | 10.7 / 0.91 = **12×** | 18.3 / 5.05 = 3.6× | 18.3 / 13.9 = 1.3× |
+| 50% | 18.5 / 41.4 = **0.45×** | 15.9 / 20.3 = 0.78× | 10.8 / 0.91 = **12×** | 18.2 / 5.05 = 3.6× | 18.2 / 16.5 = 1.1× |
+
+What the container-type breakdown shows, by shape:
+
+- **uniform** — pure Bernoulli, 100% BITMAP containers (153 of them at N=10M),
+  one gather task at sel ≤ 10%, masked-range per BITMAP at 50% — fragments
+  badly above sparsity 0.9 (the cuVS dense+mask threshold).
+- **clustered** — 100% RUN containers; `enumerate_runs` coalesces into 4
+  direct-range GEMMs once runs are wide enough (sel ≥ 1%), and the schedule
+  stays compact through 50%. Recovers the regression to 0.78× vs uniform's
+  0.45× — direct-range dispatch doing exactly what the design said it
+  should.
+- **multi_tenant** — the "target selectivity" caps at card ≈ 152K (the
+  generator's tenant has a fixed size); roaring time is **constant ~0.9 ms**
+  across 5–50% target, so the speedup *grows* with target selectivity to
+  **12× even at 50%**. Practical lesson: when the *real* eligible set is
+  small, schedule-driven is a clean win regardless of how the caller phrases
+  selectivity.
+- **power_law** — ARRAY containers at low sel, ARRAY→BITMAP transition at
+  10%, BITMAP-dominated above. Crosses to dense+mask at sparsity 0.75 so
+  cuVS levels off at ~18 ms; roaring also levels off near 5 ms because the
+  power-law distribution concentrates the cardinality. Speedup stays at
+  3.6× through 50%.
+- **temporal** — autocorrelated (recent activity is correlated), at 50% it
+  produces a mix of RUN + ARRAY + BITMAP containers (30/40/83); the
+  schedule fragments into 1 direct + 20 masked + 1 gather. Comes out at
+  1.1× (parity with cuVS), better than uniform's 0.45× because of the RUN
+  components but not as good as pure clustered.
+
+The headline reading: at low-to-moderate selectivity the schedule-driven
+path wins by **10–27× across every shape**. Above ~10% the bitset
+crossover to dense+mask compresses the gap. At ≥25% the *shape* of the
+filter starts to matter — pure-Bernoulli is the worst case, and the
+multi-tenant case (where the apparent and real selectivity disagree) is the
+best.
+
 ## Reproduce
 
 ```bash
@@ -228,9 +279,18 @@ cd build && cmake --build . --target test_filtered_search bench_filtered_search 
 ctest -R filtered_search --output-on-failure
 ./bench/bench_filtered_search
 
-# cuVS comparison: bench_schedule_driven_roaring.cu lives in the cuVS bench
-# tree (cpp/bench/prims/core). It needs cu_roaring built with the cuVS bench
-# toolchain (CUDA 12.4 / sm_89) so the static library device-links.
+# cuVS comparison: bench_schedule_driven_roaring.cu (synthetic shapes,
+# scattered + clustered) and bench_synth_filters.cu (loads .bin filters
+# from roaring-benchmark's sweep_10M output) both live in the cuVS bench
+# tree (cpp/bench/prims/core).  Each needs cu_roaring built with the cuVS
+# bench toolchain (CUDA 12.4 / sm_89) so the static library device-links.
+#
+# To reproduce the synthetic-generator table:
+#   python3 -m roaring_bench sweep -n 10000000 --num-trials 1 \
+#     --output-dir output/sweep_10M --save-bitmaps --skip-access
+#   SYNTH_FILTER_DIR=.../sweep_10M/bitmaps SYNTH_N=10000000 \
+#     ./bench_synth_filters
 ```
 
-Raw results: [`bench_cuvs_comparison.json`](bench_cuvs_comparison.json).
+Raw results: [`bench_cuvs_comparison.json`](bench_cuvs_comparison.json),
+[`bench_synth_generators.json`](bench_synth_generators.json).
