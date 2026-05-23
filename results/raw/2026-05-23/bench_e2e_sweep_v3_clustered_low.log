@@ -1,0 +1,88 @@
+GPU: NVIDIA GeForce RTX 5090   N=10000000  D=512  Q=64  K=10   dtype=fp32   shape=clustered   free=30.2 GB
+warmup=5  iters=15  selectivities=8
+
+Allocating dataset (20.5 GB, fp32)...
+Building cuVS brute_force index...
+  free after dataset+index: 11.9 GB
+
+=== sel=0.0100%  card=1000 ===
+  roaring portable bytes: 0.01 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=1 arr=0 bmp=0   schedule: D=0(0.0M) M=0(0.0M) G=1(0.0M)  FALLBACK
+  cuvs   : 1.411 ms  (p10=1.308 p90=1.781 std=0.195)  45347 QPS
+  count  : 0.107 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 1.304 ms  (cuvs minus count; fair-comparison)
+  roaring: 1.216 ms  (p10=1.171 p90=1.414 std=0.114)  52647 QPS
+  speedup raw=1.16x   fair=1.07x     recall@10: 1.0000  (schedule fallback)
+
+=== sel=0.1000%  card=10000 ===
+  roaring portable bytes: 0.01 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=1 arr=0 bmp=0   schedule: D=0(0.0M) M=0(0.0M) G=1(0.0M)  FALLBACK
+  cuvs   : 2.818 ms  (p10=2.627 p90=3.232 std=0.288)  22715 QPS
+  count  : 0.114 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 2.704 ms  (cuvs minus count; fair-comparison)
+  roaring: 1.237 ms  (p10=1.165 p90=1.575 std=0.167)  51733 QPS
+  speedup raw=2.28x   fair=2.19x     recall@10: 1.0000  (schedule fallback)
+
+=== sel=1.0000%  card=100000 ===
+  roaring portable bytes: 0.02 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=2 arr=0 bmp=0   schedule: D=1(0.1M) M=0(0.0M) G=0(0.0M)
+  cuvs   : 12.540 ms  (p10=12.223 p90=12.703 std=0.264)  5104 QPS
+  count  : 0.109 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 12.431 ms  (cuvs minus count; fair-comparison)
+  roaring: 2.002 ms  (p10=1.825 p90=2.228 std=0.176)  31974 QPS
+  speedup raw=6.26x   fair=6.21x     recall@10: 1.0000
+
+=== sel=3.0000%  card=300000 ===
+  roaring portable bytes: 0.09 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=6 arr=0 bmp=0   schedule: D=1(0.3M) M=0(0.0M) G=0(0.0M)
+  cuvs   : 33.479 ms  (p10=33.205 p90=33.769 std=0.254)  1912 QPS
+  count  : 0.155 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 33.324 ms  (cuvs minus count; fair-comparison)
+  roaring: 2.964 ms  (p10=2.715 p90=3.260 std=0.216)  21595 QPS
+  speedup raw=11.30x   fair=11.24x     recall@10: 1.0000
+
+=== sel=5.0000%  card=500000 ===
+  roaring portable bytes: 0.11 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=8 arr=0 bmp=0   schedule: D=1(0.5M) M=0(0.0M) G=0(0.0M)
+  cuvs   : 54.626 ms  (p10=54.101 p90=55.338 std=0.467)  1172 QPS
+  count  : 0.095 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 54.531 ms  (cuvs minus count; fair-comparison)
+  roaring: 3.584 ms  (p10=3.317 p90=3.782 std=0.210)  17857 QPS
+  speedup raw=15.24x   fair=15.21x     recall@10: 1.0000
+
+=== sel=10.0000%  card=1000000 ===
+  roaring portable bytes: 0.22 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=16 arr=0 bmp=0   schedule: D=1(1.0M) M=0(0.0M) G=0(0.0M)
+  cuvs   : 110.097 ms  (p10=109.675 p90=110.941 std=0.557)  581 QPS
+  count  : 0.103 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 109.994 ms  (cuvs minus count; fair-comparison)
+  roaring: 5.866 ms  (p10=5.641 p90=6.067 std=0.244)  10911 QPS
+  speedup raw=18.77x   fair=18.75x     recall@10: 1.0000
+
+=== sel=15.0000%  card=1500000 ===
+  roaring portable bytes: 0.33 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=24 arr=0 bmp=0   schedule: D=1(1.5M) M=0(0.0M) G=0(0.0M)
+  cuvs   : 30.625 ms  (p10=30.463 p90=31.173 std=0.602)  2090 QPS
+  count  : 0.112 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 30.513 ms  (cuvs minus count; fair-comparison)
+  roaring: 8.088 ms  (p10=7.787 p90=8.393 std=0.250)  7913 QPS
+  speedup raw=3.79x   fair=3.77x     recall@10: 1.0000
+
+=== sel=20.0000%  card=2000000 ===
+  roaring portable bytes: 0.45 KB   bitset host bytes: 1220.70 KB
+  (schedule census deferred to first warmup B-call)
+  containers: run=32 arr=0 bmp=0   schedule: D=1(2.0M) M=0(0.0M) G=0(0.0M)
+  cuvs   : 31.034 ms  (p10=30.609 p90=31.496 std=0.440)  2062 QPS
+  count  : 0.146 ms  (raft popc + D2H, included in cuvs above)
+  cuvs-count: 30.888 ms  (cuvs minus count; fair-comparison)
+  roaring: 9.430 ms  (p10=9.182 p90=9.568 std=0.159)  6787 QPS
+  speedup raw=3.29x   fair=3.28x     recall@10: 1.0000
+
+wrote bench_e2e_sweep_v3_clustered_low.json

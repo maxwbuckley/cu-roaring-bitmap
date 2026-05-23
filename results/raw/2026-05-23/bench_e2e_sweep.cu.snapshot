@@ -171,11 +171,39 @@ void generate_normal_typed(curandGenerator_t rng, T* d_out, size_t n_elems,
 
 } // namespace
 
+enum class FilterShape { Random, Clustered };
+
+// Build the ID set for one cell of the sweep.
+//   Random     — uniform-random without replacement; the worst case for
+//                roaring (no runs, no clusters; per-container density tracks
+//                global selectivity so containers are array or sparse-bitmap).
+//   Clustered  — single contiguous run of `card` ids starting at a fixed
+//                offset. After run_optimize this is one RUN container per
+//                65K block (cross-container coalesced by enumerate_runs into
+//                a single kRange-direct task >= kDirectMinWidth=64K wide).
+//                The best case for the schedule's direct dispatch path.
+std::vector<uint32_t> build_ids_for_cell(uint32_t N, uint64_t card,
+                                          FilterShape shape, uint64_t seed)
+{
+  if (shape == FilterShape::Clustered) {
+    // Pick a stable offset based on the card so consecutive sel cells land
+    // in different regions; ensures we don't time the same dataset slice
+    // over and over and accidentally favour roaring via cache warmth.
+    uint64_t off = (seed * 1469598103934665603ull) % (N - card);
+    std::vector<uint32_t> ids;
+    ids.reserve(card);
+    for (uint64_t i = 0; i < card; ++i) ids.push_back(static_cast<uint32_t>(off + i));
+    return ids;
+  }
+  return sample_unique_ids(N, card, seed);
+}
+
 template <typename T>
 int run_sweep(int N, int D, int NQ, int WARMUP, int ITERS,
-              const std::vector<double>& sel_grid)
+              const std::vector<double>& sel_grid, FilterShape shape)
 {
   constexpr int K = 10;
+  const char* shape_name = (shape == FilterShape::Clustered) ? "clustered" : "random";
   constexpr const char* dtype_name =
       std::is_same_v<T, float> ? "fp32" : "fp16";
   raft::resources res;
@@ -189,8 +217,8 @@ int run_sweep(int N, int D, int NQ, int WARMUP, int ITERS,
 
   cudaDeviceProp prop;
   cudaGetDeviceProperties(&prop, 0);
-  printf("GPU: %s   N=%d  D=%d  Q=%d  K=%d   dtype=%s   free=%.1f GB\n",
-         prop.name, N, D, NQ, K, dtype_name,
+  printf("GPU: %s   N=%d  D=%d  Q=%d  K=%d   dtype=%s   shape=%s   free=%.1f GB\n",
+         prop.name, N, D, NQ, K, dtype_name, shape_name,
          free_vram() / (1024.0 * 1024.0 * 1024.0));
   printf("warmup=%d  iters=%d  selectivities=%zu\n\n",
          WARMUP, ITERS, sel_grid.size());
@@ -244,13 +272,14 @@ int run_sweep(int N, int D, int NQ, int WARMUP, int ITERS,
   FILE* jf = fopen(out_path, "w");
   fprintf(jf,
     "{\n"
-    "  \"gpu\":\"%s\",\"n\":%d,\"dim\":%d,\"nq\":%d,\"k\":%d,\"dtype\":\"%s\",\n"
+    "  \"gpu\":\"%s\",\"n\":%d,\"dim\":%d,\"nq\":%d,\"k\":%d,"
+    "\"dtype\":\"%s\",\"shape\":\"%s\",\n"
     "  \"warmup\":%d,\"iters\":%d,\n"
     "  \"a\":\"cuvs brute_force + raft bitset_filter (H2D bitset + search + D2H)\",\n"
     "  \"b\":\"cu_roaring schedule-driven (H2D upload + schedule + search + D2H)\",\n"
     "  \"timed_region\":\"alloc+H2D+setup+search+D2H+free per call\",\n"
     "  \"results\":[\n",
-    prop.name, N, D, NQ, K, dtype_name, WARMUP, ITERS);
+    prop.name, N, D, NQ, K, dtype_name, shape_name, WARMUP, ITERS);
   bool first_result = true;
 
   for (double sel : sel_grid) {
@@ -263,8 +292,9 @@ int run_sweep(int N, int D, int NQ, int WARMUP, int ITERS,
     fflush(stdout);
 
     // ---- Host artefacts (built once per cell; live on host) ---------------
-    std::vector<uint32_t> ids = sample_unique_ids(static_cast<uint32_t>(N), card,
-                                                  0xCAFEBABEull ^ static_cast<uint64_t>(card));
+    std::vector<uint32_t> ids = build_ids_for_cell(
+        static_cast<uint32_t>(N), card, shape,
+        0xCAFEBABEull ^ static_cast<uint64_t>(card));
     roaring_bitmap_t* cpu_bm = roaring_bitmap_create();
     roaring_bitmap_add_many(cpu_bm, ids.size(), ids.data());
     roaring_bitmap_run_optimize(cpu_bm);
@@ -520,8 +550,16 @@ int main()
   // exercise the cublasGemmEx + __half gather path. fp16 halves dataset bytes
   // so D=1024 at N=10M is reachable (20 GB instead of 40 GB).
   const char* dtype = std::getenv("E2E_DTYPE");
-  if (dtype && (std::string(dtype) == "fp16" || std::string(dtype) == "half")) {
-    return run_sweep<__half>(N, D, NQ, WARMUP, ITERS, sel_grid);
-  }
-  return run_sweep<float>(N, D, NQ, WARMUP, ITERS, sel_grid);
+  bool use_fp16 = dtype && (std::string(dtype) == "fp16" || std::string(dtype) == "half");
+
+  // Filter shape dispatch. Default "random" matches prior data; "clustered"
+  // builds the filter as a single contiguous run of card ids — produces RUN
+  // containers after run_optimize and exercises the schedule's kRange-direct
+  // dispatch (no gather, no mask) when card >= kDirectMinWidth (64K).
+  const char* shape_env = std::getenv("E2E_SHAPE");
+  FilterShape shape = FilterShape::Random;
+  if (shape_env && std::string(shape_env) == "clustered") shape = FilterShape::Clustered;
+
+  if (use_fp16) return run_sweep<__half>(N, D, NQ, WARMUP, ITERS, sel_grid, shape);
+  return run_sweep<float>(N, D, NQ, WARMUP, ITERS, sel_grid, shape);
 }
