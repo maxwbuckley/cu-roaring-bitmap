@@ -314,10 +314,60 @@ tag bitmap is read by many queries — caching the upload once amortises
 it), (c) build the per-query intersection directly on the GPU from cached
 tag bitmaps (multi_and kernel already exists in cu_roaring).
 
-The **sorted-by-tag-tuple variant** is the natural complement here: when
-items with similar tag combinations are adjacent, tag bitmaps become
-contiguous → RUN containers → fewer containers + direct-range GEMM →
-both upload *and* search faster. That's the next experiment.
+### YFCC-10M sorted by tag tuple
+
+I built a lex-by-tag-tuple permutation of YFCC-10M (5.33M unique tag tuples
+across 10M items; preprocessing in `tools/yfcc_sort_by_tags.py`), re-emitted
+the base vectors and all 7910 tag bitmaps in the new order, and re-ran the
+bench. The per-tag bitmaps compress dramatically on the sorted layout:
+
+| tag | unsorted serialized | sorted serialized (+ run_optimize) | ratio |
+|---|---|---|---|
+| 1 (266K items)   | 535 KB | **75 bytes** | 7100× |
+| 5 (1.24M items)  | 1.25 MB | **287 bytes** | 4500× |
+| 28 (706K items)  | 1.25 MB | **1.6 KB** | 770× |
+| 100 (509K items) | 694 KB | 16 KB | 43× |
+
+Same harness, same 256 sampled queries, `run_optimize`'d filter (so RUN
+containers would survive upload). End-to-end median:
+
+| measurement | unsorted | sorted | Δ |
+|---|---|---|---|
+| cuVS bitset                | 0.641 ms | 0.672 ms | ≈ |
+| roaring SEARCH (pre-built) | 0.046 ms | 0.046 ms | ≈ |
+| roaring BUILD              | 2.868 ms | 2.960 ms | ≈ |
+| roaring END-TO-END         | 2.920 ms | 3.073 ms | ≈ |
+| speedup search-only        | 13.8×    | 14.5×    | +5% |
+| speedup end-to-end         | 0.22×    | 0.22×    | — |
+
+The sort makes tag bitmaps thousands of times smaller (the result above
+is real and not in doubt) — but neither end of the search changes
+meaningfully. Why:
+
+- **Search path doesn't differ.** Typical YFCC per-query filter has card
+  ≈ 15K (median), so the AND-of-tag-bitmaps result is narrower than the
+  64K direct-range threshold. Both layouts route to the gather path, with
+  the same single small GEMM, so the search itself is the same ~0.046 ms.
+  To exercise the direct-range path on YFCC you'd need either many
+  large-card queries or a lower direct-range threshold (a tunable).
+- **Build cost is CUDA-call-bound, not shape-bound.** The 2.9–3.0 ms
+  per-query build is dominated by ~15–20 separate `cudaMalloc /
+  cudaMemcpyAsync / cudaStreamSynchronize` calls inside
+  `cu_roaring::upload(bm, N)` and `build_schedule()`. On WSL2 each call is
+  50–200 µs; the schedule-build pipeline accumulates ~3 ms of host-side
+  CUDA overhead regardless of how compact the input is. Sorting doesn't
+  remove those calls.
+
+**What would move the needle.** The schedule-driven path is built for
+"filter shared across a batch" — that's where the 10–27× speedups live
+(Results 1–4). For per-query-filter workloads like YFCC, the architectural
+change required is to keep the *tag* bitmaps GPU-resident and uploaded
+once at startup, and build per-query filters with a **GPU-side multi-AND**
+(`cu_roaring::fused_multi_and` already exists) — bypassing the per-query
+host→device upload entirely. With cached tag bitmaps the per-query work
+collapses to one device-side AND + one `build_schedule` call. That should
+make end-to-end competitive on YFCC; not implemented in this branch, but
+the diagnostic above shows where the cost actually lives.
 
 ## Reproduce
 

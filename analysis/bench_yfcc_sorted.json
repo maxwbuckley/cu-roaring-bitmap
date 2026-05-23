@@ -1,0 +1,11 @@
+{
+  "gpu":"NVIDIA GeForce RTX 5090","n":10000000,"dim":192,"k":10,
+  "sampled_queries":256,"skipped_empty":0,
+  "card_median":15238,"card_mean":193203.6,
+  "cuvs_bitset_ms_median":0.6719,"cuvs_bitset_ms_mean":1.5110,
+  "roaring_search_ms_median":0.0464,"roaring_search_ms_mean":0.1459,
+  "roaring_build_ms_median":2.9601,"roaring_build_ms_mean":3.8737,
+  "roaring_endtoend_ms_median":3.0726,"roaring_endtoend_ms_mean":4.0196,
+  "speedup_search_only":14.4837,
+  "speedup_endtoend":0.2187
+}
