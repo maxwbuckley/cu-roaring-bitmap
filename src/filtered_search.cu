@@ -17,7 +17,10 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
+
+#include <cuda_fp16.h>
 
 namespace cu_roaring {
 
@@ -210,7 +213,8 @@ __global__ void reduce_into_running_kernel(float* run_score, uint32_t* run_id,
     }
 }
 
-__global__ void gather_rows_kernel(float* dst, const float* db,
+template <typename T>
+__global__ void gather_rows_kernel(T* dst, const T* db,
                                    const uint32_t* ids, uint32_t n, uint32_t dim)
 {
     uint64_t idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -317,8 +321,8 @@ __global__ void build_container_mask_kernel(uint32_t* mask_pool,
 // Identity of one execute() invocation — used to cache the CUDA graph so
 // repeated searches replay instead of re-issuing every kernel launch.
 struct ExecSig {
-    const float*    db   = nullptr;
-    const float*    gdb  = nullptr;
+    const void*     db   = nullptr;
+    const void*     gdb  = nullptr;
     const uint32_t* gids = nullptr;
     uint32_t*       oid  = nullptr;
     float*          osc  = nullptr;
@@ -352,12 +356,15 @@ uint64_t hash_tasks(const std::vector<GemmTask>& t)
 // kernels, so per-launch host overhead would otherwise dominate a small
 // schedule. The first call runs eagerly (also warms cuBLAS before capture).
 // ---------------------------------------------------------------------------
-void execute(cublasHandle_t handle, const float* d_queries, uint32_t q,
-             const float* d_db, uint32_t dim,
-             const std::vector<GemmTask>& tasks, const float* d_gather_db,
-             const uint32_t* d_gather_ids, uint32_t k,
-             uint32_t* d_out_ids, float* d_out_scores, cudaStream_t stream)
+template <typename T>
+void execute_impl(cublasHandle_t handle, const T* d_queries, uint32_t q,
+                  const T* d_db, uint32_t dim,
+                  const std::vector<GemmTask>& tasks, const T* d_gather_db,
+                  const uint32_t* d_gather_ids, uint32_t k,
+                  uint32_t* d_out_ids, float* d_out_scores, cudaStream_t stream)
 {
+    static_assert(std::is_same<T, float>::value || std::is_same<T, __half>::value,
+                  "filtered_search supports float (fp32) and __half (fp16) only");
     CUBLAS_CHECK(cublasSetStream(handle, stream));
 
     // Adaptive GEMM column tile: as wide as the score-tile budget allows, so
@@ -399,20 +406,37 @@ void execute(cublasHandle_t handle, const float* d_queries, uint32_t q,
         init_topk_kernel<<<div_ceil(q * k, kBlock1D), kBlock1D, 0, stream>>>(
             d_out_scores, d_out_ids, q * k);
         for (const GemmTask& task : tasks) {
-            const float* mat_base =
+            const T* mat_base =
                 (task.kind == GemmTask::kGather) ? d_gather_db : d_db;
             for (uint32_t off = 0; off < task.n_cols; off += tile_w) {
                 uint32_t w = std::min(tile_w, task.n_cols - off);
-                const float* mat = mat_base +
+                const T* mat = mat_base +
                     static_cast<uint64_t>(task.start + off) * dim;
 
                 // tile (row-major q x w) = queries (q x dim) . mat^T (dim x w)
-                cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                            static_cast<int>(w), static_cast<int>(q),
-                            static_cast<int>(dim), &alpha, mat,
-                            static_cast<int>(dim), d_queries,
-                            static_cast<int>(dim), &beta, d_tile,
-                            static_cast<int>(w));
+                if constexpr (std::is_same<T, float>::value) {
+                    CUBLAS_CHECK(cublasSgemm(
+                        handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                        static_cast<int>(w), static_cast<int>(q),
+                        static_cast<int>(dim), &alpha, mat,
+                        static_cast<int>(dim), d_queries,
+                        static_cast<int>(dim), &beta, d_tile,
+                        static_cast<int>(w)));
+                } else {
+                    // fp16 inputs, fp32 accumulation/output via TensorCores.
+                    // alpha/beta are fp32 to match the compute type.
+                    CUBLAS_CHECK(cublasGemmEx(
+                        handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                        static_cast<int>(w), static_cast<int>(q),
+                        static_cast<int>(dim),
+                        &alpha,
+                        mat,        CUDA_R_16F, static_cast<int>(dim),
+                        d_queries,  CUDA_R_16F, static_cast<int>(dim),
+                        &beta,
+                        d_tile,     CUDA_R_32F, static_cast<int>(w),
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT));
+                }
 
                 if (task.kind == GemmTask::kRange && task.mask) {
                     uint64_t n = static_cast<uint64_t>(q) * w;
@@ -492,7 +516,7 @@ void execute(cublasHandle_t handle, const float* d_queries, uint32_t q,
 namespace {
 struct BuildScratch {
     uint32_t* gather_ids = nullptr;  size_t gather_ids_cap = 0;
-    float*    gather_db  = nullptr;  size_t gather_db_cap  = 0;  // bytes
+    void*     gather_db  = nullptr;  size_t gather_db_cap  = 0;  // bytes
     uint32_t* mask_pool  = nullptr;  size_t mask_pool_cap  = 0;  // bytes
     void*     d_srcs     = nullptr;  size_t d_srcs_cap     = 0;  // bytes
     void*     d_ranges   = nullptr;  size_t d_ranges_cap   = 0;  // bytes
@@ -519,9 +543,15 @@ inline BuildScratch& build_scratch()
 }
 }  // namespace
 
-SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
-                              const float* d_db, uint32_t dim,
-                              cudaStream_t stream)
+namespace {
+
+// Templated body of build_schedule — all schedule construction is
+// dtype-independent; only the final gather_rows_kernel call differs between
+// fp32 and fp16. Exposed via two thin overloads below.
+template <typename T>
+SearchSchedule build_schedule_impl(const GpuRoaring& filter, uint32_t n_rows,
+                                   const T* d_db, uint32_t dim,
+                                   cudaStream_t stream)
 {
     SearchSchedule sched;
     sched.scratched = true;
@@ -748,11 +778,13 @@ SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
             CUDA_CHECK(cudaGetLastError());
         }
 
-        // Gather the rows into a compact buffer (scratched).
-        sc.grow(sc.gather_db, sc.gather_db_cap, n_gather * dim * sizeof(float));
+        // Gather the rows into a compact buffer (scratched). Sized for T so
+        // fp16 only uses half the bytes of an fp32 gather.
+        sc.grow(sc.gather_db, sc.gather_db_cap, n_gather * dim * sizeof(T));
         sched.gather_db = sc.gather_db;
-        gather_rows_kernel<<<grid1d(n_gather * dim), kBlock1D, 0, stream>>>(
-            sched.gather_db, d_db, sched.gather_ids, sched.n_gather, dim);
+        gather_rows_kernel<T><<<grid1d(n_gather * dim), kBlock1D, 0, stream>>>(
+            static_cast<T*>(sched.gather_db), d_db, sched.gather_ids,
+            sched.n_gather, dim);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -822,6 +854,23 @@ SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
     return sched;
 }
 
+}  // namespace (build_schedule_impl)
+
+// Public overloads — thin wrappers over the templated body above.
+SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
+                              const float* d_db, uint32_t dim,
+                              cudaStream_t stream)
+{
+    return build_schedule_impl<float>(filter, n_rows, d_db, dim, stream);
+}
+
+SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
+                              const __half* d_db, uint32_t dim,
+                              cudaStream_t stream)
+{
+    return build_schedule_impl<__half>(filter, n_rows, d_db, dim, stream);
+}
+
 void free_schedule(SearchSchedule& s)
 {
     if (!s.scratched) {
@@ -849,9 +898,25 @@ void roaring_filtered_search(cublasHandle_t handle, const float* d_queries,
 {
     if (k > kMaxK) throw std::runtime_error("filtered_search: k exceeds kMaxK");
     (void)n_rows;
-    execute(handle, d_queries, q, d_db, dim, schedule.tasks,
-            schedule.gather_db, schedule.gather_ids, k,
-            d_out_ids, d_out_scores, stream);
+    execute_impl<float>(handle, d_queries, q, d_db, dim, schedule.tasks,
+                        static_cast<const float*>(schedule.gather_db),
+                        schedule.gather_ids, k,
+                        d_out_ids, d_out_scores, stream);
+}
+
+void roaring_filtered_search_fp16(cublasHandle_t handle,
+                                  const __half* d_queries, uint32_t q,
+                                  const __half* d_db, uint32_t n_rows,
+                                  uint32_t dim, const SearchSchedule& schedule,
+                                  uint32_t k, uint32_t* d_out_ids,
+                                  float* d_out_scores, cudaStream_t stream)
+{
+    if (k > kMaxK) throw std::runtime_error("filtered_search_fp16: k exceeds kMaxK");
+    (void)n_rows;
+    execute_impl<__half>(handle, d_queries, q, d_db, dim, schedule.tasks,
+                         static_cast<const __half*>(schedule.gather_db),
+                         schedule.gather_ids, k,
+                         d_out_ids, d_out_scores, stream);
 }
 
 void dense_filtered_search(cublasHandle_t handle, const float* d_queries,
@@ -883,8 +948,8 @@ void dense_filtered_search(cublasHandle_t handle, const float* d_queries,
     tasks[0].mask_bit0   = 0u;
     tasks[0].mask_invert = 0u;
 
-    execute(handle, d_queries, q, d_db, dim, tasks, nullptr, nullptr, k,
-            d_out_ids, d_out_scores, stream);
+    execute_impl<float>(handle, d_queries, q, d_db, dim, tasks, nullptr,
+                        nullptr, k, d_out_ids, d_out_scores, stream);
 }
 
 }  // namespace cu_roaring

@@ -35,6 +35,7 @@
 #include "cu_roaring/types.cuh"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdint>
 #include <vector>
 
@@ -71,7 +72,9 @@ struct GemmTask {
 struct SearchSchedule {
     std::vector<GemmTask> tasks;                ///< host list of GEMM tiles
     uint32_t*             gather_ids  = nullptr;///< device [n_gather] global row ids
-    float*                gather_db   = nullptr;///< device [n_gather*dim] gathered rows
+    void*                 gather_db   = nullptr;///< device [n_gather*dim] gathered rows
+                                                ///< (float or __half — caller knows from
+                                                ///< which build_schedule overload it came)
     uint32_t              n_gather    = 0;
     uint32_t*             mask_pool   = nullptr;///< device, owned bitset masks
     uint64_t              total_cols  = 0;      ///< sum of task n_cols (the GEMM work)
@@ -97,6 +100,15 @@ SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
                               const float* d_db, uint32_t dim,
                               cudaStream_t stream = 0);
 
+/// fp16 overload: materialises the gather buffer as __half rows. The schedule
+/// returned is fully interchangeable with the fp32 path's structures (only the
+/// `gather_db` storage type differs, and that buffer is owned by the schedule's
+/// build-scratch so callers don't see it). Pass the result to
+/// roaring_filtered_search_fp16().
+SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
+                              const __half* d_db, uint32_t dim,
+                              cudaStream_t stream = 0);
+
 /// Release the device buffers owned by a SearchSchedule.
 void free_schedule(SearchSchedule& schedule);
 
@@ -120,6 +132,27 @@ void roaring_filtered_search(cublasHandle_t handle, const float* d_queries,
                              uint32_t dim, const SearchSchedule& schedule,
                              uint32_t k, uint32_t* d_out_ids,
                              float* d_out_scores, cudaStream_t stream = 0);
+
+/**
+ * @brief fp16 schedule-driven filtered search.
+ *
+ * Input matrices (queries, database) are __half; the GEMM uses cuBLAS GemmEx
+ * with CUDA_R_16F inputs and CUDA_R_32F accumulation, so the score tile and
+ * top-k stay in fp32 — no precision loss in the ranking. The schedule must
+ * have been built with the __half overload of build_schedule(), since the
+ * gather buffer layout is dtype-specific.
+ *
+ * @param d_queries device queries, row-major [q * dim], __half
+ * @param d_db      device database, row-major [n_rows * dim], __half
+ * (other parameters identical to the fp32 overload)
+ */
+void roaring_filtered_search_fp16(cublasHandle_t handle,
+                                  const __half* d_queries, uint32_t q,
+                                  const __half* d_db, uint32_t n_rows,
+                                  uint32_t dim, const SearchSchedule& schedule,
+                                  uint32_t k, uint32_t* d_out_ids,
+                                  float* d_out_scores,
+                                  cudaStream_t stream = 0);
 
 /**
  * @brief Dense-masked baseline: full GEMM + decompressed-bitset mask + top-k.
