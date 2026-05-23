@@ -271,6 +271,54 @@ filter starts to matter — pure-Bernoulli is the worst case, and the
 multi-tenant case (where the apparent and real selectivity disagree) is the
 best.
 
+## Result 5 — YFCC-10M (real per-query filters, unsorted)
+
+NeurIPS'23 Big-ANN filtered track: 10M base vectors (192-d u8), 100K queries
+each carrying 1–2 tag predicates, 7910 distinct query-relevant tags. The
+per-query filter is the intersection of that query's tag bitmaps — i.e.
+**the filter changes every query**, so the "schedule built once, reused
+across the batch" assumption from the synthetic results doesn't apply. 256
+sampled queries, Q=1, inner-product top-10.
+
+| measurement | cuVS bitset | roaring schedule |
+|---|---|---|
+| **search only** (filter pre-built) | 0.641 ms / 1561 QPS | **0.046 ms / 21512 QPS** |
+| schedule build (per query) | — | 2.868 ms |
+| **end-to-end** (build + search) | 0.641 ms | **2.920 ms / 342 QPS** |
+| | — | 0.22× vs cuVS |
+
+`card` per query: median 15,238 (mean 193,204 — long tail).
+
+**Two opposing forces.** When the filter is pre-built, schedule-driven is
+**13.8× faster than cuVS** on real YFCC queries — comparable to the
+synthetic numbers at similar selectivity (~0.1% median sparsity here). But
+the **per-query schedule build is ~2.9 ms**, dominating the 0.046 ms search
+and pushing end-to-end to **0.22× of cuVS** — i.e. 4.5× slower overall.
+This is the per-query-filter regime: cuVS pays essentially nothing to
+construct a `bitset_filter` view from an already-built bitset; cu_roaring
+pays the upload (sort + container build + key-index) plus
+`build_schedule()` (enumerate_runs + container-dispatch kernels + the
+gather pre-pass).
+
+**Where this matters.** For "shared filter across a query batch" workloads
+(saved searches, ACL filters that apply to whole result pages, the
+synthetic configs above) the search-only number is the right one. For
+"each user's query has its own filter" workloads — and YFCC is exactly
+that — the build cost is in the hot path, so the right number is the
+end-to-end one, and **the schedule-driven path is not competitive with
+cuVS bitset on this workload as currently implemented**. Concrete next
+steps: (a) reduce upload cost (the YFCC tags here build a fresh GpuRoaring
++ direct-map key index per query — most of the 2.9 ms is upload, not
+schedule), (b) reuse a tag-bitmap GPU cache across queries (each YFCC
+tag bitmap is read by many queries — caching the upload once amortises
+it), (c) build the per-query intersection directly on the GPU from cached
+tag bitmaps (multi_and kernel already exists in cu_roaring).
+
+The **sorted-by-tag-tuple variant** is the natural complement here: when
+items with similar tag combinations are adjacent, tag bitmaps become
+contiguous → RUN containers → fewer containers + direct-range GEMM →
+both upload *and* search faster. That's the next experiment.
+
 ## Reproduce
 
 ```bash
