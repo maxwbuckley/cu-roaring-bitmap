@@ -76,6 +76,9 @@ struct SearchSchedule {
     uint32_t*             mask_pool   = nullptr;///< device, owned bitset masks
     uint64_t              total_cols  = 0;      ///< sum of task n_cols (the GEMM work)
     bool                  used_fallback = false;///< true if the shape gate forced a gather
+    bool                  scratched   = false;  ///< true if gather/mask buffers point into
+                                                ///< build_schedule()'s persistent scratch
+                                                ///< (free_schedule must not cudaFree them).
 };
 
 /**

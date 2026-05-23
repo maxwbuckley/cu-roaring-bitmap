@@ -483,11 +483,49 @@ void execute(cublasHandle_t handle, const float* d_queries, uint32_t q,
 // ---------------------------------------------------------------------------
 // Schedule construction
 // ---------------------------------------------------------------------------
+// Process-lifetime grow-only scratch for build_schedule. A filter built on the
+// hot path of a per-query workload (e.g. YFCC) hits build_schedule once per
+// query; using these scratch buffers means each call pays at most a no-op
+// growth check instead of three to five cudaMallocs + Frees through the async
+// allocator. Buffers grow geometrically; total scratch peaks at the worst-case
+// (largest filter) seen so far.
+namespace {
+struct BuildScratch {
+    uint32_t* gather_ids = nullptr;  size_t gather_ids_cap = 0;
+    float*    gather_db  = nullptr;  size_t gather_db_cap  = 0;  // bytes
+    uint32_t* mask_pool  = nullptr;  size_t mask_pool_cap  = 0;  // bytes
+    void*     d_srcs     = nullptr;  size_t d_srcs_cap     = 0;  // bytes
+    void*     d_ranges   = nullptr;  size_t d_ranges_cap   = 0;  // bytes
+    void*     d_roff     = nullptr;  size_t d_roff_cap     = 0;  // bytes
+
+    template <typename T>
+    void grow(T*& ptr, size_t& cap, size_t need_bytes)
+    {
+        if (need_bytes <= cap) return;
+        if (ptr) { CUDA_CHECK(cudaFree(ptr)); }
+        // Round up to next power of two for amortisation.
+        size_t new_cap = cap > 0 ? cap : 1;
+        while (new_cap < need_bytes) new_cap *= 2;
+        void* p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, new_cap));
+        ptr = static_cast<T*>(p);
+        cap = new_cap;
+    }
+};
+inline BuildScratch& build_scratch()
+{
+    static BuildScratch s;
+    return s;
+}
+}  // namespace
+
 SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
                               const float* d_db, uint32_t dim,
                               cudaStream_t stream)
 {
     SearchSchedule sched;
+    sched.scratched = true;
+    BuildScratch& sc = build_scratch();
     uint32_t nc = filter.n_containers;
 
     // Pull the container index to host (one-time, a few KB).
@@ -514,15 +552,21 @@ SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
     auto clamp_end = [&](uint32_t e) { return e < n_rows ? e : n_rows; };
 
     if (!filter.negated) {
-        // RUN containers -> coalesced contiguous ranges.
-        RunRanges rr = enumerate_runs(filter, stream);
-        if (rr.count > 0) {
+        // RUN containers -> coalesced contiguous ranges. Skip the whole
+        // enumerate_runs pipeline (4 kernels + 2 D2H scalar syncs, ~150-300us
+        // of host overhead on WSL2) when the filter has no RUN containers --
+        // e.g. anything built via upload_from_device_bitset or upload_from_ids.
+        RunRanges rr{nullptr, 0};
+        if (filter.n_run_containers > 0) {
+            rr = enumerate_runs(filter, stream);
             std::vector<IdRange> hr(rr.count);
-            CUDA_CHECK(cudaMemcpy(hr.data(), rr.ranges,
-                                  rr.count * sizeof(IdRange),
-                                  cudaMemcpyDeviceToHost));
-            for (auto& r : hr) {
-                if (r.start < n_rows) ranges.push_back({r.start, clamp_end(r.end)});
+            if (rr.count > 0) {
+                CUDA_CHECK(cudaMemcpy(hr.data(), rr.ranges,
+                                      rr.count * sizeof(IdRange),
+                                      cudaMemcpyDeviceToHost));
+                for (auto& r : hr) {
+                    if (r.start < n_rows) ranges.push_back({r.start, clamp_end(r.end)});
+                }
             }
         }
         free_run_ranges(rr);
@@ -577,11 +621,12 @@ SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
             if (!full_block) need_mask.push_back(c);
         }
 
-        // Build per-block exclusion masks.
+        // Build per-block exclusion masks (scratch).
         uint32_t* mask_pool = nullptr;
         if (!need_mask.empty()) {
-            CUDA_CHECK(cudaMalloc(&mask_pool,
-                                  need_mask.size() * 2048u * sizeof(uint32_t)));
+            sc.grow(sc.mask_pool, sc.mask_pool_cap,
+                    need_mask.size() * 2048u * sizeof(uint32_t));
+            mask_pool = sc.mask_pool;
         }
         sched.mask_pool = mask_pool;
         std::vector<const uint32_t*> mask_ptr(nc, nullptr);
@@ -655,26 +700,25 @@ SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
     n_gather += narrow_cols;
 
     if (n_gather > 0) {
-        CUDA_CHECK(cudaMalloc(&sched.gather_ids, n_gather * sizeof(uint32_t)));
-        sched.n_gather = static_cast<uint32_t>(n_gather);
+        sc.grow(sc.gather_ids, sc.gather_ids_cap, n_gather * sizeof(uint32_t));
+        sched.gather_ids = sc.gather_ids;
+        sched.n_gather   = static_cast<uint32_t>(n_gather);
 
         // Scattered-id sources.
         if (!gsrc.empty()) {
             uint32_t acc = 0;
             for (auto& s : gsrc) { s.out_off = acc; acc += s.card; }
-            GatherSrc* d_srcs = nullptr;
-            CUDA_CHECK(cudaMalloc(&d_srcs, gsrc.size() * sizeof(GatherSrc)));
-            CUDA_CHECK(cudaMemcpy(d_srcs, gsrc.data(),
-                                  gsrc.size() * sizeof(GatherSrc),
-                                  cudaMemcpyHostToDevice));
+            sc.grow(sc.d_srcs, sc.d_srcs_cap, gsrc.size() * sizeof(GatherSrc));
+            GatherSrc* d_srcs = static_cast<GatherSrc*>(sc.d_srcs);
+            CUDA_CHECK(cudaMemcpyAsync(d_srcs, gsrc.data(),
+                                       gsrc.size() * sizeof(GatherSrc),
+                                       cudaMemcpyHostToDevice, stream));
             emit_gather_ids_kernel<<<static_cast<uint32_t>(gsrc.size()),
                                      kBlock1D, 0, stream>>>(
                 d_srcs, static_cast<uint32_t>(gsrc.size()), filter.array_data,
                 reinterpret_cast<const uint32_t*>(filter.bitmap_data),
                 sched.gather_ids);
             CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            CUDA_CHECK(cudaFree(d_srcs));
         }
 
         // Expand the narrow ranges into the gather id list.
@@ -687,29 +731,26 @@ SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
                 acc += (r.end - r.start);
             }
             roff.push_back(acc);
-            IdRange*  d_ranges = nullptr;
-            uint64_t* d_roff   = nullptr;
-            CUDA_CHECK(cudaMalloc(&d_ranges, narrow.size() * sizeof(IdRange)));
-            CUDA_CHECK(cudaMalloc(&d_roff, roff.size() * sizeof(uint64_t)));
-            CUDA_CHECK(cudaMemcpy(d_ranges, narrow.data(),
-                                  narrow.size() * sizeof(IdRange),
-                                  cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(d_roff, roff.data(),
-                                  roff.size() * sizeof(uint64_t),
-                                  cudaMemcpyHostToDevice));
+            sc.grow(sc.d_ranges, sc.d_ranges_cap, narrow.size() * sizeof(IdRange));
+            sc.grow(sc.d_roff,   sc.d_roff_cap,   roff.size()   * sizeof(uint64_t));
+            IdRange*  d_ranges = static_cast<IdRange*>(sc.d_ranges);
+            uint64_t* d_roff   = static_cast<uint64_t*>(sc.d_roff);
+            CUDA_CHECK(cudaMemcpyAsync(d_ranges, narrow.data(),
+                                       narrow.size() * sizeof(IdRange),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(d_roff, roff.data(),
+                                       roff.size() * sizeof(uint64_t),
+                                       cudaMemcpyHostToDevice, stream));
             expand_ranges_kernel<<<static_cast<uint32_t>(narrow.size()),
                                    kBlock1D, 0, stream>>>(
                 d_ranges, d_roff, static_cast<uint32_t>(narrow.size()),
                 sched.gather_ids);
             CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            CUDA_CHECK(cudaFree(d_ranges));
-            CUDA_CHECK(cudaFree(d_roff));
         }
 
-        // Gather the rows into a compact buffer.
-        CUDA_CHECK(cudaMalloc(&sched.gather_db,
-                              n_gather * dim * sizeof(float)));
+        // Gather the rows into a compact buffer (scratched).
+        sc.grow(sc.gather_db, sc.gather_db_cap, n_gather * dim * sizeof(float));
+        sched.gather_db = sc.gather_db;
         gather_rows_kernel<<<grid1d(n_gather * dim), kBlock1D, 0, stream>>>(
             sched.gather_db, d_db, sched.gather_ids, sched.n_gather, dim);
         CUDA_CHECK(cudaGetLastError());
@@ -737,15 +778,18 @@ SearchSchedule build_schedule(const GpuRoaring& filter, uint32_t n_rows,
 
 void free_schedule(SearchSchedule& s)
 {
-    if (s.gather_ids) cudaFree(s.gather_ids);
-    if (s.gather_db)  cudaFree(s.gather_db);
-    if (s.mask_pool)  cudaFree(s.mask_pool);
+    if (!s.scratched) {
+        if (s.gather_ids) cudaFree(s.gather_ids);
+        if (s.gather_db)  cudaFree(s.gather_db);
+        if (s.mask_pool)  cudaFree(s.mask_pool);
+    }
     s.gather_ids = nullptr;
     s.gather_db  = nullptr;
     s.mask_pool  = nullptr;
     s.n_gather   = 0;
     s.tasks.clear();
     s.total_cols = 0;
+    s.scratched  = false;
 }
 
 // ---------------------------------------------------------------------------

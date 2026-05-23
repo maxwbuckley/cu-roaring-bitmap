@@ -2,14 +2,14 @@
   "gpu":"NVIDIA GeForce RTX 5090","n":10000000,"dim":192,"k":10,
   "sampled_queries":256,"skipped_empty":0,
   "card_median":15238,"card_mean":193203.6,
-  "cuvs_bitset_ms_median":0.7145,"cuvs_bitset_ms_mean":1.6099,
-  "roaring_search_ms_median":0.0501,"roaring_search_ms_mean":0.2043,
-  "roaring_build_ms_median":3.1420,"roaring_build_ms_mean":3.9219,
-  "roaring_endtoend_ms_median":3.3430,"roaring_endtoend_ms_mean":4.1262,
-  "roaring_build_gpu_ms_median":1.0405,"roaring_build_gpu_ms_mean":1.8758,
-  "roaring_endtoend_gpu_ms_median":1.1469,"roaring_endtoend_gpu_ms_mean":2.0801,
+  "cuvs_bitset_ms_median":0.8200,"cuvs_bitset_ms_mean":1.7198,
+  "roaring_search_ms_median":0.0495,"roaring_search_ms_mean":0.2037,
+  "roaring_build_ms_median":2.9473,"roaring_build_ms_mean":3.2227,
+  "roaring_endtoend_ms_median":3.0484,"roaring_endtoend_ms_mean":3.4263,
+  "roaring_build_gpu_ms_median":0.5276,"roaring_build_gpu_ms_mean":0.5907,
+  "roaring_endtoend_gpu_ms_median":0.5910,"roaring_endtoend_gpu_ms_mean":0.7944,
   "recall_at_k":1.0000,
-  "speedup_search_only":14.2495,
-  "speedup_endtoend_host":0.2137,
-  "speedup_endtoend_gpu":0.6230
+  "speedup_search_only":16.5686,
+  "speedup_endtoend_host":0.2690,
+  "speedup_endtoend_gpu":1.3874
 }

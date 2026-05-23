@@ -374,31 +374,66 @@ input. Drop-in change: 5 lines in the bench.
 
 | path | unsorted | sorted | recall@10 |
 |---|---|---|---|
-| **cuVS bitset** | 0.72 ms (1.4k QPS) | 0.71 ms | — |
-| roaring search only | 0.052 ms (19k QPS) | 0.050 ms (20k QPS) | 1.000 |
-| roaring build, **host AND + upload(bm,N)** | 3.06 ms | 3.14 ms | — |
-| roaring build, **`upload_from_device_bitset`** | **1.17 ms** | **1.04 ms** | — |
-| end-to-end **host path** | 3.11 ms (0.23×) | 3.34 ms (0.21×) | 1.000 |
-| end-to-end **GPU-bitset path** | **1.22 ms (0.60×)** | **1.15 ms (0.62×)** | 1.000 |
+| **cuVS bitset** | 0.76 ms (1.3k QPS) | 0.82 ms | — |
+| roaring search only | 0.049 ms (20k QPS) | 0.049 ms (20k QPS) | 1.000 |
+| roaring build, **host AND + upload(bm,N)** | 2.60 ms | 2.95 ms | — |
+| roaring build, **`upload_from_device_bitset`** (pre-opt) | 1.17 ms | 1.04 ms | — |
+| roaring build, **`upload_from_device_bitset` + opts 1+2** | **0.55 ms** | **0.53 ms** | — |
+| end-to-end **host path** | 2.65 ms (0.29×) | 3.05 ms (0.27×) | 1.000 |
+| end-to-end **GPU-bitset + opts 1+2** | **0.61 ms (1.24× cuVS)** | **0.59 ms (1.39× cuVS)** | 1.000 |
 
-The GPU-side construction cuts per-query build by **2.6×** and closes most
-of the end-to-end gap — schedule-driven is now ~1.6× of cuVS rather than
-4.5×, with the same correct top-10. The remaining ~1.1 ms is GPU-side
-infrastructure: ~10 kernel launches inside `upload_from_device_bitset` +
-`build_schedule` (gather setup, key-index build, enumerate_runs sync), at
-WSL2's per-launch latency. Further levers (none implemented):
+The GPU-side construction cuts per-query build to **0.55 ms** (5–6× cheaper
+than the original host path); with optimisations #1 and #2 below applied
+(implemented and committed), schedule-driven now **beats cuVS by 1.24–1.39×
+end-to-end** on real YFCC queries, with `recall@10 = 1.000` and the 15×
+search-only speedup intact. Optimisations applied:
+
+1. **Skip `enumerate_runs` when the filter has no RUN containers.** The
+   `upload_from_device_bitset` path produces only ARRAY/BITMAP containers
+   (see note below), so `enumerate_runs`'s 4 kernels + 2 D2H syncs are
+   pure overhead. Gating on `filter.n_run_containers > 0` saves ~150–300 µs
+   on WSL2.
+2. **Persistent grow-only scratch for `build_schedule`.** `gather_ids`,
+   `gather_db`, `mask_pool`, and the per-call temporaries (`d_srcs`,
+   `d_ranges`, `d_roff`) all become process-lifetime scratch buffers; the
+   `SearchSchedule` carries a `scratched` flag so `free_schedule` skips
+   the `cudaFree`. Saves ~5 `cudaMalloc`/`cudaFree` round-trips per call
+   and lets the H2D copies for descriptors go async.
+
+**Note on `run_optimize`.** The bitset-derived path **does not currently
+run-optimise**. `upload_from_device_bitset` always emits ARRAY (card ≤
+4096) or BITMAP (card > 4096) — CRoaring's run-detection is a separate
+`roaring_bitmap_run_optimize()` second-pass that scans containers for
+contiguous regions and converts to RUN where it'd be smaller. None of that
+runs on the GPU upload path today. The practical consequence is the
+result-5 finding: on the sorted YFCC layout the *individual tag bitmaps*
+compress 4000–7000× (e.g. `tag 1`: 535 KB → 75 bytes via host
+`run_optimize`), but the per-query AND result reaches the GPU executor as
+ARRAY/BITMAP only and the direct-range dispatch never fires. Future work:
+either add a GPU-side run-detection pass to `upload_from_device_bitset`
+(single scan per non-empty block counting transitions; emit RUN when the
+count is low) or a separate `run_optimize_gpu(GpuRoaring&)` post-pass.
+With RUN containers on a sorted-layout YFCC filter the direct-range path
+should fire for the largest tags, which would push the win further.
+
+Further levers (still not implemented):
 
 - **Pre-uploaded tag bitmaps + GPU-side multi-AND.** `cu_roaring::multi_and`
   already exists. For YFCC's 7910 query-relevant tags, upload all of them
   once at startup (memory: a few hundred MB), then build per-query
   filters with one `multi_and` call → directly a `GpuRoaring`, no upload
-  step at all. Cuts another ~1 ms.
-- **Scratch buffer reuse across queries.** `build_schedule` reallocates
-  the gather buffer per call; a `SearchSchedule` pool keyed by max
-  cardinality would amortise.
-- **Skip `enumerate_runs` when the input is known to be array/bitmap-only.**
-  The bitset path never produces RUN containers, so the run-enumeration
-  pass is wasted work.
+  step at all. Combined with the sorted layout (where individual tags
+  compress to tens of bytes), this is the lowest end-to-end achievable.
+- **GPU-side `run_optimize`.** Either inline in `upload_from_device_bitset`
+  (detect runs during the per-block scan) or as a post-pass on a built
+  `GpuRoaring`. Would make sorted-layout YFCC's tag-bitmap compression
+  benefit propagate into the *search* path, firing the direct-range
+  dispatch for the largest tags. Today the bitset path emits ARRAY/BITMAP
+  only.
+- **Kernel fusion in the construction pipeline.** The popcount-per-block,
+  type-classification, metadata-write, and data-emission steps all touch
+  the same per-block data once each; collapsing them into one
+  cooperative-group kernel cuts ~4 launches.
 
 For the sorted layout, the tag bitmaps themselves compress dramatically
 (`tag 1`: 535 KB → 75 bytes after `run_optimize`, 7100×). The end-to-end
