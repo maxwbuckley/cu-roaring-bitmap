@@ -30,6 +30,7 @@ struct SearchCase {
   uint32_t dim;
   uint32_t k;
   uint32_t topk;
+  bool use_tile = false;  // dense-tile kernel instead of the v1 scan
   std::vector<std::vector<uint32_t>> lanes;
   std::vector<float> dataset;  // host [q, dim]
   std::vector<float> queries;  // host [k, dim]
@@ -53,7 +54,10 @@ void run_case(const SearchCase& sc)
       l.data(), static_cast<uint32_t>(l.size()), sc.q));
 
   Mrm m = cu_roaring::mrm::mrm_build(bitmaps.data(), sc.k);
-  cu_roaring::mrm::mrm_search(m, d_data, sc.q, sc.dim, d_q, sc.topk, d_ids, d_out);
+  if (sc.use_tile)
+    cu_roaring::mrm::mrm_search_tile(m, d_data, sc.q, sc.dim, d_q, sc.topk, d_ids, d_out);
+  else
+    cu_roaring::mrm::mrm_search(m, d_data, sc.q, sc.dim, d_q, sc.topk, d_ids, d_out);
   ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
   std::vector<int64_t> h_ids((size_t)sc.k * sc.topk);
@@ -181,4 +185,46 @@ TEST(MrmSearch, FewerThanTopk)
 TEST(MrmSearch, SixtyFourLanes)
 {
   run_case(make_case(200000, 32, 64, 10, 0.01, "uniform", 8, 26));
+}
+
+// ---- dense-tile kernel (dim = 128) ----
+
+namespace {
+SearchCase tile_case(uint32_t q, uint32_t k, uint32_t topk, double s,
+                     const char* mode, uint32_t m_mult, uint64_t seed)
+{
+  SearchCase sc = make_case(q, 128, k, topk, s, mode, m_mult, seed);
+  sc.use_tile   = true;
+  return sc;
+}
+}  // namespace
+
+TEST(MrmSearchTile, UniformSparse)
+{
+  run_case(tile_case(300000, 16, 10, 0.005, "uniform", 1, 31));
+}
+
+TEST(MrmSearchTile, UniformDenseChunks)
+{
+  run_case(tile_case(200000, 8, 10, 0.05, "uniform", 1, 32));
+}
+
+TEST(MrmSearchTile, ContiguousShared)
+{
+  run_case(tile_case(300000, 16, 10, 0.01, "contiguous", 16, 33));
+}
+
+TEST(MrmSearchTile, ContiguousDistinct)
+{
+  run_case(tile_case(300000, 8, 10, 0.02, "contiguous", 1, 34));
+}
+
+TEST(MrmSearchTile, FewerThanTopk)
+{
+  run_case(tile_case(100000, 4, 10, 0.00005, "uniform", 1, 35));
+}
+
+TEST(MrmSearchTile, SixtyFourLanes)
+{
+  run_case(tile_case(200000, 64, 10, 0.01, "uniform", 8, 36));
 }

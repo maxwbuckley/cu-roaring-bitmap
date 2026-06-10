@@ -6,6 +6,7 @@ add_library(cu_roaring_mrm STATIC
     src/build.cu
     src/decode.cu
     src/search.cu
+    src/search_tile.cu
 )
 
 target_include_directories(cu_roaring_mrm

@@ -151,4 +151,17 @@ void mrm_search(const Mrm& m,
                 float* out_dists,
                 cudaStream_t stream = 0);
 
+// Dense-tile variant (design doc §4.2): 32-row x 64-lane GEMM tiles over the
+// compacted selected rows with a mask epilogue. Same contract as mrm_search;
+// dim must be 128 (template instantiation), topk <= 16.
+void mrm_search_tile(const Mrm& m,
+                     const float* dataset,
+                     uint32_t n_rows,
+                     uint32_t dim,
+                     const float* queries,
+                     uint32_t topk,
+                     int64_t* out_ids,
+                     float* out_dists,
+                     cudaStream_t stream = 0);
+
 }  // namespace cu_roaring::mrm
