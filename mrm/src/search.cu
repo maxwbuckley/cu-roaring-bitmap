@@ -67,15 +67,20 @@ __device__ static void topk_insert(float* dist, int64_t* id, uint32_t topk,
   id[pos]   = i;
 }
 
+// Grid: (n_chunks, n_segs). Each CTA covers one row-segment of one chunk for
+// all lanes, so occupancy scales with selected rows rather than chunk count
+// (1M rows is only 16 chunks; without segmentation the GPU starves).
 __global__ static void mrm_scan_kernel(MrmView view,
                                        const float* __restrict__ dataset,
                                        const float* __restrict__ queries,
                                        uint32_t dim,
                                        uint32_t topk,
+                                       uint32_t n_segs,
                                        float* __restrict__ cand_dists,
                                        int64_t* __restrict__ cand_ids)
 {
   uint32_t chunk = blockIdx.x;
+  uint32_t seg   = blockIdx.y;
   if (chunk >= view.n_chunks) return;
   uint32_t warp = threadIdx.x >> 5;
   uint32_t lane = threadIdx.x & 31u;
@@ -83,6 +88,26 @@ __global__ static void mrm_scan_kernel(MrmView view,
   const MrmContainerDesc d = view.descs[chunk];
   uint64_t base_id         = static_cast<uint64_t>(d.key) << 16;
   auto type                = static_cast<MrmContainerType>(d.type);
+
+  // BITMAP segments split the 1024 words; the segment's starting rank (index
+  // into the rank-ordered masks array) is the popcount of all words before
+  // it — computed once per CTA by warp 0.
+  __shared__ uint32_t s_rank_base;
+  uint32_t w_lo = 0, w_hi = 0;
+  if (type == MrmContainerType::BITMAP_MASKED) {
+    w_lo = seg * 1024 / n_segs;
+    w_hi = (seg + 1) * 1024 / n_segs;
+    if (threadIdx.x < 32) {
+      const uint64_t* words = view.bitmap_words(d);
+      uint32_t acc          = 0;
+      for (uint32_t w = lane; w < w_lo; w += 32)
+        acc += static_cast<uint32_t>(__popcll(words[w]));
+      for (uint32_t off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+      if (lane == 0) s_rank_base = acc;
+    }
+    __syncthreads();
+  }
 
   for (uint32_t L = warp; L < view.n_lanes; L += WARPS) {
     mask_t lane_bit      = mask_t{1} << L;
@@ -97,7 +122,9 @@ __global__ static void mrm_scan_kernel(MrmView view,
     if (type == MrmContainerType::ARRAY_MASKED) {
       const uint16_t* ids = view.array_ids(d);
       const mask_t* masks = view.array_masks(d);
-      for (uint32_t i = 0; i < d.n; ++i) {
+      uint32_t lo         = seg * d.n / n_segs;
+      uint32_t hi         = (seg + 1) * d.n / n_segs;
+      for (uint32_t i = lo; i < hi; ++i) {
         if ((masks[i] & lane_bit) == 0) continue;
         uint64_t row_id = base_id | ids[i];
         float dot = warp_dot(dataset + row_id * dim, query, dim);
@@ -106,8 +133,8 @@ __global__ static void mrm_scan_kernel(MrmView view,
     } else if (type == MrmContainerType::BITMAP_MASKED) {
       const uint64_t* words = view.bitmap_words(d);
       const mask_t* masks   = view.bitmap_masks(d);
-      uint32_t rank         = 0;
-      for (uint32_t w = 0; w < 1024; ++w) {
+      uint32_t rank         = s_rank_base;
+      for (uint32_t w = w_lo; w < w_hi; ++w) {
         uint64_t word = words[w];
         while (word != 0) {
           uint32_t bit = static_cast<uint32_t>(__ffsll(static_cast<long long>(word))) - 1;
@@ -121,15 +148,20 @@ __global__ static void mrm_scan_kernel(MrmView view,
           word &= word - 1;
         }
       }
-    } else {  // RUN_MASKED: constant mask per run -> whole-run take or skip
+    } else {  // RUN_MASKED: constant mask per run -> whole-run take or skip.
+      // Runs can be 64K elements long (one run per chunk in the shared
+      // multitenant case), so each segment takes a slice of EVERY run rather
+      // than a slice of the run list.
       const uint16_t* starts = view.run_starts(d);
       const uint16_t* lens   = view.run_lens(d);
       const mask_t* masks    = view.run_masks(d);
       for (uint32_t r = 0; r < d.n; ++r) {
         if ((masks[r] & lane_bit) == 0) continue;
+        uint32_t count = static_cast<uint32_t>(lens[r]) + 1;
+        uint32_t e_lo  = seg * count / n_segs;
+        uint32_t e_hi  = (seg + 1) * count / n_segs;
         uint32_t start = starts[r];
-        uint32_t end   = start + lens[r];
-        for (uint32_t v = start; v <= end; ++v) {
+        for (uint32_t v = start + e_lo; v < start + e_hi; ++v) {
           uint64_t row_id = base_id | v;
           float dot = warp_dot(dataset + row_id * dim, query, dim);
           if (lane == 0) topk_insert(top_d, top_i, topk, dot, static_cast<int64_t>(row_id));
@@ -138,7 +170,8 @@ __global__ static void mrm_scan_kernel(MrmView view,
     }
 
     if (lane == 0) {
-      uint64_t slot = (static_cast<uint64_t>(chunk) * view.n_lanes + L) * topk;
+      uint64_t slot =
+        ((static_cast<uint64_t>(chunk) * n_segs + seg) * view.n_lanes + L) * topk;
       for (uint32_t t = 0; t < topk; ++t) {
         cand_dists[slot + t] = top_d[t];
         cand_ids[slot + t]   = top_i[t];
@@ -147,7 +180,7 @@ __global__ static void mrm_scan_kernel(MrmView view,
   }
 }
 
-__global__ static void mrm_merge_kernel(uint32_t n_chunks,
+__global__ static void mrm_merge_kernel(uint32_t n_lists,
                                         uint32_t n_lanes,
                                         uint32_t topk,
                                         const float* __restrict__ cand_dists,
@@ -163,7 +196,7 @@ __global__ static void mrm_merge_kernel(uint32_t n_chunks,
     top_d[t] = -FLT_MAX;
     top_i[t] = -1;
   }
-  for (uint32_t c = 0; c < n_chunks; ++c) {
+  for (uint32_t c = 0; c < n_lists; ++c) {
     uint64_t slot = (static_cast<uint64_t>(c) * n_lanes + L) * topk;
     for (uint32_t t = 0; t < topk; ++t) {
       int64_t id = cand_ids[slot + t];
@@ -196,17 +229,23 @@ void mrm_search(const Mrm& m,
   uint32_t k = m.view.n_lanes;
   if (C == 0) return;
 
+  // Segment chunks so CTA count tracks selected rows, not chunk count.
+  uint32_t n_segs = 4096 / C;
+  if (n_segs < 1) n_segs = 1;
+  if (n_segs > 64) n_segs = 64;
+
   float* cand_dists = nullptr;
   int64_t* cand_ids = nullptr;
-  uint64_t slots    = static_cast<uint64_t>(C) * k * topk;
+  uint64_t slots    = static_cast<uint64_t>(C) * n_segs * k * topk;
   MRM_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&cand_dists), slots * 4, stream));
   MRM_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&cand_ids), slots * 8, stream));
 
-  mrm_scan_kernel<<<C, BLOCK, 0, stream>>>(
-    m.view, dataset, queries, dim, topk, cand_dists, cand_ids);
+  dim3 grid(C, n_segs);
+  mrm_scan_kernel<<<grid, BLOCK, 0, stream>>>(
+    m.view, dataset, queries, dim, topk, n_segs, cand_dists, cand_ids);
   MRM_CUDA_CHECK(cudaGetLastError());
   mrm_merge_kernel<<<k, 32, 0, stream>>>(
-    C, k, topk, cand_dists, cand_ids, out_dists, out_ids);
+    C * n_segs, k, topk, cand_dists, cand_ids, out_dists, out_ids);
   MRM_CUDA_CHECK(cudaGetLastError());
 
   MRM_CUDA_CHECK(cudaFreeAsync(cand_dists, stream));
