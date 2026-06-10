@@ -30,6 +30,7 @@
 
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
 
 namespace cu_roaring::mrm {
 
@@ -73,12 +74,19 @@ struct Producer {
   uint32_t r_run, r_off;  // current run index, offset within its slice
 };
 
+// ablate: 0 = full kernel; 1 = skip in-CTA merge (no output; timing only);
+// 2 = additionally skip the dot+insert compute (producer + row loads only);
+// 3 = additionally skip row loads (producer only); 4 = additionally skip
+// the producer body (pure launch + query staging + init overhead).
+// Used to attribute kernel time on machines where ncu counters are
+// unavailable (WSL ERR_NVGPUCTRPERM).
 template <int DIM>
 __global__ static void mrm_tile_kernel(MrmView view,
                                        const float* __restrict__ dataset,
                                        const float* __restrict__ queries,
                                        uint32_t topk,
                                        uint32_t n_segs,
+                                       uint32_t ablate,
                                        float* __restrict__ cand_dists,
                                        int64_t* __restrict__ cand_ids)
 {
@@ -146,6 +154,10 @@ __global__ static void mrm_tile_kernel(MrmView view,
     // ---- produce next tile (thread 0, serial; tiny vs the GEMM tile) ----
     if (tid == 0) {
       uint32_t count = 0;
+      if (ablate >= 4) {
+        prod.a_i = prod.a_end = prod.b_w = prod.b_wend = 0;
+        prod.r_run = 0xFFFFFFFFu;
+      }
       if (type == MrmContainerType::ARRAY_MASKED) {
         const uint16_t* ids = view.array_ids(dsc);
         const mask_t* masks = view.array_masks(dsc);
@@ -200,15 +212,17 @@ __global__ static void mrm_tile_kernel(MrmView view,
     if (count == 0) break;
 
     // ---- cooperative row load (padded to kill bank conflicts) ----
-    for (uint32_t idx = tid; idx < count * DIM; idx += TBLOCK) {
-      uint32_t r = idx / DIM;
-      uint32_t j = idx % DIM;
-      srow(r)[j] = dataset[(base_id | sid[r]) * DIM + j];
+    if (ablate < 3) {
+      for (uint32_t idx = tid; idx < count * DIM; idx += TBLOCK) {
+        uint32_t r = idx / DIM;
+        uint32_t j = idx % DIM;
+        srow(r)[j] = dataset[(base_id | sid[r]) * DIM + j];
+      }
     }
     __syncthreads();
 
     // ---- 32x64 dense tile: 8 dots per thread ----
-    if (row_slot < count) {
+    if (row_slot < count && ablate < 2) {
       float acc[LANES_PER_THREAD];
 #pragma unroll
       for (uint32_t l = 0; l < LANES_PER_THREAD; ++l)
@@ -236,6 +250,7 @@ __global__ static void mrm_tile_kernel(MrmView view,
   // For each (group, lane-within-group): the group's 32 threads stage their
   // per-thread lists into the (now idle) row region; one thread selects the
   // CTA-level top-k for that lane. 64 short iterations.
+  if (ablate >= 1) return;
   for (uint32_t g = 0; g < LANE_GROUPS; ++g) {
     for (uint32_t l = 0; l < LANES_PER_THREAD; ++l) {
       __syncthreads();
@@ -356,9 +371,14 @@ void mrm_search_tile(const Mrm& m,
     attr_set = true;
   }
 
+  static const uint32_t ablate = [] {
+    const char* e = getenv("MRM_TILE_ABLATE");
+    return e ? static_cast<uint32_t>(atoi(e)) : 0u;
+  }();
+
   dim3 grid(C, n_segs);
   mrm_tile_kernel<DIM><<<grid, TBLOCK, smem_bytes, stream>>>(
-    m.view, dataset, queries, topk, n_segs, cand_dists, cand_ids);
+    m.view, dataset, queries, topk, n_segs, ablate, cand_dists, cand_ids);
   MRM_CUDA_CHECK(cudaGetLastError());
   tile_merge_kernel<<<k, 32, 0, stream>>>(
     C * n_segs, k, topk, cand_dists, cand_ids, out_dists, out_ids);

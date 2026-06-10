@@ -62,9 +62,37 @@ Tests are CPU-reference property tests over every input container-type
 pairing (array/bitmap/run), boundary ids, empty lanes, full chunks, 64
 lanes, and the shared-filter case that must collapse to `RUN_MASKED`.
 
+## Search kernels: measured status (both lose to the SDDMM MVP)
+
+`mrm_search` (v1 lane-major scan) and `mrm_search_tile` (v2 dense 32×64
+smem tile) are oracle-correct but slower than the batched-CSR + cusparse
+SDDMM + sparse select_k pipeline in every benchmarked config.
+
+Ablation attribution for the tile kernel at 1M rows / s=0.1 / 64 shared
+lanes (23.4 ms total; `MRM_TILE_ABLATE=1..4` skips phases cumulatively —
+ncu is unavailable on this WSL box, ERR_NVGPUCTRPERM):
+
+| phase | ms | share |
+|---|---|---|
+| in-CTA per-lane merge (64 serial selections, 2 barriers each) | 11.3 | 48% |
+| final merge kernel (1 thread/lane over 1024 lists) + launch overhead | 6.9 | 30% |
+| cooperative row loads into smem | 2.6 | 11% |
+| dot products + top-k inserts | 2.1 | 9% |
+| serial tile producer | 0.4 | 2% |
+
+**~78% is top-k reduction, not math.** v3 requirements, in order: (1)
+collapse the reduction — far fewer segment lists (size CTAs to fill the
+GPU, not 64×chunks), parallel warp-level merges in-CTA, one warp (not one
+thread) per lane in the final merge; (2) occupancy — 50 KB smem caps the
+kernel at 2 CTAs/SM and every phase is latency-bound (row loads run 20x
+over the DRAM floor); shrink smem (queries fit L2 — consider not staging
+them) and double-buffer tiles; (3) only then revisit the FMA micro-kernel
+(register-block the query operand) and WMMA on RUN slabs.
+
 ## Status / next
 
 - [x] Phase 2: construction + tests + construction-cost bench
-- [ ] Phase 3: fused compute kernels (RUN_MASKED slab GEMM, BITMAP_MASKED
-      dense tile, ARRAY_MASKED data-major scan) + top-k reduce
+- [x] Phase 3 v1 (scan) + v2 (dense tile): correct, benchmarked, both
+      negative; ablation attribution above
+- [ ] Phase 3 v3: reduction collapse + occupancy (see table)
 - [ ] k > 64 via query tiles (Phase 4 grouping)
