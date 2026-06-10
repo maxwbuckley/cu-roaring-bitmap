@@ -130,4 +130,25 @@ void mrm_decode(const Mrm& m,
                 std::vector<mask_t>& masks,
                 cudaStream_t stream = 0);
 
+// ----------------------------------------------------------------------------
+// Fused filtered search (Phase 3): exact top-k inner products of each lane's
+// query against exactly the rows its filter selects, straight off the MRM.
+// No dense bitmap, no CSR, no nnz-sized value materialization.
+//
+// dataset: [n_rows, dim] fp32 row-major (device). queries: [n_lanes, dim]
+// fp32 row-major (device). out_ids/out_dists: [n_lanes, topk] (device),
+// descending by inner product; out_ids padded with -1 when a lane selects
+// fewer than topk rows. dim <= 512 (queries staged in shared memory).
+// topk <= 32. Reusable scratch is allocated/freed per call.
+// ----------------------------------------------------------------------------
+void mrm_search(const Mrm& m,
+                const float* dataset,
+                uint32_t n_rows,
+                uint32_t dim,
+                const float* queries,
+                uint32_t topk,
+                int64_t* out_ids,
+                float* out_dists,
+                cudaStream_t stream = 0);
+
 }  // namespace cu_roaring::mrm

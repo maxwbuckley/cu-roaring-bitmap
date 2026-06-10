@@ -5,6 +5,7 @@
 add_library(cu_roaring_mrm STATIC
     src/build.cu
     src/decode.cu
+    src/search.cu
 )
 
 target_include_directories(cu_roaring_mrm
@@ -32,13 +33,15 @@ option(CU_ROARING_MRM_BUILD_TESTS      "Build MRM tests"      ON)
 option(CU_ROARING_MRM_BUILD_BENCHMARKS "Build MRM benchmarks" ON)
 
 if(CU_ROARING_MRM_BUILD_TESTS AND TARGET GTest::gtest_main)
-    add_executable(test_mrm test/test_mrm.cu)
-    target_link_libraries(test_mrm PRIVATE cu_roaring_mrm GTest::gtest_main)
-    set_target_properties(test_mrm PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-    if(COMMAND cu_roaring_target_strict_warnings)
-        cu_roaring_target_strict_warnings(test_mrm)
-    endif()
-    add_test(NAME test_mrm COMMAND test_mrm)
+    foreach(t test_mrm test_mrm_search)
+        add_executable(${t} test/${t}.cu)
+        target_link_libraries(${t} PRIVATE cu_roaring_mrm GTest::gtest_main)
+        set_target_properties(${t} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+        if(COMMAND cu_roaring_target_strict_warnings)
+            cu_roaring_target_strict_warnings(${t})
+        endif()
+        add_test(NAME ${t} COMMAND ${t})
+    endforeach()
 endif()
 
 if(CU_ROARING_MRM_BUILD_BENCHMARKS)
