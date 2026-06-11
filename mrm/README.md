@@ -109,11 +109,33 @@ all shapes. Proper fix: device-side adaptive work partitioning
 (persistent CTAs / work stealing), plus ncu once GPU counters are
 enabled (Windows toggle) for the remaining latency-bound compute.
 
+### ncu profile of v3 (counters enabled) — register-bound, occupancy is structural
+
+With GPU performance counters enabled, ncu at 1M/s=0.1/m=64 shows the v3
+tile kernel at **1 CTA/SM** (`Block Limit Registers = 1`, >128
+regs/thread from the unrolled register top-k; theoretical and achieved
+occupancy 16.7%), issue rate 0.22 warps/scheduler/cycle, eligible
+warps 0.27, SM 23%, DRAM 44% — pure latency exposure. Forcing occupancy
+via `__launch_bounds__` was tried and **regressed**: minBlocks=3 (≤85
+regs) made every config 1.6–2.3x slower (10M/s=0.1/m=64: 43.9→103 ms);
+minBlocks=2 (≤128 regs) still 1.1–1.6x slower. The register-resident
+top-k is what makes the epilogue fast, and it is also what caps
+occupancy — spilling it costs more than the extra warps buy.
+
+Conclusion: further gains need a structural epilogue change (v5), e.g.
+per-warp shared-memory top-k with periodic warp merges, or fewer lanes
+per thread (more CTAs, each thinner), so register demand drops without
+spilling the hot path. The launch-bounds experiments are deliberately
+not kept in the code.
+
 ## Status / next
 
 - [x] Phase 2: construction + tests + construction-cost bench
 - [x] Phase 3 v1 (scan) + v2 (dense tile) + v3 (occupancy + shuffle
       reduction): correct, benchmarked; best-case gap to the SDDMM MVP
       now 1.35–1.7x, but no config where the fused kernel wins
-- [ ] Phase 3 v4: device-side adaptive segmentation + ncu-guided compute
+- [x] ncu profile: register-bound at 1 CTA/SM; launch-bounds forcing
+      regresses (see above)
+- [ ] Phase 3 v5: epilogue redesign for occupancy (per-warp smem top-k
+      or narrower lane ownership) + device-side adaptive segmentation
 - [ ] k > 64 via query tiles (Phase 4 grouping)
