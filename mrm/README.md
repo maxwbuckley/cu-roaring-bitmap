@@ -89,10 +89,31 @@ over the DRAM floor); shrink smem (queries fit L2 — consider not staging
 them) and double-buffer tiles; (3) only then revisit the FMA micro-kernel
 (register-block the query operand) and WMMA on RUN slabs.
 
+## Phase 3 v3 (reduction collapse + occupancy) — implemented, still loses
+
+v3 applied the ablation work order: queries no longer staged in smem
+(~17 KB/CTA, ~3x occupancy), register-resident top-k (fully unrolled
+predicated bubble insert), in-CTA reduction as a per-warp `__shfl` tree
+(warp g exclusively owns lanes 8g..8g+7 — zero barriers, zero smem),
+final merge one warp per lane, and CTA count sized to ~128 (measured
+optimum; `MRM_TILE_SEGS` overrides).
+
+Result: 2–14x faster than v2 on uniform/zipf shared-filter configs
+(best: 10M/s=0.001/m=64 25.7→1.85 ms; 10M/s=0.1/m=64 140→43.9 ms, now
+1.68x from P1), oracle-correct throughout — but **0/48 wins vs P1**.
+Contiguous-clustered configs regressed under the new segment default
+(few dense chunks want many segments; sparse many-chunk workloads want
+few): the right segmentation depends on per-chunk union cardinality,
+which only the device knows — a host heuristic cannot pick one value for
+all shapes. Proper fix: device-side adaptive work partitioning
+(persistent CTAs / work stealing), plus ncu once GPU counters are
+enabled (Windows toggle) for the remaining latency-bound compute.
+
 ## Status / next
 
 - [x] Phase 2: construction + tests + construction-cost bench
-- [x] Phase 3 v1 (scan) + v2 (dense tile): correct, benchmarked, both
-      negative; ablation attribution above
-- [ ] Phase 3 v3: reduction collapse + occupancy (see table)
+- [x] Phase 3 v1 (scan) + v2 (dense tile) + v3 (occupancy + shuffle
+      reduction): correct, benchmarked; best-case gap to the SDDMM MVP
+      now 1.35–1.7x, but no config where the fused kernel wins
+- [ ] Phase 3 v4: device-side adaptive segmentation + ncu-guided compute
 - [ ] k > 64 via query tiles (Phase 4 grouping)

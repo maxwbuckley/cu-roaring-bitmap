@@ -2,28 +2,32 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  *
- * MRM fused filtered search, dense-tile kernel (Phase 3 v2, design doc §4.2).
+ * MRM fused filtered search, dense-tile kernel (Phase 3 v3).
  *
- * The v1 lane-major scan (search.cu) re-traverses each container per lane
- * and pays a warp reduction per (row, lane) pair — measured 2.2-78x slower
- * than the SDDMM MVP. This kernel instead treats each 32-row tile of the
- * chunk's *compacted* selected rows as a dense GEMM tile against the full
- * 64-lane query block:
+ * v2 ablation (see mrm/README.md) attributed 78% of kernel time to top-k
+ * reduction (serial in-CTA merge + single-thread final merge) and showed
+ * every phase latency-bound at 2 CTAs/SM (50 KB smem). v3 changes:
  *
- *   - queries [64, 128] staged once per CTA in shared memory
- *   - a serial producer (thread 0) emits the next 32 (row id, mask) pairs
- *     from the container (array slice / bitmap rank walk / run slice)
- *   - all threads cooperatively load the 32 rows into padded smem
- *   - thread (row_slot r, lane_group g) computes 8 dots (lanes 8g..8g+7)
- *     with 8 FMAs per smem row element — no shuffles, no re-reads
- *   - mask epilogue drops non-selected (row, lane) pairs at insert time;
- *     wasted FLOPs are bounded by tile mask density (zero waste when all
- *     lanes share the filter)
- *   - per-thread top-k registers; end-of-segment in-CTA merge produces one
- *     top-k list per (chunk-segment, lane), folded by the same merge
- *     kernel as v1
+ *  - queries are no longer staged in shared memory: the 64xDIM block
+ *    (<=32 KB) is L1-resident and read with warp-uniform addresses; smem
+ *    drops to ~17 KB -> ~3x more resident CTAs. The host pads queries to
+ *    64 rows so dead lanes read zeros instead of out-of-bounds.
+ *  - per-thread top-k is a fully unrolled predicated bubble insert over
+ *    MAX_TOPK_T register slots (no dynamic indexing -> stays in
+ *    registers), which makes warp shuffle merging possible.
+ *  - the in-CTA merge exploits lane ownership: warp g exclusively owns
+ *    lanes 8g..8g+7, so its 32 per-thread lists fold with a 5-round
+ *    __shfl tree, zero shared memory, zero block barriers (v2 spent
+ *    11.3 ms here on 64 barrier-separated serial selections).
+ *  - the final merge kernel uses one warp per lane (strided scan +
+ *    shuffle tree) instead of one thread per lane (v2: 6.9 ms).
  *
- * fp32 inner product, dim == 128 (template), n_lanes <= 64, topk <= 32.
+ * Tile compute is unchanged from v2: a serial producer emits 32-row
+ * (id, mask) tiles from the container, rows are cooperatively staged in
+ * padded smem, thread (row_slot, group) computes 8 lanes' dots with 8
+ * FMAs per smem element, mask epilogue at insert time.
+ *
+ * fp32 inner product, dim == 128 (template), n_lanes <= 64, topk <= 16.
  */
 
 #include <cu_roaring_mrm/mrm.cuh>
@@ -35,10 +39,11 @@
 namespace cu_roaring::mrm {
 
 static constexpr uint32_t TILE_ROWS = 32;
-static constexpr uint32_t LANE_GROUPS = 8;   // 8 lanes per thread
+static constexpr uint32_t LANE_GROUPS = 8;   // warps per CTA
 static constexpr uint32_t LANES_PER_THREAD = 8;
-static constexpr uint32_t TBLOCK = 256;      // TILE_ROWS * LANE_GROUPS
-static constexpr uint32_t MAX_TOPK_T = 16;   // per-thread top-k capacity
+static constexpr uint32_t TBLOCK = 256;
+static_assert(TBLOCK == TILE_ROWS * LANE_GROUPS, "one warp per lane group");
+static constexpr int MAX_TOPK_T = 16;        // register top-k slots
 
 #define MRM_CUDA_CHECK(call)                                                      \
   do {                                                                            \
@@ -50,40 +55,59 @@ static constexpr uint32_t MAX_TOPK_T = 16;   // per-thread top-k capacity
     }                                                                             \
   } while (0)
 
-__device__ static void tk_insert(float* dist, int32_t* id, uint32_t topk,
-                                 float d, int32_t i)
+// Fully unrolled descending-order insert: compile-time indices only, so the
+// arrays live in registers. The candidate bubbles down; the previous last
+// element falls off.
+__device__ static inline void reg_insert(float (&d)[MAX_TOPK_T],
+                                         int32_t (&i)[MAX_TOPK_T],
+                                         float nd,
+                                         int32_t ni)
 {
-  if (d <= dist[topk - 1]) return;
-  uint32_t pos = topk - 1;
-  while (pos > 0 && dist[pos - 1] < d) {
-    dist[pos] = dist[pos - 1];
-    id[pos]   = id[pos - 1];
-    --pos;
+  if (nd <= d[MAX_TOPK_T - 1]) return;
+#pragma unroll
+  for (int t = 0; t < MAX_TOPK_T; ++t) {
+    bool sw     = nd > d[t];
+    float td    = sw ? nd : d[t];
+    int32_t ti  = sw ? ni : i[t];
+    nd          = sw ? d[t] : nd;
+    ni          = sw ? i[t] : ni;
+    d[t]        = td;
+    i[t]        = ti;
   }
-  dist[pos] = d;
-  id[pos]   = i;
+}
+
+// Fold the 32 sorted register lists of a warp into lane 0's list via a
+// shuffle tree. All threads participate in the shuffles; inserts are
+// predicated on being a receiving thread.
+__device__ static inline void warp_topk_merge(float (&d)[MAX_TOPK_T],
+                                              int32_t (&i)[MAX_TOPK_T],
+                                              uint32_t lane)
+{
+#pragma unroll
+  for (uint32_t step = 16; step > 0; step >>= 1) {
+#pragma unroll
+    for (int j = 0; j < MAX_TOPK_T; ++j) {
+      float pd   = __shfl_down_sync(0xffffffffu, d[j], step);
+      int32_t pi = __shfl_down_sync(0xffffffffu, i[j], step);
+      if (lane < step && pi >= 0) reg_insert(d, i, pd, pi);
+    }
+  }
 }
 
 // Producer state for "next TILE_ROWS (low16 id, mask) pairs of this segment".
 struct Producer {
-  // ARRAY: [lo, hi) index range. BITMAP: word range + running rank.
-  // RUN: per-run element slices.
   uint32_t a_i, a_end;
   uint32_t b_w, b_wend, b_rank;
   uint64_t b_word;
-  uint32_t r_run, r_off;  // current run index, offset within its slice
+  uint32_t r_run, r_off;
 };
 
-// ablate: 0 = full kernel; 1 = skip in-CTA merge (no output; timing only);
-// 2 = additionally skip the dot+insert compute (producer + row loads only);
-// 3 = additionally skip row loads (producer only); 4 = additionally skip
-// the producer body (pure launch + query staging + init overhead).
-// Used to attribute kernel time on machines where ncu counters are
-// unavailable (WSL ERR_NVGPUCTRPERM).
+// ablate: 0 = full; 1 = skip merges/output (timing); 2 = + skip compute;
+// 3 = + skip row loads; 4 = + skip producer body.
 template <int DIM>
 __global__ static void mrm_tile_kernel(MrmView view,
                                        const float* __restrict__ dataset,
-                                       const float* __restrict__ queries,
+                                       const float* __restrict__ queries,  // [64, DIM] padded
                                        uint32_t topk,
                                        uint32_t n_segs,
                                        uint32_t ablate,
@@ -95,40 +119,28 @@ __global__ static void mrm_tile_kernel(MrmView view,
   if (chunk >= view.n_chunks) return;
   uint32_t tid      = threadIdx.x;
   uint32_t row_slot = tid & (TILE_ROWS - 1);
-  uint32_t group    = tid >> 5;  // tid / TILE_ROWS
+  uint32_t group    = tid >> 5;
 
   const MrmContainerDesc dsc = view.descs[chunk];
   uint64_t base_id           = static_cast<uint64_t>(dsc.key) << 16;
   auto type                  = static_cast<MrmContainerType>(dsc.type);
 
   extern __shared__ float smem[];
-  float* sq    = smem;                          // [64][DIM]
-  float* srows = sq + 64 * DIM;                 // [TILE_ROWS][DIM+1] padded
+  float* srows = smem;  // [TILE_ROWS][DIM+1] padded
   auto srow    = [&](uint32_t r) { return srows + r * (DIM + 1); };
-  uint32_t* sid   = reinterpret_cast<uint32_t*>(srows + TILE_ROWS * (DIM + 1));
-  mask_t* smask   = reinterpret_cast<mask_t*>(sid + TILE_ROWS);  // 8B aligned ok
+  uint32_t* sid    = reinterpret_cast<uint32_t*>(srows + TILE_ROWS * (DIM + 1));
+  mask_t* smask    = reinterpret_cast<mask_t*>(sid + TILE_ROWS);
   uint32_t* scount = reinterpret_cast<uint32_t*>(smask + TILE_ROWS);
-  // merge staging reuses the srows region after the segment loop
-  float* stage_d  = srows;
-  int32_t* stage_i = reinterpret_cast<int32_t*>(srows + TILE_ROWS * MAX_TOPK_T);
 
-  // stage queries (lanes beyond n_lanes are zero -> their dots are 0 and
-  // never inserted because no mask bit can be set for them)
-  for (uint32_t idx = tid; idx < 64 * DIM; idx += TBLOCK)
-    sq[idx] = (idx / DIM) < view.n_lanes ? queries[idx] : 0.0f;
-
-  // per-thread top-k for 8 lanes (local memory)
+  // per-thread top-k for 8 lanes (local memory; folded via registers at end)
   float tk_d[LANES_PER_THREAD][MAX_TOPK_T];
   int32_t tk_i[LANES_PER_THREAD][MAX_TOPK_T];
   for (uint32_t l = 0; l < LANES_PER_THREAD; ++l)
-    for (uint32_t t = 0; t < topk; ++t) {
+    for (int t = 0; t < MAX_TOPK_T; ++t) {
       tk_d[l][t] = -FLT_MAX;
       tk_i[l][t] = -1;
     }
 
-  // segment bounds + producer init (thread 0 owns producer state in smem? it
-  // is cheaper to recompute in registers of thread 0 only; communicated via
-  // sid/smask/scount each tile)
   __shared__ Producer prod;
   if (tid == 0) {
     if (type == MrmContainerType::ARRAY_MASKED) {
@@ -147,6 +159,10 @@ __global__ static void mrm_tile_kernel(MrmView view,
       prod.r_run = 0;
       prod.r_off = 0;
     }
+    if (ablate >= 4) {
+      prod.a_i = prod.a_end = prod.b_w = prod.b_wend = 0;
+      prod.r_run = 0xFFFFFFFFu;
+    }
   }
   __syncthreads();
 
@@ -154,10 +170,6 @@ __global__ static void mrm_tile_kernel(MrmView view,
     // ---- produce next tile (thread 0, serial; tiny vs the GEMM tile) ----
     if (tid == 0) {
       uint32_t count = 0;
-      if (ablate >= 4) {
-        prod.a_i = prod.a_end = prod.b_w = prod.b_wend = 0;
-        prod.r_run = 0xFFFFFFFFu;
-      }
       if (type == MrmContainerType::ARRAY_MASKED) {
         const uint16_t* ids = view.array_ids(dsc);
         const mask_t* masks = view.array_masks(dsc);
@@ -221,73 +233,61 @@ __global__ static void mrm_tile_kernel(MrmView view,
     }
     __syncthreads();
 
-    // ---- 32x64 dense tile: 8 dots per thread ----
+    // ---- 32x64 dense tile: 8 dots per thread; queries read via L1 ----
     if (row_slot < count && ablate < 2) {
       float acc[LANES_PER_THREAD];
 #pragma unroll
       for (uint32_t l = 0; l < LANES_PER_THREAD; ++l)
         acc[l] = 0.0f;
       const float* rp = srow(row_slot);
+      const float* qp = queries + group * LANES_PER_THREAD * DIM;
 #pragma unroll 4
       for (uint32_t j = 0; j < DIM; ++j) {
         float rv = rp[j];
 #pragma unroll
         for (uint32_t l = 0; l < LANES_PER_THREAD; ++l)
-          acc[l] += rv * sq[(group * LANES_PER_THREAD + l) * DIM + j];
+          acc[l] += rv * __ldg(&qp[l * DIM + j]);
       }
       mask_t mask = smask[row_slot];
       int32_t low = static_cast<int32_t>(sid[row_slot]);
 #pragma unroll
       for (uint32_t l = 0; l < LANES_PER_THREAD; ++l) {
         uint32_t L = group * LANES_PER_THREAD + l;
-        if (mask & (mask_t{1} << L)) tk_insert(tk_d[l], tk_i[l], topk, acc[l], low);
+        if (mask & (mask_t{1} << L)) reg_insert(tk_d[l], tk_i[l], acc[l], low);
       }
     }
     __syncthreads();  // before producer overwrites sid/smask
   }
 
-  // ---- in-CTA per-lane merge ----
-  // For each (group, lane-within-group): the group's 32 threads stage their
-  // per-thread lists into the (now idle) row region; one thread selects the
-  // CTA-level top-k for that lane. 64 short iterations.
+  // ---- per-lane reduction: warp g owns lanes 8g..8g+7 exclusively, so a
+  // shuffle tree folds its 32 lists with no smem and no block barriers ----
   if (ablate >= 1) return;
-  for (uint32_t g = 0; g < LANE_GROUPS; ++g) {
-    for (uint32_t l = 0; l < LANES_PER_THREAD; ++l) {
-      __syncthreads();
-      if (group == g) {
-        for (uint32_t t = 0; t < topk; ++t) {
-          stage_d[row_slot * MAX_TOPK_T + t] = tk_d[l][t];
-          stage_i[row_slot * MAX_TOPK_T + t] = tk_i[l][t];
-        }
-      }
-      __syncthreads();
-      uint32_t L = g * LANES_PER_THREAD + l;
-      if (tid == 0 && L < view.n_lanes) {
-        float od[MAX_TOPK_T];
-        int32_t oi[MAX_TOPK_T];
-        for (uint32_t t = 0; t < topk; ++t) {
-          od[t] = -FLT_MAX;
-          oi[t] = -1;
-        }
-        for (uint32_t r = 0; r < TILE_ROWS; ++r)
-          for (uint32_t t = 0; t < topk; ++t) {
-            int32_t i = stage_i[r * MAX_TOPK_T + t];
-            if (i < 0) break;
-            tk_insert(od, oi, topk, stage_d[r * MAX_TOPK_T + t], i);
-          }
+  for (uint32_t l = 0; l < LANES_PER_THREAD; ++l) {
+    float rd[MAX_TOPK_T];
+    int32_t ri[MAX_TOPK_T];
+#pragma unroll
+    for (int t = 0; t < MAX_TOPK_T; ++t) {
+      rd[t] = tk_d[l][t];
+      ri[t] = tk_i[l][t];
+    }
+    warp_topk_merge(rd, ri, row_slot);
+    if (row_slot == 0) {
+      uint32_t L = group * LANES_PER_THREAD + l;
+      if (L < view.n_lanes) {
         uint64_t slot =
           ((static_cast<uint64_t>(chunk) * n_segs + seg) * view.n_lanes + L) * topk;
         for (uint32_t t = 0; t < topk; ++t) {
-          cand_dists[slot + t] = od[t];
+          cand_dists[slot + t] = rd[t];
           cand_ids[slot + t] =
-            oi[t] < 0 ? -1 : static_cast<int64_t>(base_id | static_cast<uint32_t>(oi[t]));
+            ri[t] < 0 ? -1 : static_cast<int64_t>(base_id | static_cast<uint32_t>(ri[t]));
         }
       }
     }
   }
 }
 
-// Same merge as v1 (duplicated here to keep TUs independent).
+// One warp per lane: threads scan candidate lists strided, then fold via
+// the same shuffle tree. (v2 used one thread per lane: 6.9 ms of 23.4.)
 __global__ static void tile_merge_kernel(uint32_t n_lists,
                                          uint32_t n_lanes,
                                          uint32_t topk,
@@ -297,33 +297,33 @@ __global__ static void tile_merge_kernel(uint32_t n_lists,
                                          int64_t* __restrict__ out_ids)
 {
   uint32_t L = blockIdx.x;
-  if (L >= n_lanes || threadIdx.x != 0) return;
-  float top_d[MAX_TOPK_T];
-  int64_t top_i[MAX_TOPK_T];
-  for (uint32_t t = 0; t < topk; ++t) {
-    top_d[t] = -FLT_MAX;
-    top_i[t] = -1;
+  if (L >= n_lanes) return;
+  uint32_t lane = threadIdx.x & 31u;
+
+  float rd[MAX_TOPK_T];
+  int32_t ri[MAX_TOPK_T];
+  // ids are 64-bit; track them via an index into the candidate array instead
+  // of truncating: store the *position* in ri and resolve on output.
+#pragma unroll
+  for (int t = 0; t < MAX_TOPK_T; ++t) {
+    rd[t] = -FLT_MAX;
+    ri[t] = -1;
   }
-  for (uint32_t c = 0; c < n_lists; ++c) {
+  for (uint32_t c = lane; c < n_lists; c += 32) {
     uint64_t slot = (static_cast<uint64_t>(c) * n_lanes + L) * topk;
     for (uint32_t t = 0; t < topk; ++t) {
       int64_t id = cand_ids[slot + t];
-      if (id < 0) break;
-      float d      = cand_dists[slot + t];
-      if (d <= top_d[topk - 1]) continue;
-      uint32_t pos = topk - 1;
-      while (pos > 0 && top_d[pos - 1] < d) {
-        top_d[pos] = top_d[pos - 1];
-        top_i[pos] = top_i[pos - 1];
-        --pos;
-      }
-      top_d[pos] = d;
-      top_i[pos] = id;
+      if (id < 0) break;  // lists are sorted descending
+      reg_insert(rd, ri, cand_dists[slot + t], static_cast<int32_t>(slot + t));
     }
   }
-  for (uint32_t t = 0; t < topk; ++t) {
-    out_dists[static_cast<uint64_t>(L) * topk + t] = top_d[t];
-    out_ids[static_cast<uint64_t>(L) * topk + t]   = top_i[t];
+  warp_topk_merge(rd, ri, lane);
+  if (lane == 0) {
+    for (uint32_t t = 0; t < topk; ++t) {
+      out_dists[static_cast<uint64_t>(L) * topk + t] = rd[t];
+      out_ids[static_cast<uint64_t>(L) * topk + t] =
+        ri[t] < 0 ? -1 : cand_ids[ri[t]];
+    }
   }
 }
 
@@ -342,48 +342,57 @@ void mrm_search_tile(const Mrm& m,
     fprintf(stderr, "mrm_search_tile: only dim=128 instantiated (got %u)\n", dim);
     abort();
   }
-  if (topk > MAX_TOPK_T) {
-    fprintf(stderr, "mrm_search_tile: topk=%u exceeds %u\n", topk, MAX_TOPK_T);
+  if (topk > static_cast<uint32_t>(MAX_TOPK_T)) {
+    fprintf(stderr, "mrm_search_tile: topk=%u exceeds %d\n", topk, MAX_TOPK_T);
     abort();
   }
   uint32_t C = m.view.n_chunks;
   uint32_t k = m.view.n_lanes;
   if (C == 0) return;
 
-  uint32_t n_segs = 4096 / C;
+  // Fixed per-CTA costs (producer init, merge rounds, launch) dominate when
+  // segments get thin: measured optimum is ~128 CTAs total (SEGS=8 at C=16,
+  // SEGS=1 at C=153 on RTX 5090), not maximal segmentation.
+  uint32_t n_segs = 128 / C;
   if (n_segs < 1) n_segs = 1;
   if (n_segs > 64) n_segs = 64;
+  static const uint32_t segs_override = [] {
+    const char* e = getenv("MRM_TILE_SEGS");
+    return e ? static_cast<uint32_t>(atoi(e)) : 0u;
+  }();
+  if (segs_override >= 1 && segs_override <= 64) n_segs = segs_override;
 
+  constexpr int DIM = 128;
+
+  // pad queries to 64 rows so dead lanes read zeros, not out-of-bounds
+  float* q_pad      = nullptr;
   float* cand_dists = nullptr;
   int64_t* cand_ids = nullptr;
   uint64_t slots    = static_cast<uint64_t>(C) * n_segs * k * topk;
+  MRM_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&q_pad), 64 * DIM * 4, stream));
   MRM_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&cand_dists), slots * 4, stream));
   MRM_CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&cand_ids), slots * 8, stream));
-
-  constexpr int DIM = 128;
-  size_t smem_bytes = (64 * DIM + TILE_ROWS * (DIM + 1)) * sizeof(float) +
-                      TILE_ROWS * (sizeof(uint32_t) + sizeof(mask_t)) + 64;
-  static bool attr_set = false;
-  if (!attr_set) {
-    MRM_CUDA_CHECK(cudaFuncSetAttribute(mrm_tile_kernel<DIM>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(smem_bytes)));
-    attr_set = true;
-  }
+  if (k < 64) MRM_CUDA_CHECK(cudaMemsetAsync(q_pad, 0, 64 * DIM * 4, stream));
+  MRM_CUDA_CHECK(cudaMemcpyAsync(
+    q_pad, queries, static_cast<size_t>(k) * DIM * 4, cudaMemcpyDeviceToDevice, stream));
 
   static const uint32_t ablate = [] {
     const char* e = getenv("MRM_TILE_ABLATE");
     return e ? static_cast<uint32_t>(atoi(e)) : 0u;
   }();
 
+  size_t smem_bytes = TILE_ROWS * (DIM + 1) * sizeof(float) +
+                      TILE_ROWS * (sizeof(uint32_t) + sizeof(mask_t)) + 64;
+
   dim3 grid(C, n_segs);
   mrm_tile_kernel<DIM><<<grid, TBLOCK, smem_bytes, stream>>>(
-    m.view, dataset, queries, topk, n_segs, ablate, cand_dists, cand_ids);
+    m.view, dataset, q_pad, topk, n_segs, ablate, cand_dists, cand_ids);
   MRM_CUDA_CHECK(cudaGetLastError());
   tile_merge_kernel<<<k, 32, 0, stream>>>(
     C * n_segs, k, topk, cand_dists, cand_ids, out_dists, out_ids);
   MRM_CUDA_CHECK(cudaGetLastError());
 
+  MRM_CUDA_CHECK(cudaFreeAsync(q_pad, stream));
   MRM_CUDA_CHECK(cudaFreeAsync(cand_dists, stream));
   MRM_CUDA_CHECK(cudaFreeAsync(cand_ids, stream));
 }
